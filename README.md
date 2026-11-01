@@ -5,8 +5,6 @@
 
 ## 支持的格式
 
-每行一类，点「截图」看实际效果（截的都是本程序在 Win10 上的真实窗口）：
-
  [图片](docs/screenshots/preview-image.png) |
  [PDF](docs/screenshots/preview-pdf.png) |
  [文本](docs/screenshots/preview-text.png) |
