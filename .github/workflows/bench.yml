@@ -7,12 +7,13 @@ name: bench
 #   * 数字本身在共享 runner 上会抖，所以它是"拦住慢一个数量级"的守门员，
 #     不是 PR 必过的红绿灯 —— PR 由 ci.yml 的 build/clippy/test 把关。
 #
-# 跑法：workflow_dispatch 手动触发、每周一定时跑、以及推 master 时跑。
+# 跑法：workflow_dispatch 手动触发、每周一定时跑。
+# **不要在 push 时跑**：GitHub 托管的 runner 没有交互桌面、也没有 pdfium.dll，
+# 起真 GUI 进程会有一半场景卡在"无 RENDER"（2026-11-02 首次 push 就是这么红的）。
+# 推代码的守门员是 ci.yml（fmt / clippy / test / 构建 + 体积预算）。
 # 产物：bench-results.json（三张表的原始数据）+ 控制台表格。
 
 on:
-  push:
-    branches: [master, main]
   schedule:
     - cron: "0 3 * * 1"   # 每周一 03:00 UTC
   workflow_dispatch:
@@ -42,6 +43,9 @@ jobs:
         run: ./scripts/make-fixtures.ps1 -OutDir target/bench-fixtures
 
       - name: 跑基准（CI 预算表）
+        # 托管 runner 没有交互桌面、也没有 pdfium.dll，PDF 场景必然 FAIL(无 RENDER)；
+        # 这里只当趋势采集，红叉不拦人（真实门禁是本机手动跑 + ci.yml）。
+        continue-on-error: true
         shell: pwsh
         run: |
           ./scripts/bench.ps1 `

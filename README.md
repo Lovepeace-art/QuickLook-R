@@ -1,176 +1,201 @@
 # QLRust
 
-用 Rust 重写的 Windows「按空格预览」工具，思路与交互对齐 [QuickLook](https://github.com/QL-Win/QuickLook)，目标是把**冷启动、首帧、内存、分发体积**全部压下一个数量级。
-
-> 当前版本 **1.8.2**（Windows 10 / 11 x64，GPL-3.0-or-later，见 [LICENSE](LICENSE) 与 [NOTICE.md](NOTICE.md)）。
-> 内置 **11 类**查看器：**图片 · PDF · 文本 · 源码 · Markdown · Office · 压缩包 · 音频 · 视频 · SVG · HTML**；其余格式以**插件**（进程内 C ABI）形式接入。
-> 接手开发先读 [docs/dev/HANDOFF.md](docs/dev/HANDOFF.md)，再看 [docs/dev/ARCH.md](docs/dev/ARCH.md) 与 [docs/dev/STATUS.md](docs/dev/STATUS.md)。
+**Windows 上的「按空格瞬间预览」工具：选中任意文件敲一下空格就能看，用 Rust 原生重写，单进程、无外部运行时依赖、主程序 2.2 MB。**
 
 ![Markdown 预览](docs/screenshots/preview-markdown.png)
 
-## 支持什么
+> 当前版本 **1.8.2**（Windows 10 / 11 x64）· 内置 **11 类**查看器 · 其余格式走插件 · GPL-3.0-or-later（见 [LICENSE](LICENSE) / [NOTICE.md](NOTICE.md)）
+>
+> 下载：[Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) · 想接手开发先读 [AGENTS.md](AGENTS.md) 与 [docs/dev/HANDOFF.md](docs/dev/HANDOFF.md)
 
-| 类别 | 覆盖 | 能力 |
-|---|---|---|
-| 图片 | png jpg jpeg jfif gif bmp dib webp tif tiff ico cur | 按原图尺寸的 **50%** 开窗（设置页可改 10–400%）、左键拖动移动窗口、滚轮缩放、大图按预算降采样 |
-| PDF | pdf | 逐页渲染、**顶栏页码框（点了可输入页码直接跳）**、**页缓存（翻回去 0 ms，顺带预取前后各一页）**、滚轮上下滑动/到边翻页、左键拖动移动窗口、缩小态超采样不糊 |
-| 文本 | txt log ini toml yaml json xml csv（共 100+ 扩展名） | 编码自动识别、自动折行、**每行左侧行号**、滚轮/右键拖动/翻页滚动、只画可视区、默认 880 px 阅读宽度 |
-| 源码 | rs go py js ts c cpp java cs php rb lua sh ps1 sql json toml yaml 等 70+ | **仿 VSCode**：等宽字体 + 行号 + 关键字/字符串/注释/数字着色，不折行、超长行截断 |
-| Markdown | md markdown mdown mkd mkdn | 标题分级、代码块、引用、列表、任务框、表格、分隔线着色；行内标记**渲染后去掉**（不是源码）；**左侧目录**（点击跳转、高亮跟随滚动） |
-| Office | docx xlsx pptx pptm potx ppsx odt ods odp | **交给系统预览处理器渲染真排版**（装了 Office 才生效，和资源管理器预览窗格同一条路）：PPT 翻页由我们接管（到首/末页停住并提示，不会掉到黑屏"放映结束"），Excel/Word 点一下预览窗就能拖滚动条、滚轮滚动、点选单元格 |
-| 压缩包 | zip cbz jar war | 内置**可展开的目录树**：目录在前按名排序、带大小与时间三列，点一行折叠/展开，滚轮滚动（不依赖插件） |
-| 音频 | wav mp3 m4a aac flac ogg wma | 内置播放条：时长、进度、播放/暂停，滚轮拖动进度（MCI，点一下预览窗即可出声） |
-| 视频 | mp4 m4v mov mkv wmv avi webm | 内置逐帧解码出画面 + 进度条，滚轮快进/快退（Media Foundation）；**画面有、声音暂不出** |
-| SVG | svg | Direct2D 的 `CreateSvgDocument` 矢量光栅化，随窗口重绘不糊；拿不到 D2D 时退回内置极简光栅化器（形状与描边可用，文字/字体不支持） |
-| HTML | html htm xhtml | 当**文档**排版（自写极简解析器：标题/段落/列表/引用/表格/代码块），**不拉 WebView2、不执行脚本** |
-| 其它 | 任意扩展名 | 有插件则交给插件；**没有插件就只响一声提示音、不弹窗口**（去装插件即可） |
-
-没写扩展名的文件会**嗅探文件头**（PDF/位图魔数/无 NUL 文本）再决定用哪个查看器。
-
-## 安装
-
-```powershell
-# 免管理员：装到 %LOCALAPPDATA%\Programs\QLRust，注册文件关联（"打开方式"里出现 QLRust）
-pwsh -NoProfile -File scripts\install.ps1
-
-# 附带开机自启
-pwsh -NoProfile -File scripts\install.ps1 -Autostart
-
-# 卸载（含 123 个扩展名关联的摘除、注册表、开始菜单、数据目录）
-pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"
-```
-
-也可以是绿色版：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-<版本>-win64.zip` 解压即用——目录里有 `portable.lock` 时数据就写在 `UserData\`，不碰注册表。
-
-仓库里不含构建产物（`dist/` 与 `target/` 已 ignore）；要自己打包：`pwsh -NoProfile -File scripts\pack.ps1 -Version 1.8.2`。
-
-## 用法
+<details>
+<summary><b>用法与快捷键</b>（点开）</summary>
 
 | 操作 | 效果 |
 |---|---|
-| 在资源管理器/桌面选中文件 → `空格` | 打开/关闭预览（再按一次关） |
+| 资源管理器/桌面选中文件 → `空格` | 打开/关闭预览（再按一次关） |
 | `Esc` | 关闭预览 |
-| **左键拖动** | 所有格式：整个预览窗口跟着鼠标在桌面上移动（不重绘、不频闪） |
-| **右键上下拖动** | 文本/Markdown/源码：按行滚动（图片与 PDF 的右键缩放已按用户要求关闭） |
-| 滚轮 | 文本/Markdown/源码/HTML 上下滚动；PDF 上下滑动（滑到页底继续滚 = 翻页）；图片放得下时缩放、放大后可上下滑动；压缩包逐行滚动；PPT 翻页（到首/末页停住并提示）；Office 里交给处理器自己滚（Excel 用 `Shift` + 滚轮左右滚）；音频拖动进度；视频快进/快退（一格 5 秒） |
-| **按住 `Shift` 移动鼠标** | 放大镜：光标处出现 220×220 的镜头（默认 3×），专看素材里的细节；松开即消失 |
-| **`Shift` + 滚轮** | 调放大镜倍数 1.5×–8× |
-| `PageDown` / `PageUp` / `↑` `↓` | 文本滚动整屏/单行、PDF 翻页 |
-| **顶栏**（所有格式统一） | 黑底：左侧文件名；PDF 中间是可点的页码框（输入页码 + `Enter` 跳转，`Esc` 取消）；顺序：页码框 → `锁`（阻止关闭，单向）→ `↗`（用系统默认程序打开）→ `×`（关闭预览）；**拖顶栏空白处也能移动窗口** |
-| **拖窗口边/角** | 四条边与四个角是热区，指针变成 `↔ ↕ ⤡`；松手按新尺寸重新渲染（文本/Markdown 按新宽度重新折行）。**图片与视频例外**：窗口一打开就锁死素材长宽比、不再允许拖边改大小（滚轮缩放已经够用），最大化时才退回等比居中 |
-| **跟随选中项** | 预览开着时在资源管理器里换选一个文件，窗口 400 ms 内自动换成新选中项（选中的是不支持的文件则保持原样） |
-| **记住窗口位置与尺寸** | 这次把窗口拖到哪儿、改成多大，下次打开就照这个开；尺寸**按格式分别记**（图片/PDF/文本/Markdown 各记一份），换过显示器会自动夹回工作区 |
-| 不支持的文件 | 不弹任何窗口、也不画占位文字，只响一声系统提示音（已经显示着的预览会收起） |
-| **右侧滚动条** | 文本/源码按行、PDF 按页；点轨道跳、拖滑块滚 |
-| 托盘图标 | 右键：菜单（设置… / 关于 / 退出）；左键双击：显示/收起 |
-| **稳定性** | 渲染超 3 s 自动取消并提示（窗口始终可关/可换文件）；崩溃留证据：`crashes\` 下一份 txt 报告 + 一份 minidump，下次启动会提示；长稳压测（2000 次开关）GDI/USER/句柄零增长 |
-| **投机预渲染** | 窗口收着时先把"资源管理器里选中的那一个文件"画好，按空格直接上屏（8MP JPEG 20 ms → 0–1 ms）。设置页 → 性能 → 投机预渲染，三档：**关 / 自适应（默认）/ 总是** |
+| **左键拖动** | 所有格式：预览窗口跟着鼠标移动（不重绘、不频闪） |
+| **右键上下拖动** | 文本/Markdown/源码按行滚动 |
+| 滚轮 | 文本/Markdown/源码/HTML 滚动；PDF 滑动（到页底继续滚 = 翻页）；图片缩放；压缩包逐行滚动；PPT 翻页（到首/末页停住并提示）；音频拖进度；视频快进/快退（一格 5 秒） |
+| **按 `Shift` 移动鼠标** | 放大镜：光标处 220×220 镜头（默认 3×），松开消失 |
+| **`Shift` + 滚轮** | 放大镜倍数 1.5×–8× |
+| `PageDown` / `PageUp` / `↑` `↓` | 文本整屏/单行滚动、PDF 翻页 |
+| **顶栏** | 左侧文件名；PDF 中间可点页码框（输入 + `Enter` 跳转）；右侧 `锁` / `↗`（用系统程序打开）/ `×`；拖顶栏空白处也能移动窗口 |
+| **拖窗口边/角** | 指针变 `↔ ↕ ⤡`，松手按新尺寸重渲染。**图片与视频例外**：窗口锁死素材长宽比、不允许拖边（缩放交给滚轮） |
+| **跟随选中项** | 预览开着时在资源管理器换选文件，窗口自动换内容 |
+| **记住位置与尺寸** | 按格式分别记；换显示器自动夹回工作区 |
+| 不支持的格式 | 不弹窗、不画占位文字，只响一声提示音 |
 
-上面这些**按键都可以改**：托盘右键 →「设置…」或 `qlrust.exe --settings`，点一行 → 直接按新键 → `Enter` 保存（`Esc` 取消、`Backspace` 恢复默认）。改完即时生效，配置写进 `config.json` 的 `hotkeys` 段。
+上面这些按键都能改：托盘右键 →「设置…」或 `qlrust.exe --settings`。
 
-命令行（第二实例会把请求转交给常驻实例，不会起第二个窗口）：
+命令行（第二实例会把请求转交给常驻实例）：
 
 ```powershell
 qlrust.exe                 # 常驻后台，注册全局热键
 qlrust.exe .\a.jpg         # 请求预览（常驻实例未跑则自己顶上）
-qlrust.exe --settings      # 打开设置窗口（快捷键等）
+qlrust.exe --settings      # 打开设置窗口
 qlrust.exe --hide          # 收起预览窗
 qlrust.exe --quit          # 退出常驻实例
-qlrust.exe --render a.pdf  # 无窗口渲染一帧（脚本/CI 用，配合日志判定）
+qlrust.exe --render a.pdf  # 无窗口渲染一帧（脚本/CI 用）
 qlrust.exe --list-extensions out.txt   # 导出全部识别扩展名
 ```
 
-## 性能
+</details>
 
-同机实测（Win10 19045 / i5-12400F / 16 GB，release 构建，`scripts/bench.ps1` 可复现）：
+## 支持的格式
 
-| 场景 | 渲染 | 按键到出图 | 峰值内存 |
+每行一类，点「截图」看实际效果（截的都是本程序在 Win10 上的真实窗口）：
+
+| 类型 | 扩展名 | 能力 | 截图 |
 |---|---|---|---|
-| 冷启动（壳层就绪） | — | **4–5 ms** | 空闲常驻 7.6–8.8 MB |
-| 4K JPEG（8.3 MP） | 34 ms | 55 ms | 16.9 MB |
-| 1080p PNG | 28 ms | 51 ms | — |
-| 48 MP JPEG | 77 ms | 95 ms | 12.3 MB |
-| 16 MB 文本 | 21 ms | 35 ms | 24.8 MB |
-| 26.6 MB 文本（121,425 行） | 21 ms | 53 ms | 21.7 MB |
-| 8 页 PDF | 7 ms | 36 ms | 17.0 MB |
-| 200 页 PDF 翻页 | 均值 6.3 ms（最慢 9 ms） | — | — |
+| 图片 | png jpg jpeg gif bmp webp tif tiff ico cur | 按原图尺寸 50% 开窗（设置页可改 10–400%）、滚轮缩放、左键拖动、大图按预算降采样 | [截图](docs/screenshots/preview-image.png) |
+| PDF | pdf | 逐页渲染、顶栏页码框（可输入跳转）、页缓存（翻回去 0 ms，预取前后各一页）、滚轮滑动/到边翻页、缩小态超采样 | [截图](docs/screenshots/preview-pdf.png) |
+| 文本 | txt log ini toml json xml csv…（100+ 扩展名） | 编码自动识别、自动折行、行号、只画可视区、默认 880 px 阅读宽度 | [截图](docs/screenshots/preview-text.png) |
+| 源码 | rs go py js ts c cpp java cs php rb lua sh ps1 sql…（70+） | 仿 VSCode：等宽 + 行号 + 关键字/字符串/注释着色，不折行 | [截图](docs/screenshots/preview-code.png) |
+| Markdown | md markdown mdown mkd | 标题分级、代码块、引用、列表、任务框、表格；左侧目录点击跳转 | [截图](docs/screenshots/preview-markdown.png) |
+| Office | docx xlsx pptx pptm potx ppsx odt ods odp | 走**系统预览处理器**渲染真排版（装了 Office 才生效）：PPT 翻页由本程序接管（到首/末页停住提示，不掉黑屏），Excel/Word 点一下就能拖滚动条、点选单元格 | [docx](docs/screenshots/preview-office.png) · [xlsx](docs/screenshots/preview-office-xlsx.png) |
+| 压缩包 | zip cbz jar war | 内置**可展开目录树**：目录在前按名排序，带大小/时间三列，点行折叠展开、滚轮滚动 | [截图](docs/screenshots/preview-archive.png) |
+| 音频 | wav mp3 m4a aac flac ogg wma | 内置播放条：时长、进度、播放/暂停，滚轮拖进度（MCI） | [截图](docs/screenshots/preview-audio.png) |
+| 视频 | mp4 m4v mov mkv wmv avi webm | 内置解码出画面 + 进度条，滚轮快进/快退（Media Foundation）；**有画面、暂不出声** | [截图](docs/screenshots/preview-video.png) |
+| SVG | svg | Direct2D `CreateSvgDocument` 矢量光栅化，随窗口重绘不糊；拿不到 D2D 时退回内置极简光栅化器 | [截图](docs/screenshots/preview-svg.png) |
+| HTML | html htm xhtml | 当**文档**排版（自写极简解析器：标题/段落/列表/引用/表格/代码块），不拉 WebView2、不执行脚本 | [截图](docs/screenshots/preview-html.png) |
+| 放大镜 | 任意格式 | `Shift` + 移动鼠标：光标处 220×220 镜头，`Shift`+滚轮调倍数 | [截图](docs/screenshots/preview-lens.png) |
+| 其它 | 任意扩展名 | 有插件则交给插件；没有插件只响一声提示音（插件怎么写见 [docs/dev/PLUGINS.md](docs/dev/PLUGINS.md)） | — |
 
-对比上游 QuickLook 4.5.0（同机、同一批夹具、同一个测量口径，详见 [docs/dev/COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md)）：
+没写扩展名的文件会**嗅探文件头**（PDF/位图魔数/无 NUL 文本）再决定用哪个查看器。
+
+## 与 QuickLook 原版的对比
+
+上游 [QuickLook](https://github.com/QL-Win/QuickLook)（C# / WPF，4.5.0）是这类工具的事实标准。下面全部是**同一台机器、同一批夹具、同一个测量口径**的实测（18 个夹具，脚本 `_bench/compare-run.ps1`，明细见 [docs/dev/COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md)）。
+
+### 一、速度与内存：QLRust 全面领先
 
 | 指标（18 个夹具） | QLRust 1.8.2 | QuickLook 4.5.0 |
 |---|---|---|
-| 能预览的夹具 | **17 / 18** | 14 / 18（本机缺 OfficeViewer-Native） |
-| 窗口出现（均值） | **59 ms** | 221 ms |
+| 窗口出现（均值 / 中位） | **59 ms / 60 ms** | 221 ms / 197 ms |
 | 首帧稳定（均值，不含视频） | **260 ms** | 603 ms |
 | 看文件期间内存（均值） | **34.5 MB** | 1007.1 MB |
-| 空闲内存 | ~23 MB | 253.8 MB |
+| 空闲内存 | **约 23 MB** | 253.8 MB |
+| 冷启动 | **约 100 ms** | 1.0–1.5 s |
+| 分发包体积 | **5.4 MB** | 约 278 MB |
+| 主程序 | 2.2 MB 单 exe | 数十个托管程序集 |
 
-差距是结构性的——WPF + 二十多个托管插件程序集 vs 原生 + 按需加载。
+差距是结构性的：WPF 视觉树 + 二十多个托管插件程序集 vs 原生窗口 + 按需加载。原版每开一个预览就拉起一套 WPF 控件，切几个文件后停到 0.9–1.2 GB；我们全程 13.8–97.2 MB（最大是视频解码缓冲）。
 
-主程序 `qlrust.exe` **2.23 MB**（不含可选 `pdfium.dll` 7.2 MB）；Office/压缩包插件 1.23 MB；示例插件 0.1 MB。
+### 二、QLRust 比原版强的地方
 
-## 插件
+| 维度 | QLRust | 原版 QuickLook 4.5.0 |
+|---|---|---|
+| Office 三件 | 内置接管系统预览处理器：**PPT 翻页由我们控制**（到末页停住给提示，不掉进"放映结束"黑屏）、**Excel 点一下就选中单元格**、滚动条/滚动轮可用 | 靠可选装的 `OfficeViewer-Native` 插件；本机未装，docx/pptx/xlsx 与 400 行表格都打不开 |
+| 压缩包 | 内置目录树（可折叠、三列、滚轮），开图 **129 ms / 366 ms** | 走插件列表，**488 ms / 677 ms** |
+| 音频 | 内置播放条，**62 ms / 250 ms** | WPF 波形控件，197 ms / 2648 ms |
+| 视频 | 内置 MF 解码出画面 + 进度条，97 MB | 能播能出声，1021 MB |
+| 文本/代码/CSV | 45–61 ms 出窗，198–289 ms 稳定 | 178–198 ms 出窗，347–1359 ms 稳定 |
+| 插件模型 | 进程内 C ABI，三个导出符号，一个 DLL 丢进 `plugins\` 即可 | .NET 程序集 + `.qlplugin` 双击安装 |
+| 便携性 | 解压即用（`portable.lock`），数据留 `UserData\` | 安装包为主 |
+| 体积 | 5.4 MB | 278 MB |
 
-没有内置查看器的格式，可以写一个 DLL 丢进 `<安装目录>\plugins\` 就接管：导出 `qlr_plugin_info` / `qlr_plugin_render` / `qlr_plugin_free` 三个 C 符号，渲染结果以 RGBA8 位图交回宿主。
+### 三、原版比 QLRust 强的地方（不藏着）
 
-约定（RGBA8、按 `max_w/max_h` 缩放、64 MP 上限、内存归属、`free` 必调）与十分钟上手模板见 **[docs/dev/PLUGINS.md](docs/dev/PLUGINS.md)**，ABI 取舍见 [docs/adr/0008-plugin-api.md](docs/adr/0008-plugin-api.md)。仓库里的 `crates/qlr-plugin-demo` 就是示例：它把 `.mkv .avi .flv …` 这类**内置没有**的容器渲染成一张占位色卡（内置已覆盖 mp4/webm 的画面，插件只在没有内置查看器时才会被问到）。
+| 维度 | 原版 QuickLook | QLRust 现状 |
+|---|---|---|
+| 格式广度 | **416 个扩展名 / 29 种语言**：字体、CHM、PE/ELF、SQLite、3D 模型、Office 全套、归档、邮件等 | **123 个扩展名**，11 类内置查看器 + 插件 |
+| 字体预览 | 用 DirectWrite 画字体样本页 | **不支持**（ttf/otf 归到「不支持」，这是已知最大缺口） |
+| 视频声音 | 音视频同步播放 | 视频**只有画面**（MCI 播不了 mp4，需接 EVR/WASAPI） |
+| 界面上限 | 插件生态成熟、可换主题、自动更新、`.qlplugin` 双击安装 | 无自动更新、界面固定（托盘设置页可调热键/渲染比例/预渲染） |
+| 多语言 | 界面 29 种语言 | 仅中文 |
+| 生态 | GitHub 4k+ star、多年打磨 | 1.8.2 首个公开版本 |
 
-插件跑在宿主进程里、与宿主同权限——只装信任的插件。
+### 四、一句话结论
 
-## 结构
+**同样一件事（敲空格看一眼），QLRust 快 3–4 倍、省 30 倍内存、体积小 50 倍；原版支持的格式更多、生态更成熟。**我们优先做的是「最常看的 11 类」，冷门格式与字体预览留作后续。
+
+## 安装
+
+**绿色版（推荐）**：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-1.8.2-win64.zip`，解压到任意目录，双击 `qlrust.exe` 即可。目录里有 `portable.lock` 时数据（配置/日志）写在同目录 `UserData\`，不碰注册表。
+
+**安装版**（免管理员，装到 `%LOCALAPPDATA%\Programs\QLRust` 并注册"打开方式"）：
+
+```powershell
+pwsh -NoProfile -File scripts\install.ps1              # 安装 + 注册文件关联
+pwsh -NoProfile -File scripts\install.ps1 -Autostart   # 附带开机自启
+pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"   # 卸载（含关联、注册表、开始菜单、数据目录）
+```
+
+首次运行会有 SmartScreen 提示（无代码签名证书），选"更多信息 → 仍要运行"即可。
+
+**系统要求**：Windows 10 1809+ / Windows 11，x64。Office 三件预览需要本机装了 Microsoft Office（走系统 `IPreviewHandler`）；PDF 需要随包提供的 `pdfium.dll`。
+
+## 文档说明
+
+| 文档 | 内容 |
+|---|---|
+| [AGENTS.md](AGENTS.md) | 给 AI / 人类协作者的完整约定：仓库地图、crate 索引、分层决策、硬约定、改码规则、日志、构建测试、提交纪律、坑速查表 |
+| [docs/dev/HANDOFF.md](docs/dev/HANDOFF.md) | 接力说明：当前状态、回归命令、下一步（新人从这读起） |
+| [docs/dev/STATUS.md](docs/dev/STATUS.md) | 做到哪了：需求矩阵、里程碑、每版小节 |
+| [docs/dev/ARCH.md](docs/dev/ARCH.md) | 架构：进程/线程/窗口/四类绘制通道/模块清单 |
+| [docs/dev/LOG.md](docs/dev/LOG.md) | 每版改了什么、为什么、怎么验证（带实测数字） |
+| [docs/dev/CONVENTIONS.md](docs/dev/CONVENTIONS.md) | 坑清单 #1–#151：症状 → 根因 → 修法 → 数字 |
+| [docs/dev/PLUGINS.md](docs/dev/PLUGINS.md) | 插件 ABI 与十分钟上手模板 |
+| [docs/dev/COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md) | 与本机原版 QuickLook 的逐夹具对比数据 |
+| [docs/adr/](docs/adr/) | 架构决策记录 0001–0008（分层、单实例、零依赖、热键、选区、渲染管线、插件 ABI） |
+| [docs/dev/SECURITY.md](docs/dev/SECURITY.md) / [RELEASE.md](docs/dev/RELEASE.md) | 安全边界（无网络、插件同权限、日志不含内容）与发布流程 |
+
+## 开发说明
+
+环境：Rust 1.75+、Windows 10/11 x64（构建不需要 MSVC 之外的额外依赖）。
+
+```powershell
+cargo build --release
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test                                                              # 251 passed / 3 ignored
+```
+
+端到端验证（每个脚本会自建便携目录、用 WMI 起真进程、`PrintWindow` 截图断言，最后打印 PASS/SKIP 汇总）：
+
+| 脚本 | 期望 | 覆盖 |
+|---|---|---|
+| `scripts/smoke.ps1` | 全过（托盘 1 条 SKIP：管理员会话 UIPI） | 单实例、热键、窗口、翻页、缩放、退出 |
+| `scripts/verify-office.ps1` | 23 PASS | Office 处理器接管、标题、翻页边界、拖边改大小、改完重新对齐 |
+| `scripts/verify-archive.ps1` | 11 PASS | 压缩包目录树、折叠、滚动 |
+| `scripts/verify-media.ps1` | 15 PASS | 音频/视频/SVG/HTML |
+| `scripts/verify-mediashape.ps1` | 13 PASS | Excel 点选单元格、右缘无白边、图片/视频锁比例 |
+| `scripts/verify-pdf.ps1` / `probe-selection.ps1` | 全过 | PDF 渲染翻页、选中项跟随 |
+| `scripts/bench.ps1` / `stress.ps1` | 预算内 | 性能与长稳（2000 次开关句柄零增长） |
+
+验证脚本用 `QLRUST_FIXTURES` 指向夹具目录（缺夹具的检查会 SKIP 而不是 FAIL；夹具可用 `scripts/make-fixtures.ps1` 现造）。
+
+代码结构：
 
 ```
 crates/
   qlr-app         编排：消息泵、热键、状态机、CLI、渲染线程、压缩包列表
-  qlr-platform    纯 Win32 FFI：窗口/托盘/钩子/选区/DWM/DPI/音频（MCI）/系统预览处理器宿主
-  qlr-render      无 windows 依赖：image / pdf / text / markdown / svg / html / 折行 / 画布
-                  （唯一边界例外：`media` 用 Media Foundation 解视频首帧，见该文件顶部说明）
-  qlr-core        无 windows 依赖：配置、路径、日志、IPC、格式表、插件宿主
+  qlr-platform    纯 Win32 FFI：窗口/托盘/钩子/选区/DWM/DPI/音频/系统预览处理器宿主
+  qlr-render      解码与排版：image / pdf / text / code / markdown / svg / html / 折行 / 画布
+  qlr-core        纯逻辑：配置、路径、日志、IPC、格式表、插件清单
   qlr-plugin-api  插件 ABI（C，零依赖）
-  qlr-plugin-demo 示例插件（视频占位图，演示 ABI）
-  qlr-plugin-office Office/压缩包的插件实现（内置已有同类能力，留作 ABI 参考实现）
+  qlr-plugin-demo 示例插件（演示 ABI）
+  qlr-plugin-office Office/压缩包的插件实现（内置已有同类能力，留作 ABI 参考）
 scripts/          install / uninstall / pack / bench / stress / smoke / verify-*
-docs/dev/         LOG STATUS ARCH HANDOFF CONVENTIONS PLUGINS SECURITY RELEASE bench COMPARE-*
-docs/adr/         架构决策记录 0001–0008
+docs/             dev（LOG/STATUS/ARCH/HANDOFF/CONVENTIONS…）+ adr（架构决策）
 ```
 
-几条硬约束（都是为了压体积与延迟）：不引 `pdfium-render`（会拖 tokio）而是手写 12 个 C 绑定动态加载；不引 `cosmic-text` 而是自己折行 + GDI 测量；上屏用 `StretchDIBits` 而不是 D3D11；Windows 10 用亚克力、Windows 11 用 DWM backdrop，有位图内容时一律关掉半透明层。
+几条硬约束（为了体积与延迟）：不引 `pdfium-render`（会拖 tokio）而是手写 12 个 C 绑定动态加载；不引 `cosmic-text` 而是自己折行 + GDI 测量；上屏用 `StretchDIBits` 而不是 D3D11；`qlr-core` 与 `qlr-render` 不许出现 `windows::`（唯一例外是视频解码那道边界，见 `crates/qlr-render/src/media.rs` 顶部说明）。
 
-## 开发与验证
+CI：`.github/workflows/ci.yml`（Windows runner：fmt / clippy / test / release 构建 + 体积预算）、`fuzz.yml`、`bench.yml`（每周定时跑真实 GUI 基准）。
 
-```powershell
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test                                                                # 251 项
-pwsh -NoProfile -File scripts\smoke.ps1 -Exe target\release\qlrust.exe    # 端到端冒烟
-pwsh -NoProfile -File scripts\verify-office.ps1                           # Office：标题/翻页/拖边/滚动（23 项）
-pwsh -NoProfile -File scripts\verify-mediashape.ps1                        # Excel 点选 / 图片视频比例（13 项）
-pwsh -NoProfile -File scripts\verify-archive.ps1                          # 压缩包目录树（11 项）
-pwsh -NoProfile -File scripts\verify-media.ps1                             # 音频/视频/SVG/HTML（15 项）
-pwsh -NoProfile -File scripts\bench.ps1                                   # 三张表 + JSON，可配预算
-pwsh -NoProfile -File scripts\pack.ps1 -Version 1.8.2
-```
+## 致谢
 
-验证脚本读环境变量 `QLRUST_FIXTURES` 找夹具目录；缺夹具时整段 SKIP（不算失败）。
-
-CI：`.github/workflows/ci.yml`（fmt / clippy / test / 体积预算）+ `.github/workflows/bench.yml`（每周跑真实 GUI 基准，超预算即失败）。
-
-文档索引：[AGENTS](AGENTS.md)（给 AI/协作者的完整约定）· [HANDOFF](docs/dev/HANDOFF.md)（10 分钟上手）· [STATUS](docs/dev/STATUS.md)（做到哪了，坑清单在 §8.3）· [ARCH](docs/dev/ARCH.md) · [LOG](docs/dev/LOG.md)（每版做了什么）· [CONVENTIONS](docs/dev/CONVENTIONS.md)（踩过的坑全清单，编号 #1–#151）· [PLUGINS](docs/dev/PLUGINS.md) · [SECURITY](docs/dev/SECURITY.md) · [RELEASE](docs/dev/RELEASE.md)
-
-## 已知限制
-
-- 预览窗是**不可激活**窗口（不吃焦点），所以滚轮/拖拽走全局钩子旁听；自动化注入的按键会被特意过滤，脚本测试请用 `--render` / `--wheel` 这类直投入口。
-- 没有代码签名证书：首次运行会有 SmartScreen 提示，分发前请看 [docs/dev/RELEASE.md](docs/dev/RELEASE.md)。
-- 文本折行是朴素实现（无字距调整/连字/双向文字）；Markdown 不做行内强调（粗体、斜体、链接保持原样字符）。
-- Office 三件走**系统预览处理器**：机器上装了 Office 才有真排版；没装时只响一声、不弹窗。
-- 视频**只有画面没有声音**（Media Foundation 解码到画面，音频链路由 MCI 承担且 MCI 播不了 mp4）。音频（wav/mp3 等）能出声。
-- **字体（ttf/otf）目前不支持**——这是与原版 QuickLook 相比唯一缺的一类。
-- 图片与视频的窗口比例锁死素材比例，不能拖边改大小（见上文"拖窗口边/角"）。
-- 任何插件/预览处理器画出来的内容都只能落在顶栏之下。
+- **[QuickLook](https://github.com/QL-Win/QuickLook)**（Paddy Xu）：这个交互范式（空格预览、跟在资源管理器选中项后面、插件化）与大量行为契约都来自它；本项目的快捷键语义、便携目录布局、插件模型、系统预览处理器接入方式都参考了它。本项目是**独立重写**，代码不拷贝。
+- **[PDFium](https://pdfium.googlesource.com/pdfium/)**（BSD-3-Clause）：PDF 光栅化，运行时动态加载，本仓库不分发该 DLL。
+- **[windows-rs](https://github.com/microsoft/windows-rs)**（MIT OR Apache-2.0）：Win32 / COM / Direct2D / Media Foundation 绑定。
+- **Rust 社区**：本项目零第三方 GUI/运行时依赖，全部靠 std + `windows-rs` 完成，受益于社区里关于 GDI/Direct2D/Media Foundation 的经验帖。
+- Windows 平台上那些"没有好文档"的部分（`IPreviewHandler` 的输入同步呼叫限制、`CreateSvgDocument` 的能力边界、MCI 的路径怪癖）都是靠实测 + 踩坑记录磨出来的，清单见 [CONVENTIONS](docs/dev/CONVENTIONS.md)。
 
 ## 许可
 
 **GPL-3.0-or-later**，全文见 [LICENSE](LICENSE)，来源与第三方组件说明见 [NOTICE.md](NOTICE.md)。
 
-与上游 QuickLook 同许可：本项目是**独立重写**（代码不从上游拷贝），但行为契约（快捷键、便携目录布局、插件语义、系统预览处理器的接入方式）大量参考上游，按衍生作品对待。可选依赖 PDFium 为 BSD-3-Clause（运行时动态加载，本仓库不分发该 DLL）。
-
+与上游 QuickLook 同许可：本项目为**独立重写**（代码不从上游拷贝），但行为契约（快捷键、便携目录布局、插件语义、系统预览处理器的接入方式）大量参考上游，按衍生作品对待。
