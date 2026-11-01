@@ -1,0 +1,41 @@
+// 文件是 UTF-8（无 BOM）存的，必须显式告诉 rc.exe 代码页，
+// 否则中文会按系统 ANSI 代码页解，报 `RC2133: unexpected value in value data`。
+#pragma code_page(65001)
+
+1 ICON "qlrust.ico"
+
+// RT_MANIFEST(24) 的 ID 必须是 1，否则系统不认。
+// 内容见 qlrust.manifest：asInvoker（不提权）+ PerMonitorV2 + Win10 supportedOS。
+1 24 "qlrust.manifest"
+
+1 VERSIONINFO
+FILEVERSION     1,8,2,0
+PRODUCTVERSION  1,8,2,0
+FILEOS          0x40004L
+FILETYPE        0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "QLRust contributors"
+            VALUE "FileDescription",  "QLRust - 按空格预览文件（Rust 版 QuickLook 重写）"
+            VALUE "FileVersion",     "1.8.2.0"
+            VALUE "InternalName",     "qlrust"
+            VALUE "LegalCopyright",   "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "qlrust.exe"
+            VALUE "ProductName",      "QLRust"
+            VALUE "ProductVersion",  "1.8.2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END
+
+
+
+
+
+

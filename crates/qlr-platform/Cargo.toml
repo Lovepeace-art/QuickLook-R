@@ -1,0 +1,11 @@
+[package]
+name = "qlr-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 平台层：Win32 窗口/材质/托盘/单实例（只做 FFI 薄封装，不含业务逻辑）"
+
+[dependencies]
+qlr-core.workspace = true
+windows.workspace = true

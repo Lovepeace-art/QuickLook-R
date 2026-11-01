@@ -1,0 +1,13 @@
+{
+  "_comment": "scripts/bench.ps1 的预算表。数字取本机实测（Win10 22H2 / i5-12400F）的 2-3 倍余量，作用只是拦住'某次改动让某条路径慢一个数量级'，不是性能目标。CI runner 更慢，所以 CI 用同一份表也能过。",
+  "cold_start_ms": 400,
+  "scenarios": {
+    "png_1920x1080.png": { "render_ms": 120, "perceived_ms": 400, "peak_rss_mb": 220 },
+    "8mp_3840x2160.jpg": { "render_ms": 200, "perceived_ms": 500, "peak_rss_mb": 320 },
+    "48mp_8000x6000.jpg": { "render_ms": 400, "perceived_ms": 800, "peak_rss_mb": 700 },
+    "big_16mb.txt": { "render_ms": 200, "perceived_ms": 500, "peak_rss_mb": 260 },
+    "big_100mb.txt": { "render_ms": 300, "perceived_ms": 700, "peak_rss_mb": 320 },
+    "pdf_8page.pdf": { "render_ms": 300, "perceived_ms": 600, "peak_rss_mb": 260 },
+    "md_styled.md": { "render_ms": 120, "perceived_ms": 400, "peak_rss_mb": 200 }
+  }
+}

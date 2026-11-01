@@ -1,0 +1,48 @@
+[package]
+name = "qlr-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qlr-core = { workspace = true }
+image = { workspace = true }
+jpeg-decoder = { workspace = true }
+png = { workspace = true }
+libloading = "0.8"
+
+# 1.8.0 起 `qlr-render` 在 Windows 上有**一处** `windows` crate 用法（`src/svg.rs` 的 Direct2D 1.3
+# SVG 光栅化），因此这是唯一一条按目标平台收窄的依赖：
+#
+# - 为什么必须加：`ID2D1DeviceContext5::CreateSvgDocument` 住在 D2D 的 COM 链上
+#   （`ID2D1DeviceContext` → 5 → `ID2D1SvgDocument`），手写 vtable 的槽位索引
+#   （继承链 100+ 个方法）错一个就是访问违例而不是 `Err`，风险远大于收益；
+#   PDFium 那种 `libloading` + 手写函数指针的玩法只适用于**扁平 C 导出**，
+#   不适用于 COM 接口。
+# - 为什么不算"引新 crate"：`windows 0.62` 已在 workspace 依赖里（`qlr-platform` / `qlr-app` 在用），
+#   这里只是把同版本加进来并打开 Direct2D/D3D11 相关 feature，不进新 crate、不升版本。
+# - 为什么按 `cfg(windows)` 收窄：只有 SVG 需要 GPU（D2D 设备上下文必须挂在 D3D11 纹理上）。
+#   HTML/文本/图片/PDF 路径仍是纯 Rust，`cargo test` 在没有 `windows` 的平台上照样能编。
+# 1.7.8 追加：`src/media.rs`（视频首帧）也用 Media Foundation，同一条 target 依赖里开 feature。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # Media Foundation：`MFStartup` / `SourceReader` 首帧解码；PROPVARIANT 取时长要
+    # `Com_StructuredStorage` + `Variant`。
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # 仅 `#[cfg(test)]` 的 PNG 落盘夹具用（GDI 画字，见 html.rs 的 dump_png）。
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }

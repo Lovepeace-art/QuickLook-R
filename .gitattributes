@@ -1,0 +1,30 @@
+# 统一行尾与二进制标记：仓库在 Windows 上开发，但要让 Linux/macOS 克隆与 CI 也不出噪音。
+* text=auto
+
+# 源码与文档统一 LF
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# PowerShell 与 .rc：Windows 工具链（rc.exe / 旧版 pwsh 编辑器）按 CRLF 最省事
+*.ps1 text eol=crlf
+*.rc  text eol=crlf
+
+# 二进制：不要做任何转换，也不要在 diff 里显示
+*.dll   binary
+*.exe   binary
+*.lib   binary
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.mp4  binary
+*.wav  binary
+*.ttf  binary

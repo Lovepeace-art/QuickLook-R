@@ -1,0 +1,93 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/qlr-core",
+    "crates/qlr-platform",
+    "crates/qlr-render",
+    "crates/qlr-app",
+    "crates/qlr-plugin-api",
+    "crates/qlr-plugin-demo",
+    "crates/qlr-plugin-office",
+]
+
+[workspace.package]
+version = "1.8.2"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+qlr-core = { path = "crates/qlr-core" }
+qlr-platform = { path = "crates/qlr-platform" }
+qlr-render = { path = "crates/qlr-render" }
+qlr-plugin-api = { path = "crates/qlr-plugin-api" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+
+# 解码只留常见格式，按需再加（装载裁剪：每加一种就多一块解码器）。
+jpeg-decoder = { version = "0.3", default-features = false }
+# 直接依赖 png：大 PNG 要逐行解码 + 边解边缩（`image` 只能整图解码，48MP 峰值 192 MB）。
+# 版本必须与 `image` 依赖的那个一致，否则锁文件里会出现两份（见 CONVENTIONS #105）。
+png = "0.18"
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "tga",
+    "tiff",
+    "webp",
+] }
+
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    # 1.7.8：音频播放控制（`mciSendStringW`，winmm）。
+    "Win32_Media_Multimedia",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# A8.5 装载裁剪：release 走 fat LTO + 单 codegen unit + panic=abort + strip。
+# 目标见 docs/route-a-wbs.md §7.1 A8.5（壳层 exe <= 5 MB，重 dll 一律不进主进程）。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# 开发态也用 -O1：方便按真实速度判断"首帧"手感，避免 debug 构建误导性能判断。
+[profile.dev]
+opt-level = 1
+
+
+
+
+
+
+
+

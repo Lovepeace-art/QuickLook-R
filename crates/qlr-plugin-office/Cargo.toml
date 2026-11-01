@@ -1,0 +1,20 @@
+[package]
+name = "qlr-plugin-office"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 插件：Office（docx/xlsx/pptx/odt…）与压缩包（zip/cbz/jar）的轻量预览——能取到缩略图就显示缩略图，否则画一张文本大纲卡片"
+
+[lib]
+name = "qlr_plugin_office"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+qlr-plugin-api.workspace = true
+# 解析压缩包（Office 文件本身就是 zip）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 缩略图：Office 文件里常带 docProps/thumbnail.jpeg，只留 jpeg/png 两种解码器
+image = { workspace = true }
+# 文本大纲卡片要用 GDI 画字（插件在主进程内，直接用系统字体，不额外打包字体）
+windows = { workspace = true }

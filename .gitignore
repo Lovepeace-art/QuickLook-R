@@ -1,0 +1,13 @@
+/target
+**/UserData
+*.pdb
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地分发/打包产物（2026-11-01 起不再跟踪：曾经跟踪过 354 个文件、678 MB）
+/dist/
+*.zip
+
+# 本机测试残留
+_bench_tmp/

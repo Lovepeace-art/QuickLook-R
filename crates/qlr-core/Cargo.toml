@@ -1,0 +1,14 @@
+[package]
+name = "qlr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 核心：配置、路径、日志、IPC 协议（不依赖任何 Windows API，可跨平台单测）"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# 插件宿主：跨平台的 dlopen/LoadLibrary 封装（无 windows 依赖，符合本 crate 的约束）。
+libloading.workspace = true
+qlr-plugin-api.workspace = true

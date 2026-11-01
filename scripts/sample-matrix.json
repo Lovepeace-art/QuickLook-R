@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-10-31T09:56:02.1566529+08:00",
+  "exe": "C:\\Users\\Administrator\\Desktop\\DSH\\quicklook-rs\\target\\release\\qlrust.exe",
+  "source": "C:\\Users\\Administrator\\Desktop\\DSH\\quicklook-rs\\target\\bench-fixtures\\matrix",
+  "total": 97,
+  "passed": 97,
+  "rate": 1.0,
+  "min_rate": 0.98,
+  "by_kind": [
+    {
+      "kind": "image",
+      "count": 31,
+      "ok": 31
+    },
+    {
+      "kind": "markdown",
+      "count": 22,
+      "ok": 22
+    },
+    {
+      "kind": "pdf",
+      "count": 20,
+      "ok": 20
+    },
+    {
+      "kind": "text",
+      "count": 24,
+      "ok": 24
+    }
+  ],
+  "failures": []
+}

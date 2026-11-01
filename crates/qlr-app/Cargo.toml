@@ -1,0 +1,17 @@
+[package]
+name = "qlr-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 可执行体：消息泵、托盘、预览窗口编排"
+
+[[bin]]
+name = "qlrust"
+path = "src/main.rs"
+
+[dependencies]
+qlr-core.workspace = true
+qlr-platform.workspace = true
+qlr-render.workspace = true
+windows.workspace = true

@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build · clippy · test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: clippy（零警告是硬要求）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --all
+
+      - name: 构建 release
+        run: cargo build --release
+
+      - name: 体积预算（A8.5：exe ≤5 MB）
+        shell: pwsh
+        run: |
+          $exe = Get-Item "target/release/qlrust.exe"
+          $mb = $exe.Length / 1MB
+          "release 体积：{0:N0} 字节（{1:N2} MB）" -f $exe.Length, $mb
+          if ($mb -gt 5) {
+            Write-Error "超出 A8.5 体积预算：$mb MB > 5 MB"
+            exit 1
+          }
+
+  # 端到端冒烟（scripts/smoke.ps1）不在 CI 里跑：
+  #   1) 需要真实交互桌面会话（runner 在 session 0，托盘/窗口枚举行为与本地不同）；
+  #   2) 需要便携目录可写。
+  # 本地/自托管机上手动执行：
+  #   pwsh -NoProfile -File scripts/smoke.ps1 -Exe target\release\qlrust.exe

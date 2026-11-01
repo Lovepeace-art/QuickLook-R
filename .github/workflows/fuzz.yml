@@ -1,0 +1,55 @@
+name: fuzz
+
+# 夜间 fuzz：把变异规模从 2000 例拉到 10000 例（`cargo test` 里只跑 2000 例，0.3 s）。
+# 为什么单独一个 workflow：它比 check 慢一个量级，但比跑真实 GUI 的 bench 便宜，
+# 放夜间足够；失败时用例会直接告诉你怎么重放（固定种子 + 迭代下标）。
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/qlr-render/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "0 4 * * *" # 每天 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "变异迭代数"
+        required: false
+        default: "10000"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  mutate:
+    name: 确定性变异（${{ github.event.inputs.iterations || '10000' }} 例）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quicklook-rs
+
+      - name: 变异测试
+        working-directory: quicklook-rs
+        shell: pwsh
+        env:
+          QLR_FUZZ_ITERS: ${{ github.event.inputs.iterations || '10000' }}
+        run: |
+          cargo test -p qlr-render --test fuzz -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "fuzz 失败：见上面的断言输出" }
+
+      - name: 畸形输入回归
+        working-directory: quicklook-rs
+        shell: pwsh
+        run: |
+          cargo test -p qlr-render --test malformed -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "畸形输入回归失败" }

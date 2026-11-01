@@ -1,0 +1,14 @@
+[package]
+name = "qlr-plugin-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 示例插件：接管视频扩展名，画一张色条占位图（演示插件 ABI 的最小实现）"
+
+[lib]
+name = "qlr_plugin_demo"
+crate-type = ["cdylib"]
+
+[dependencies]
+qlr-plugin-api.workspace = true

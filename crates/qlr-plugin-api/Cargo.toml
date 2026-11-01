@@ -1,0 +1,9 @@
+[package]
+name = "qlr-plugin-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QLRust 插件 ABI（纯 C 布局的 v1 契约，宿主与插件共用的唯一接口定义）"
+
+[dependencies]

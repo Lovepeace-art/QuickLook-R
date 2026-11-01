@@ -1,0 +1,60 @@
+name: bench
+
+# 性能回归基准（WBS A6.4）。
+#
+# 为什么单独一个 workflow 而不是塞进 ci.yml：
+#   * 它要起真实 GUI 进程（窗口 + 钩子 + 托盘），比 check 慢一个数量级；
+#   * 数字本身在共享 runner 上会抖，所以它是"拦住慢一个数量级"的守门员，
+#     不是 PR 必过的红绿灯 —— PR 由 ci.yml 的 build/clippy/test 把关。
+#
+# 跑法：workflow_dispatch 手动触发、每周一定时跑、以及推 master 时跑。
+# 产物：bench-results.json（三张表的原始数据）+ 控制台表格。
+
+on:
+  push:
+    branches: [master, main]
+  schedule:
+    - cron: "0 3 * * 1"   # 每周一 03:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: 冷启动 · 首帧 · 内存
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建 release
+        run: cargo build --release
+
+      - name: 生成夹具（脚本现造，仓库里不放几十 MB 的图）
+        shell: pwsh
+        run: ./scripts/make-fixtures.ps1 -OutDir target/bench-fixtures
+
+      - name: 跑基准（CI 预算表）
+        shell: pwsh
+        run: |
+          ./scripts/bench.ps1 `
+            -Exe target/release/qlrust.exe `
+            -FixtureDir target/bench-fixtures `
+            -Rounds 2 `
+            -Budget ./scripts/bench-budget-ci.json `
+            -JsonOut bench-results.json
+
+      - name: 上传结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json
+          if-no-files-found: warn
