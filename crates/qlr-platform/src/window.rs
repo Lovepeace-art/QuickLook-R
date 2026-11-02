@@ -552,7 +552,13 @@ pub fn paint_window_frame(hwnd: HWND) {
         }
         let rc = client_rect(hwnd);
         frame_solid(hdc, rc, FRAME_HAIRLINE_RGB);
-        // DC 由调用方持有/释放（1.5.2）
+        // 1.8.3 修 GDI 泄漏：这里以前只有 `GetDC` 没有 `ReleaseDC`，注释还写着
+        // "DC 由调用方持有/释放"——但函数既不返回 DC，唯一调用点
+        // （`app.rs::paint_overlays`）也拿不到它，于是每画一帧就漏 1 个 GDI 对象。
+        // 表现为"每预览一个文件 GDI +1、收起不回收"：每次 show 至少跑一次
+        // `paint_overlays`，而 `ReleaseDC` 一次都没有。现在配对释放，
+        // 和同文件的 `paint_scrollbar` / `paint_toc` 保持一致。
+        ReleaseDC(Some(hwnd), hdc);
     }
 }
 
