@@ -129,6 +129,14 @@ pub struct Config {
     /// 老配置的迁移见 [`Config::migrate`]（schema 1 → 2）。
     pub image_zoom_percent: u32,
 
+    /// 预览窗口**内容**的缩放（百分比；`0` = 自动）。1.8.3 新增。
+    ///
+    /// 为什么要把"内容"和"外壳"分开：外壳（顶栏 / 页码框 / 滚动条 / 设置窗）必须跟着
+    /// DPI 走，否则 200% 下按钮小得点不着；但正文也跟着翻倍就变成"字很大、一屏没几行"。
+    /// `0` = 自动（按 `sqrt(dpi/96)` 压缩，200% 下 ≈1.41 倍而不是 2 倍）；
+    /// 填具体百分比就按它；填 `100` 等于"完全跟随 DPI"。
+    pub content_scale_percent: u32,
+
     /// 上次预览窗口的位置（屏幕坐标，左上角；1.0.13 起记忆）。
     ///
     /// 用户要求："记录上次预览窗口打开的位置，新开预览窗口的时候直接在上次位置打开"。
@@ -177,6 +185,7 @@ impl Default for Config {
             hotkey_enabled: true,
             hotkeys: Hotkeys::default(),
             image_zoom_percent: 100,
+            content_scale_percent: 0,
             window_pos: None,
             window_sizes: std::collections::BTreeMap::new(),
             prewarm: Prewarm::default(),
@@ -249,6 +258,12 @@ impl Config {
         self.hotkeys = self.hotkeys.sanitized();
         // 1% 太小、400% 太大（4 倍已经要跨屏拖了），夹在中间。
         self.image_zoom_percent = self.image_zoom_percent.clamp(10, 400);
+        // 内容缩放：0 = 自动；手填的离谱值夹到 50–400（太小看不清，太大一屏放不下一行）。
+        self.content_scale_percent = if self.content_scale_percent == 0 {
+            0
+        } else {
+            self.content_scale_percent.clamp(50, 400)
+        };
         // 记住的窗口尺寸是用户可手改的 JSON：丢掉明显不合理的（负数、0、比任何显示器都大）。
         self.window_sizes
             .retain(|_, (w, h)| (200..=20000).contains(w) && (120..=20000).contains(h));

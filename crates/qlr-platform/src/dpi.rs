@@ -168,6 +168,49 @@ pub fn pxf(v: f32) -> f32 {
     v * (dpi as f32) / 96.0
 }
 
+/// 内容缩放（1.8.3）：**预览窗口里的内容**（正文行高、字号、行号栏、目录/列表行高）
+/// 与**平台层外壳**（顶栏、页码框、滚动条、设置窗）分开调。
+///
+/// 为什么分开：用户的原话——"100% 缩放，md 等文本会显得很大，建议顶栏平台层和
+/// 预览窗口内分开"。外壳必须跟着 DPI 走（不然按钮小得点不着），但正文跟着 DPI 翻倍
+/// 之后就"字大、一屏没几行"。
+///
+/// 默认 `0` = 自动：内容按 `sqrt(dpi/96)` 缩放（200% 下 ≈1.41 倍，而不是 2 倍）。
+/// 配置里写具体百分比（如 `80`）则按它；写 `100` 就是完全跟随 DPI。
+static CONTENT_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 设定内容缩放百分比（`0` = 自动）。
+pub fn set_content_percent(percent: u32) {
+    CONTENT_PERCENT.store(percent, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 内容相对"完全跟随 DPI"的系数。
+fn content_factor() -> f32 {
+    if !enabled() {
+        return 1.0;
+    }
+    let p = CONTENT_PERCENT.load(std::sync::atomic::Ordering::Relaxed);
+    if p > 0 {
+        p as f32 / 100.0
+    } else {
+        // 自动：把"完全跟随 DPI"压成开方。总倍率 = dpi/96 × 这个系数 = sqrt(dpi/96)。
+        // 96 → 1.0（所以 96 下一切照旧）；192 → 总倍率 1.414（而不是 2）。
+        (96.0 / current() as f32).sqrt()
+    }
+}
+
+/// DIP → 物理像素，**只给"预览窗口内的内容"用**（正文、目录、列表）。
+pub fn cpx(v: i32) -> i32 {
+    if v <= 0 {
+        return v;
+    }
+    let f = content_factor();
+    if (f - 1.0).abs() < f32::EPSILON {
+        return px(v);
+    }
+    (v as f32 * (current() as f32 / 96.0) * f).round() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +271,34 @@ mod tests {
         assert!((pxf(15.0) - 30.0).abs() < 0.01);
         seed_thread(96);
         assert!((pxf(15.0) - 15.0).abs() < 0.01);
+    }
+
+    /// 1.8.3：**内容**（正文行高、字号）与**外壳**分开缩放。
+    /// 96 下必须与 px() 完全一致（否则既有 250+ 个测试与视觉基线全废）。
+    #[test]
+    fn content_scale_is_identity_at_96() {
+        seed_thread(96);
+        set_content_percent(0);
+        for v in [12, 15, 24, 26, 64] {
+            assert_eq!(cpx(v), px(v), "96 DPI 下内容缩放必须与外壳一致（{v}）");
+        }
+    }
+
+    /// 200% 且"自动"时：内容只放大 √2 ≈1.41 倍，而外壳放大 2 倍。
+    /// 这就是用户说的"顶栏和预览窗口内分开"——外壳照常跟着 DPI，正文别放大到两倍。
+    #[test]
+    fn content_scale_is_milder_than_shell_at_200() {
+        seed_thread(192);
+        set_content_percent(0);
+        assert_eq!(px(24), 48, "外壳/行高按 2 倍");
+        assert_eq!(cpx(24), 34, "内容按 1.41 倍（24 × 1.414 ≈ 34）");
+        assert_eq!(cpx(15), 21, "正文 15 → 21 而不是 30");
+        // 手填 100% = 完全跟随 DPI，手填 50% = 只放大 1 倍
+        set_content_percent(100);
+        assert_eq!(cpx(24), 48);
+        set_content_percent(50);
+        assert_eq!(cpx(24), 24);
+        set_content_percent(0);
+        seed_thread(96);
     }
 }

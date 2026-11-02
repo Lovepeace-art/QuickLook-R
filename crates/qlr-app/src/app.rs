@@ -205,6 +205,10 @@ struct State {
     /// **彻底没反应**（缩放开不了、正文不滚、目录不滚，而且日志里一条记录都没有）。
     /// 现在把零头攒起来：4 次 30 = 1 档。实测复现与修复见 `wheel_take` 的单测。
     wheel_acc: i32,
+    /// 目录栏滚动到第几条（1.8.3：目录可以独立滚动，所以**不需要滚动条**）。
+    toc_scroll: usize,
+    /// 鼠标当前是否悬停在目录栏上（决定滚轮滚目录还是滚正文）。
+    hover_toc: bool,
     /// 是否正在拖右侧滚动条。
     scroll_drag: bool,
     /// 当前内容的目录（Markdown 才有）：`(级别, 标题, 显示行下标)`。
@@ -443,6 +447,8 @@ fn set_content(content: Option<Arc<Canvas>>) {
         s.styled_logged = false;
         s.toc = toc;
         s.toc_active = None;
+        // 1.8.3：目录的滚动位置也要跟着新文件归零（否则换文件后目录停在半截）。
+        s.toc_scroll = 0;
     });
 }
 
@@ -465,6 +471,9 @@ pub fn run() -> ExitCode {
     let _ = paths::ensure_dirs();
 
     let (config, config_err) = Config::load(&paths::config_path());
+    // 1.8.3：内容缩放（正文/目录/列表）与外壳分开——见 `Config::content_scale_percent`。
+    // 必须在读配置之后设（默认 0 = 自动，200% 下按 1.41 倍而不是 2 倍）。
+    dpi::set_content_percent(config.content_scale_percent);
     let level = Level::from_env_or(level_from_str(&config.log_level));
     let _ = log::init(level, &paths::log_file());
 
@@ -777,6 +786,8 @@ pub fn run() -> ExitCode {
         hover_button: None,
         page_edit: None,
         wheel_acc: 0,
+        toc_scroll: 0,
+        hover_toc: false,
         scroll_drag: false,
         toc: Vec::new(),
         toc_active: None,
@@ -2505,6 +2516,12 @@ fn on_wheel(delta: i32) {
     if archive_scroll_by(wheel_text_rows(notches)) {
         return;
     }
+    // 目录栏（1.8.3）：鼠标悬停在目录上时，滚轮滚**目录**而不是正文。
+    // 目录比窗口高的时候以前根本翻不到后面几条（没有滚动条，也没有滚轮），
+    // 用户的原话："目录页可以不要滚动栏，支持鼠标滚动即可"。
+    if with_state(|s| s.hover_toc).unwrap_or(false) && scroll_toc_by(notches) {
+        return;
+    }
     // 文本：一格 3 行。滚得动就不缩放。
     if scroll_text_by(wheel_text_rows(notches)) {
         return;
@@ -2522,6 +2539,39 @@ fn on_wheel(delta: i32) {
     if !moved {
         wheel_zoom(notches);
     }
+}
+
+/// 滚动目录栏（1.8.3）。返回是否处理了这次滚轮。
+///
+/// 目录一屏放不下时，滚轮在目录上就滚目录；放得下就返回 false，让给正文
+/// （否则"目录只有 5 条"的文件滚轮会失效，看起来像坏了）。
+fn scroll_toc_by(notches: isize) -> bool {
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let layout = frame(preview.raw());
+    let Some(toc) = layout.toc else {
+        return false;
+    };
+    let visible = window::toc_visible_rows(layout.below_chrome).max(1);
+    let total = with_state(|s| s.toc.len()).unwrap_or(0);
+    let max = total.saturating_sub(visible);
+    if max == 0 {
+        return false;
+    }
+    let cur = with_state(|s| s.toc_scroll).unwrap_or(0);
+    let step = wheel_text_rows(notches); // 一格 3 条，与正文手感一致
+    let next = (cur as i64 + step as i64).clamp(0, max as i64) as usize;
+    if next != cur {
+        with_state(|s| s.toc_scroll = next);
+        window::invalidate(preview.raw());
+        log_debug!(
+            SCOPE,
+            "TOCSCROLL {cur} -> {next}（共 {total} 条，可见 {visible} 条）"
+        );
+    }
+    let _ = toc;
+    true
 }
 
 /// 滚轮档数 → 文本滚动行数（纯函数，便于单测）。
@@ -5110,7 +5160,11 @@ fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
     if let Some(toc) = layout.toc
         && point_in(x, y, toc)
     {
-        let index = window::toc_item_at(layout.below_chrome, y);
+        let index = window::toc_item_at(
+            layout.below_chrome,
+            y,
+            with_state(|s| s.toc_scroll).unwrap_or(0),
+        );
         if let Some(index) = index {
             let target = with_state(|s| s.toc.get(index).map(|item| item.2)).flatten();
             if let Some(line) = target {
@@ -5173,14 +5227,21 @@ fn update_hover(hwnd: HWND, lparam: LPARAM) -> bool {
         None
     };
     let layout = frame(hwnd);
-    let toc_active = layout
-        .toc
-        .filter(|toc| point_in(x, y, *toc))
-        .and_then(|_| window::toc_item_at(layout.below_chrome, y));
+    let toc_active = layout.toc.filter(|toc| point_in(x, y, *toc)).and_then(|_| {
+        window::toc_item_at(
+            layout.below_chrome,
+            y,
+            with_state(|s| s.toc_scroll).unwrap_or(0),
+        )
+    });
+    let hover_toc = layout.toc.is_some_and(|toc| point_in(x, y, toc));
     let changed = with_state(|s| {
-        let changed = s.hover_button != button || s.toc_active != toc_active;
+        let changed =
+            s.hover_button != button || s.toc_active != toc_active || s.hover_toc != hover_toc;
         s.hover_button = button;
         s.toc_active = toc_active;
+        // 滚轮落点：悬停在目录栏上就滚目录，否则滚正文（1.8.3）。
+        s.hover_toc = hover_toc;
         changed
     })
     .unwrap_or(false);
@@ -6125,7 +6186,8 @@ fn paint_overlays_dc(hdc: HDC, layout: &Frame, content: RECT) {
             })
             .collect();
         let selected = hovered.or_else(|| toc_following(&items, scroll));
-        window::paint_toc_dc(hdc, toc, &refs, selected);
+        let first_toc = with_state(|s| s.toc_scroll).unwrap_or(0);
+        window::paint_toc_dc(hdc, toc, &refs, selected, first_toc);
     }
     if layout.bar.is_some()
         && let Some(info) = scroll_info()
@@ -6147,6 +6209,7 @@ fn paint_overlays(hwnd: HWND, layout: &Frame) {
             with_state(|s| (s.toc.clone(), s.toc_active, s.scroll)).unwrap_or_default();
         // 悬停优先，否则跟着当前滚动位置高亮（像阅读器那样，滚到哪里目录指到哪里）。
         let selected = hovered.or_else(|| toc_following(&items, scroll));
+        let first_toc = with_state(|s| s.toc_scroll).unwrap_or(0);
         let refs: Vec<window::TocItem<'_>> = items
             .iter()
             .map(|(level, text, _)| window::TocItem {
@@ -6154,7 +6217,7 @@ fn paint_overlays(hwnd: HWND, layout: &Frame) {
                 text: text.as_str(),
             })
             .collect();
-        window::paint_toc(hwnd, toc, &refs, selected);
+        window::paint_toc(hwnd, toc, &refs, selected, first_toc);
     }
     if layout.bar.is_some()
         && let Some(info) = scroll_info()
