@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use qlr_core::ipc::{self, Action, Request};
 use qlr_core::{
@@ -26,6 +26,7 @@ use qlr_render::Canvas;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, KillTimer, PostQuitMessage, SetTimer, WM_ACTIVATE, WM_CLOSE, WM_COPYDATA,
     WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
@@ -950,6 +951,12 @@ pub fn run() -> ExitCode {
         }
     }
 
+    // 退出兜底（1.8.3）：消息泵已经退出，下面全是"尽力而为"的清理。清理有可能被
+    // 第三方 DLL 吊住——插件是用 LoadLibrary 进来的，进程退出时 Windows 会进它的
+    // `DllMain(DLL_PROCESS_DETACH)`；插件在 DllMain 里等锁/等 COM/跑静态析构，
+    // 进程就停在"窗口没了、任务管理器里还在"的半死状态（现场报障就是这个现象）。
+    // 托盘图标已经摘掉、配置也已经落盘，所以超时直接强制结束自己最干脆。
+    arm_exit_watchdog(Duration::from_secs(5));
     if tray_ready {
         tray::remove(host, TRAY_ID);
     }
@@ -975,6 +982,38 @@ pub fn run() -> ExitCode {
     }
     log_info!(SCOPE, "退出：总运行 {}ms", started.elapsed().as_millis());
     ExitCode::SUCCESS
+}
+
+/// 退出看门狗：清理阶段卡住就强制结束进程（调用点见 `run()`）。
+///
+/// 为什么需要它：`quit()` 只负责把消息泵停掉，之后还要摘热键钩子、卸托盘、
+/// 反初始化 COM。这几步都会进第三方代码（钩子线程、插件 DLL 的 DllMain），
+/// 一旦对方卡住，进程就永远停在"没有窗口、任务管理器里还在"的状态——用户唯一的
+/// 出路是手动结束进程。这里给清理一个硬上限，到点自己走 `TerminateProcess`：
+/// 不触发 DLL detach 流程（卡住我们的正是它），也不等任何线程收尾。
+fn arm_exit_watchdog(limit: Duration) {
+    let spawned = std::thread::Builder::new()
+        .name("qlrust-exit-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(limit);
+            log_error!(
+                SCOPE,
+                "退出清理超过 {}s 仍未结束（第三方 DLL/钩子线程卡住），强制结束进程",
+                limit.as_secs()
+            );
+            unsafe {
+                let _ = TerminateProcess(GetCurrentProcess(), 1);
+            }
+            // TerminateProcess 正常情况下当场生效；万一被拒（受保护句柄），
+            // 再用 std 的保底退出，至少不会把控制权交给卡住的清理代码。
+            std::process::exit(1);
+        });
+    if spawned.is_err() {
+        log_error!(
+            SCOPE,
+            "退出看门狗线程起不来（内存不足？），清理阶段没有超时保护"
+        );
+    }
 }
 
 fn level_from_str(s: &str) -> Level {
