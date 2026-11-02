@@ -8,9 +8,12 @@
 //! - 渲染线程只做 `qlr_render::render_file`（纯 CPU，不碰 `HWND`），
 //!   完成后把结果放进 `RESULT` 槽并 `PostMessage(WM_QLR_RENDER)` 通知 UI；
 //! - 两者之间只靠"代际号 + 结果槽"通信，不做锁内回调，避免重蹈 `WM_PAINT` 递归死锁。
+//! - 渲染线程是单例，但**不是永生的**（1.8.3）：它卡死在第三方 FFI 里回不来时，看门狗
+//!   会换一条新的顶上去（`check_render_hang`），旧线程不 join 不 kill、自然烂掉。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -97,6 +100,26 @@ const SHELL_RING_DIP: i32 = 4;
 /// 定 3 s 的理由：本机最慢的正常帧（200 页 PDF 首页、48MP JPEG）都在 100 ms 量级，
 /// 3 s 已是 30 倍；再久基本就是解析器卡住或文件躺在慢速网络盘上。
 const RENDER_TIMEOUT_MS: u128 = 3000;
+
+/// 渲染线程"挂死"的判定阈值（1.8.3，自愈用）。
+///
+/// 和上面的 `RENDER_TIMEOUT_MS` 是两件事：3 s 那条只是"记 warn + 请求取消"（协作式，
+/// 渲染器在阶段边界自己退出），线程本身还会接着做下一帧；这里回答的是"线程根本回不来了"。
+///
+/// 为什么是 10 s：本机最慢的正常帧（200 页 PDF 首页、48 MP JPEG）实测都在 100–400 ms，
+/// 3 s 已经是 7–30 倍余量；真到 10 s 说明它卡死在某次不会返回的调用里（PDFium /
+/// MediaFoundation / 插件 cdylib 的 FFI，或 COM）。阈值再短会把"慢速网络盘上读一个
+/// 30 MB 扫描件"误判成挂死——每误判一次就白扔一条线程、重发一帧。
+const RENDER_HANG_MS: u64 = 10_000;
+
+/// 连续自愈的退避上限（1.8.3）：第 1 次 10 s、第 2 次 20 s、第 3 次起 40 s。
+///
+/// 为什么要退避：新线程如果也立刻挂死（PDFium 的全局锁还被旧线程攥着、插件里的静态锁
+/// 没释放），固定 10 s 就变成"每 10 s spawn 一条死线程"的连环抖动。退避到 40 s 仍然会
+/// 自愈，只是给旧线程留出"自己爬回来"的窗口；一旦有帧正常完成，计数立即清零（见
+/// `end_lease`），退避不会累积到下一次偶发挂死上。
+const RENDER_HANG_BACKOFF_MAX: u32 = 2;
+
 /// 拖边改大小的热区宽度（DIP）。太小不好抓，太大会吃掉顶栏按钮。
 const RESIZE_MARGIN_DIP: i32 = 6;
 /// 拖边之后的窗口最小尺寸（DIP；再小就只剩顶栏，用户没法再拖回来）。
@@ -388,11 +411,68 @@ static JOB_TX: OnceLock<Mutex<Sender<RenderJob>>> = OnceLock::new();
 /// worker 的产出槽：`(代际号, 结果)`。`PostMessage` 只能带两个整数，所以载荷走这里。
 type RenderOutcome = (u64, Result<Canvas, qlr_core::Error>);
 static RESULT: OnceLock<Mutex<Option<RenderOutcome>>> = OnceLock::new();
+
+/// 渲染线程代号（1.8.3）：每 spawn 一条就换一个新的、更大的号。
+///
+/// 渲染结果异步回来，自愈换线程之后**旧线程仍可能从第三方代码里爬出来交活**（PDFium 的
+/// 锁一放、COM 调用一返回）。结果槽只存"最后一帧"，旧线程的迟到结果要是写进去，就会顶掉
+/// 新线程刚算好的那一帧（UI 看到过期代际 → 丢弃 → 画面永远不出现）。有了代号，"这条线程
+/// 还是不是当前那条"就是一次原子读：旧线程在写槽/发通知之前先自报家门。
+///
+/// 初值 0 = "还没有渲染线程"；`spawn_render_worker` 成功换上新通道之后才把新号写进来。
+static RENDER_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 渲染线程的"租约"（1.8.3）：渲染线程领活时登记，交活时注销。
+///
+/// 为什么需要它：渲染线程是**单例**，一旦它卡在第三方 FFI 里就永不返回，之后所有任务
+/// 排队无人消费 —— 本会话预览永久不出图，只能重启。租约让 UI 线程能回答"这一帧从什么
+/// 时候开始跑、跑的是哪个文件"，从而判挂并换一条线程。
+///
+/// 另外三个字段的含义：`epoch` 领这条租约的渲染线程代号，`generation` 任务代际
+/// （防止 A 的完成把 B 的租约清掉），`job` 留着自愈之后原样重发。
+struct Lease {
+    epoch: u64,
+    generation: u64,
+    started: Instant,
+    job: RenderJob,
+}
+
+/// 租约 + 自愈状态（1.8.3）。**一把锁**，因为这三件事每次都要一起看。
+///
+/// 为什么不塞进 `State`：`State` 是 UI 线程的大锁（里面的字段牵着窗口/COM 句柄的生命
+/// 周期），渲染线程绝不能去碰它。这把锁只在三处各拿几微秒：派发时登记、交活时注销、
+/// 250 ms 看门狗判挂 —— UI 线程读它不会等渲染，渲染线程写它也不会等 UI。
+struct RenderTrack {
+    lease: Option<Lease>,
+    /// 自上次有帧真正完成以来，连续自愈了几次（成功后清零，用于退避）。
+    consecutive: u32,
+    /// 本会话累计重建次数（写进日志，便于判断"是不是一直在自愈"）。
+    total: u32,
+    /// 有重建在飞：从判挂到换完发送端之间置位，保证任何时刻最多一个重建。
+    healing: bool,
+}
+
+static RENDER_TRACK: OnceLock<Mutex<RenderTrack>> = OnceLock::new();
+
+fn render_track() -> &'static Mutex<RenderTrack> {
+    RENDER_TRACK.get_or_init(|| {
+        Mutex::new(RenderTrack {
+            lease: None,
+            consecutive: 0,
+            total: 0,
+            healing: false,
+        })
+    })
+}
+
 /// 从 `WM_COPYDATA` 收到、还没处理的请求。
 /// 不能在 `WM_COPYDATA` 里直接处理：那会儿线程处于输入同步呼叫状态，调 COM 会被拒。
 static PENDING: OnceLock<Mutex<Vec<Request>>> = OnceLock::new();
 
 /// 一帧渲染任务。只带不可变输入 + 显示预算，不碰任何窗口句柄。
+///
+/// `Clone` 只为租约服务（1.8.3）：自愈之后要把"卡住的那一帧"原样重发给新线程。
+#[derive(Clone)]
 struct RenderJob {
     generation: u64,
     path: PathBuf,
@@ -822,8 +902,10 @@ pub fn run() -> ExitCode {
 
     // 渲染线程（M2）：一次拉起、长期存活。它拿不到 HWND，只能 PostMessage 通知 UI。
     match spawn_render_worker(host) {
-        Ok(tx) => {
+        Ok((tx, epoch)) => {
             let _ = JOB_TX.set(Mutex::new(tx));
+            // 通道就位之后再让代号生效（理由见 `spawn_render_worker` 的注释）。
+            RENDER_EPOCH.store(epoch, Ordering::Release);
         }
         Err(e) => log_error!(SCOPE, "渲染线程启动失败（只能出占位文字）：{e}"),
     }
@@ -1050,12 +1132,246 @@ fn fake_slow_ms() -> Option<u64> {
     })
 }
 
-fn spawn_render_worker(host: HWND) -> Result<Sender<RenderJob>, qlr_core::Error> {
+/// 测试钩子（1.8.3）：`QLRUST_RENDER_HANG_MS=30000` 让渲染线程在处理**第一个**任务前
+/// 先睡这么久，模拟"卡在第三方 FFI（PDFium / MediaFoundation / 插件 cdylib）里回不来"，
+/// 用来验证租约判挂 + 线程自愈这条链路。
+///
+/// **仅开发/自动化验证用**，和 `QLRUST_DPI_FAKE` / `QLRUST_DPI_FIX` 是同一类开关：
+/// 不设置这个变量时行为与改动前完全一致（`std::env::var` 只查一次，热路径零开销）。
+///
+/// 为什么只注入到**第一条**线程：要验证的是"打开文件 → 约 10 s 后自愈 ERROR →
+/// 再打开另一个文件能正常出图"。重建出来的线程如果也睡 30 s，就永远验证不到"恢复"。
+fn fake_hang_ms() -> Option<u64> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<u64>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("QLRUST_RENDER_HANG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0 && *ms <= 600_000)
+    })
+}
+
+/// 派发任务前登记租约（UI 线程）。
+///
+/// 顺序是"先登记、再 `send`"：反过来的话，一个几十微秒就完成的渲染可能先注销，
+/// 然后被我们写成一条再也不会被清掉的空租约 —— 10 s 后看门狗就会对一条不存在的活判挂。
+///
+/// 这里**不**预先生成任务描述：那要在每一帧（包括 3 ms 的文本帧）上多一次 `format!` 和
+/// 一次堆分配，而描述只在"真的判挂"那一次才用得上（`mark_hung` 里现算）。
+fn begin_lease(job: &RenderJob) {
+    let lease = Lease {
+        epoch: RENDER_EPOCH.load(Ordering::Acquire),
+        generation: job.generation,
+        started: Instant::now(),
+        job: job.clone(),
+    };
+    if let Ok(mut guard) = render_track().lock() {
+        guard.lease = Some(lease);
+    }
+}
+
+/// 任务描述（写日志用）：文件名 + 类型 + 目标尺寸 + 页码，**不含完整用户路径**。
+fn describe_job(job: &RenderJob) -> String {
+    let name = job
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<无名>");
+    let kind = format::kind_for_path(&job.path);
+    if kind == format::Kind::Pdf {
+        format!(
+            "{name} {kind} {}x{} 第{}页",
+            job.max_width,
+            job.max_height,
+            job.page + 1
+        )
+    } else {
+        format!("{name} {kind} {}x{}", job.max_width, job.max_height)
+    }
+}
+
+/// 投递失败（线程已退出）：撤掉刚登记的租约，否则看门狗会为一条根本不存在的活重建线程。
+fn abort_lease(generation: u64) {
+    if let Ok(mut guard) = render_track().lock()
+        && let Some(lease) = guard.lease.as_ref()
+        && lease.generation == generation
+    {
+        guard.lease = None;
+    }
+}
+
+/// 渲染线程交活：只有"同一条线程 + 同一代"的租约才有资格注销。
+///
+/// 两个条件各挡一种错：`epoch` 挡"自愈前那条旧线程迟到返回"（它手里那张租约早属于新世界
+/// 了）；`generation` 挡"同一线程里 A 交活时把 B 的租约清掉"（UI 在 A 还在跑的时候就已经
+/// 派了 B，单线程 worker 手里是 A，租约却已经是 B 的）。
+fn end_lease(epoch: u64, generation: u64) {
+    let Ok(mut guard) = render_track().lock() else {
+        return;
+    };
+    if let Some(lease) = guard.lease.as_ref()
+        && lease.epoch == epoch
+        && lease.generation == generation
+    {
+        guard.lease = None;
+        // 有帧真的跑完了 = 线程是活的：连续自愈计数清零，退避不会累积到下一次偶发挂死。
+        guard.consecutive = 0;
+    }
+}
+
+/// 判挂阈值：连续自愈时翻倍退避（10 s → 20 s → 40 s 封顶，理由见 `RENDER_HANG_BACKOFF_MAX`）。
+fn hang_threshold(consecutive: u32) -> Duration {
+    Duration::from_millis(RENDER_HANG_MS << consecutive.min(RENDER_HANG_BACKOFF_MAX))
+}
+
+/// 判挂（UI 线程，250 ms 一拍）：租约超时、且没有重建在飞时占住 `healing`。
+///
+/// 返回 `(任务描述, 已卡毫秒, 原任务, 连续第几次, 本会话第几次)`。
+fn mark_hung() -> Option<(String, u128, RenderJob, u32, u32)> {
+    let mut guard = render_track().lock().ok()?;
+    if guard.healing {
+        return None;
+    }
+    let (desc, ms, job) = {
+        let lease = guard.lease.as_ref()?;
+        let ms = lease.started.elapsed();
+        if ms < hang_threshold(guard.consecutive) {
+            return None;
+        }
+        (describe_job(&lease.job), ms.as_millis(), lease.job.clone())
+    };
+    guard.healing = true;
+    Some((
+        desc,
+        ms,
+        job,
+        guard.consecutive.saturating_add(1),
+        guard.total.saturating_add(1),
+    ))
+}
+
+/// 重建失败（线程起不来 / 发送端锁被毒化）：退避一次，别每 250 ms 刷一行 ERROR。
+fn heal_failed() {
+    if let Ok(mut guard) = render_track().lock() {
+        guard.healing = false;
+        guard.consecutive = guard.consecutive.saturating_add(1);
+        // 时钟重启：下一次判挂要再等一个（已经翻倍过的）阈值。
+        if let Some(lease) = guard.lease.as_mut() {
+            lease.started = Instant::now();
+        }
+    }
+}
+
+/// 重建成功：记一次，并把卡住的那一帧重新登记成新租约（`Some` 表示要重发）。
+///
+/// **必须在"把这一帧投给新线程"之前调用**：新线程可能几微秒就算完（文本类），
+/// 要是它先交活、我们再登记租约，就会留下一条永远没人清的空租约 —— 下一个阈值到点
+/// 时看门狗会为一条根本不存在的活再判一次挂死。
+fn heal_succeeded(requeue: Option<&RenderJob>) {
+    if let Ok(mut guard) = render_track().lock() {
+        guard.healing = false;
+        guard.lease = None;
+        guard.consecutive = guard.consecutive.saturating_add(1);
+        guard.total = guard.total.saturating_add(1);
+    }
+    if let Some(job) = requeue {
+        begin_lease(job);
+    }
+}
+
+/// 渲染线程挂死 → 换一条新线程（1.8.3）。
+///
+/// 旧线程**不 join、不 kill**：Windows 上 `TerminateThread` 会在它正持有锁（堆锁、加载器锁、
+/// 第三方库内部锁）时把进程状态撕坏 —— 那比"烂着一条线程"危险得多。旧线程的 `Sender`
+/// 在这里就地换成新的、旧的被 drop，所以它一旦从 FFI 里爬出来，`rx.recv()` 立刻报错、
+/// 自己安静退出（线程自然死亡，不占任何资源）。
+///
+/// 保证任何时刻最多一个重建在飞：`healing` 从判挂起一直占到发送端换完；重建本身是同步的
+/// （只 spawn + 换 Sender，不 join 任何东西），UI 线程不会被它拖住。
+fn check_render_hang() {
+    let Some((desc, ms, job, consecutive, total)) = mark_hung() else {
+        return;
+    };
+    let Some(host) = with_state(|s| s.host) else {
+        heal_failed();
+        return;
+    };
+    // 用户还停在这一帧上（代际没变 + 窗口开着）才值得重发，否则没必要白占一条新线程。
+    let requeue = with_state(|s| s.visible && s.render_gen == job.generation).unwrap_or(false);
+    let (tx, epoch) = match spawn_render_worker(host.raw()) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log_error!(SCOPE, "RENDER 挂死 {ms}ms（{desc}），重建渲染线程失败：{e}");
+            heal_failed();
+            return;
+        }
+    };
+    // 换发送端 + 让新代号生效 + 登记新租约 + 重发，四件事在同一把锁里按这个顺序做完：
+    // - 代号必须先于投递：否则新线程可能在我们写代号之前就算完，结果被当成"旧线程"丢弃；
+    // - 租约必须先于投递：否则"几微秒就算完"的那一帧交活时找不到租约（见 `heal_succeeded`）。
+    // 锁序与 `request_render` 一致（JOB_TX → RENDER_TRACK），不会与渲染线程那把单锁成环。
+    let swapped = match JOB_TX.get().map(|slot| slot.lock()) {
+        Some(Ok(mut guard)) => {
+            *guard = tx;
+            RENDER_EPOCH.store(epoch, Ordering::Release);
+            heal_succeeded(requeue.then_some(&job));
+            if requeue {
+                let _ = guard.send(job.clone());
+            }
+            true
+        }
+        _ => false,
+    };
+    if !swapped {
+        // 只有锁被毒化才可能走到这里：新通道随 `tx` 一起丢弃，新线程自己退出。
+        log_error!(SCOPE, "RENDER 挂死 {ms}ms（{desc}），重建后没换上发送端");
+        heal_failed();
+        return;
+    }
+    if requeue {
+        // 重发也算"这一帧重新开始"：让 3 s 的取消告警重新计时。
+        with_state(|s| {
+            s.render_since = Some(Instant::now());
+            s.render_warned = false;
+        });
+    }
+    log_error!(
+        SCOPE,
+        "RENDER 挂死 {ms}ms（{desc}，代际 {}），已重建渲染线程 epoch={}（连续第 {consecutive} 次 / 本会话第 {total} 次）{}",
+        job.generation,
+        epoch,
+        if requeue {
+            "，这一帧已重发给新线程"
+        } else {
+            ""
+        }
+    );
+}
+
+/// 拉起一条渲染线程。返回 `(任务发送端, 线程代号)`。
+///
+/// 线程只拿 `host` 的裸句柄用于 `PostMessageW`（`HWND` 不是 `Send`，所以只能传 `isize`），
+/// 绝不碰窗口的其他属性——窗口只能在 UI 线程上操作。
+///
+/// 代号**由调用方**在把发送端换进 `JOB_TX` 之后才写进 `RENDER_EPOCH`（见
+/// `check_render_hang`）：换不上通道时新线程根本收不到活，代号也就不该生效，否则旧线程
+/// 会立刻变成"已退役"，它下一次交活的结果被白白丢掉。
+///
+/// 测试钩子：`QLRUST_SLOW_RENDER_MS=5000` 让每个渲染任务先睡这么久（验证 1.2.0 的
+/// 取消链路——真造一个要跑 5 s 的合法文件很难，"注入延迟"才能稳定复现看门狗的行为）；
+/// `QLRUST_RENDER_HANG_MS` 让第一条线程的第一个任务睡（验证 1.8.3 的挂死自愈）。
+/// 两者都只读一次环境变量，生产环境不设置时零开销。
+fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64), qlr_core::Error> {
     let (tx, rx) = mpsc::channel::<RenderJob>();
     let host_raw = host.0 as isize;
+    let epoch = RENDER_EPOCH.load(Ordering::Acquire) + 1;
+    // 挂死只注入到第一条线程：要验证的是"自愈之后能恢复"，新线程必须是好的。
+    let hang_ms = if epoch == 1 { fake_hang_ms() } else { None };
     std::thread::Builder::new()
         .name("qlr-render".to_string())
         .spawn(move || {
+            let mut hang_simulated = false;
             while let Ok(mut job) = rx.recv() {
                 // 1.2.0：队列里堆着好几个过期的活（用户连按方向键）时，只做最新的那个。
                 // 工作线程是单线程，不这么做"过期帧"会一个个渲染完再被丢弃——纯浪费。
@@ -1079,6 +1395,16 @@ fn spawn_render_worker(host: HWND) -> Result<Sender<RenderJob>, qlr_core::Error>
                 if let Some(ms) = fake_slow_ms() {
                     log_warn!(SCOPE, "RENDER 注入慢渲染 {ms}ms（测试钩子）");
                     std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                // 测试钩子（1.8.3）：模拟"卡在第三方 FFI 里不返回"——不查取消标志、
+                // 不响应任何协作式退出，只能靠 UI 线程换一条线程来恢复。
+                if let Some(ms) = hang_ms.filter(|_| !hang_simulated) {
+                    hang_simulated = true;
+                    log_warn!(
+                        SCOPE,
+                        "RENDER 注入挂死 {ms}ms（测试钩子 QLRUST_RENDER_HANG_MS，仅开发用）"
+                    );
+                    std::thread::sleep(Duration::from_millis(ms));
                 }
                 // 测试钩子（1.2.0）：验证崩溃兜底（panic → 报告 + minidump）。
                 // release 是 `panic = "abort"`，所以这里**一定会**把进程带走——
@@ -1128,6 +1454,18 @@ fn spawn_render_worker(host: HWND) -> Result<Sender<RenderJob>, qlr_core::Error>
                         elapsed
                     ),
                 }
+                // 1.8.3：自愈换线程之后，旧线程迟早会从第三方代码里爬出来交活。
+                // 它的结果绝不能进结果槽、也不能通知 UI —— 那会顶掉新线程刚算好的那一帧
+                // （UI 只看代际号，一代就对得上），或者把用户早翻过去的旧图糊上来。
+                if RENDER_EPOCH.load(Ordering::Acquire) != epoch {
+                    log_debug!(
+                        SCOPE,
+                        "RENDER gen={} 来自已退役的渲染线程（epoch={epoch}），丢弃",
+                        job.generation
+                    );
+                    continue;
+                }
+                end_lease(epoch, job.generation);
                 if let Some(slot) = RESULT.get()
                     && let Ok(mut guard) = slot.lock()
                 {
@@ -1138,7 +1476,7 @@ fn spawn_render_worker(host: HWND) -> Result<Sender<RenderJob>, qlr_core::Error>
             log_debug!(SCOPE, "渲染线程退出");
         })
         .map_err(|e| qlr_core::Error::Message(format!("创建渲染线程失败：{e}")))?;
-    Ok(tx)
+    Ok((tx, epoch))
 }
 
 /// 走插件渲染（只在渲染线程调用）。
@@ -1307,7 +1645,10 @@ fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         page,
         upscale: with_state(|s| s.zoom > 1.0).unwrap_or(false),
     };
+    // 1.8.3：登记租约（先登记再投递，顺序理由见 `begin_lease`）。
+    begin_lease(&job);
     if tx.send(job).is_err() {
+        abort_lease(generation);
         log_warn!(SCOPE, "渲染线程已退出，丢弃本次任务");
     }
 }
@@ -1318,7 +1659,11 @@ fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
 /// **请求取消**（协作式：渲染器在下一个阶段边界退出；单个 FFI 调用打断不了，
 /// 这条限制写在 `qlr_render::cancel` 的模块文档里）。UI 线程绝不因此阻塞——
 /// 用户随时还能按空格换文件、按 × 关窗口。
+///
+/// 1.8.3 起多一件事：**判挂换线程**（`check_render_hang`）。取消只在渲染器肯查标志时
+/// 有用；卡死在第三方 FFI 里的线程连标志都摸不到，只能换一条新的顶上去。
 fn on_render_watchdog() {
+    check_render_hang();
     let slow = with_state(|s| {
         let since = s.render_since?;
         let ms = since.elapsed().as_millis();
@@ -7714,5 +8059,46 @@ mod tests {
         // 点在内容区之上（顶栏）或之下（窗口底）都不算行。
         assert_eq!(archive_row_index(content, 0, top - 1), None);
         assert_eq!(archive_row_index(content, 0, 748), None);
+    }
+
+    /// 1.8.3 自愈：判挂阈值必须"起步 10 s、连续自愈翻倍、封顶 40 s"。
+    ///
+    /// 这条锁住三件事：① 阈值不能偷偷改小（会把慢盘/大图误判成挂死）；
+    /// ② 连续重建必须退避（否则新线程也挂死时变成每 10 s 死一条的连环抖动）；
+    /// ③ 退避有上限（否则挂死次数一多，阈值涨到几分钟，用户以为程序又"永久失效"了）。
+    #[test]
+    fn hang_threshold_backs_off_then_caps() {
+        assert_eq!(hang_threshold(0), Duration::from_millis(10_000));
+        assert_eq!(hang_threshold(1), Duration::from_millis(20_000));
+        assert_eq!(hang_threshold(2), Duration::from_millis(40_000));
+        assert_eq!(
+            hang_threshold(9),
+            Duration::from_millis(40_000),
+            "封顶后不再翻倍"
+        );
+    }
+
+    /// 1.8.3 自愈日志：任务描述带文件名/类型/尺寸/页码，但**不许**带上完整用户路径。
+    #[test]
+    fn job_desc_has_no_user_path() {
+        let job = RenderJob {
+            generation: 7,
+            path: PathBuf::from(r"C:\Users\someone\Desktop\report.pdf"),
+            max_width: 800,
+            max_height: 1000,
+            page: 2,
+            upscale: false,
+        };
+        let desc = describe_job(&job);
+        assert!(desc.contains("report.pdf"), "要有文件名：{desc}");
+        assert!(desc.contains("800x1000"), "要有目标尺寸：{desc}");
+        assert!(
+            desc.contains("第3页"),
+            "PDF 要带页码（0 基转 1 基）：{desc}"
+        );
+        assert!(
+            !desc.contains("someone"),
+            "日志不许出现完整用户路径：{desc}"
+        );
     }
 }
