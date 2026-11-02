@@ -794,8 +794,12 @@ pub fn natural_rect_scaled(work: RECT, width: i32, height: i32, factor: f32) -> 
 
     let ww = ((work.right - work.left) as f32 * NATURAL_FILL).max(1.0) as i32;
     let wh = ((work.bottom - work.top) as f32 * NATURAL_FILL).max(1.0) as i32;
-    let cw = width.max(1);
-    let ch = height.max(1);
+    // 1.8.3：入参 `width/height` 是**96 DPI 下的自然像素**（PDF 页 794×1123 = A4@96dpi，
+    // 图片 = 图片像素数），先按 DPI 换成物理像素再算缩放。
+    // 不换的话：200% 屏上一页 A4 只有 397×561 DIP，用户看到的是"内容小一半"
+    // （这是"顶栏小"之外的另一半，光改字号和行高不够）。
+    let cw = dpi::px(width.max(1));
+    let ch = dpi::px(height.max(1));
 
     // `fit` = 塞进工作区所需的系数；`min_scale` = 撑到最小可读尺寸所需的系数。
     let fit = (ww as f32 / cw as f32).min(wh as f32 / ch as f32);
@@ -835,6 +839,10 @@ pub fn zoomed_rect(work: RECT, natural: (u32, u32), zoom: f32) -> RECT {
     let ch = ((natural.1.max(1) as f32) * zoom.max(0.01))
         .round()
         .max(1.0);
+    // 1.8.3：与 `natural_rect_scaled` 同一套口径——自然尺寸是 96 DPI 像素，先换到物理像素。
+    // 这样"缩放 100%"在 200% 屏上仍然是一页实实在在的 A4，而不是半页。
+    let cw = dpi::pxf(cw);
+    let ch = dpi::pxf(ch);
     let scale = (ww as f32 / cw).min(wh as f32 / ch).min(1.0);
     let width = ((cw * scale).round() as i32).clamp(1, ww);
     let height = ((ch * scale).round() as i32).clamp(1, wh);
@@ -925,9 +933,13 @@ impl TextStyle {
         }
     }
 
-    /// 字号（像素，逻辑高度）。全部 ≤18 px，保证塞进 24 px 行高不被裁。
+    /// 字号（**物理像素**，逻辑高度）。全部 ≤18 DIP，保证塞进 24 DIP 行高不被裁。
+    ///
+    /// 1.8.3：表里写的是 DIP，实际传给 `CreateFontW` 的是按 DPI 换算后的值。
+    /// 200% 下正文 15 → 30，与 30×2=60 的顶栏、48 的行高成比例，
+    /// 这就是用户要的"字看起来和 100% 下一模一样大"。
     fn height(self) -> i32 {
-        match self {
+        let dip = match self {
             TextStyle::Heading1 => 18,
             TextStyle::Heading2 => 17,
             TextStyle::Heading3 => 16,
@@ -936,7 +948,8 @@ impl TextStyle {
             TextStyle::LineNumber => 12,
             TextStyle::Keyword | TextStyle::Str | TextStyle::Comment | TextStyle::Number => 14,
             _ => 15,
-        }
+        };
+        dpi::px(dip)
     }
 
     fn weight(self) -> i32 {
@@ -1070,6 +1083,39 @@ impl FontSet {
         self.fonts[idx] = Some(font);
         font
     }
+
+    /// 丢掉全部缓存字体（DPI 变化时用）：不丢的话跨屏之后还在用旧像素高度的字体，
+    /// 字会"半大不小"，而且每次都新建字体但不释放 → 每跨一次屏漏 14 个 HFONT。
+    fn clear(&mut self) {
+        for slot in &mut self.fonts {
+            if let Some(font) = slot.take() {
+                // 只删自己 `CreateFontW` 出来的；`get()` 里失败退回 stock 的那条路径
+                // **不缓存**，所以这里不可能拿到 stock 对象（删它会失败但也不致命）。
+                unsafe {
+                    let _ = DeleteObject(font.into());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FontSet {
+    /// 线程退出时兜底：`thread_local` 不保证 drop，但主线程退出前会走到这里的情况
+    /// （例如设置窗所在的线程）至少不把 HFONT 漏给系统。
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// 丢掉本线程的字体缓存。**这是 `dpi::set_change_hook` 的回调**：DPI 一变就调，
+/// 下次绘制按新字号重建。
+pub fn fonts_invalidate() {
+    FONTS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// 装上"DPI 变了 → 重建字体"的钩子。宿主启动时调一次即可。
+pub fn install_dpi_hook() {
+    dpi::set_change_hook(fonts_invalidate);
 }
 
 /// 画一组带样式的文本行（逐行上色，每行可以多段）。

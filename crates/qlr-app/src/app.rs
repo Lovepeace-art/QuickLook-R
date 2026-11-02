@@ -448,6 +448,13 @@ fn get_content() -> Option<Arc<Canvas>> {
 /// 程序入口。返回进程退出码。
 pub fn run() -> ExitCode {
     dpi::enable_per_monitor_v2();
+    // 1.8.3：主线程先按"系统 DPI"起步。开窗尺寸是在**窗口建出来之前**算的
+    // （`window_size_for`），那时没有 hwnd 可查，只能用系统 DPI；单屏用户这就是对的。
+    // 窗口建好之后由窗口过程里的 `dpi::enter(hwnd)` 按窗口实际 DPI 细化。
+    dpi::seed_thread(dpi::system_dpi());
+    // 装"DPI 变了 → 重建字体"的钩子：字体是按像素高度 CreateFontW 出来的，
+    // 不重建就会一直是旧尺寸。
+    window::install_dpi_hook();
     let _ = paths::ensure_dirs();
 
     let (config, config_err) = Config::load(&paths::config_path());
@@ -2921,6 +2928,10 @@ fn ensure_follow_worker() {
             .name("qlrust-follow".into())
             .spawn(|| {
                 let _ = qlr_platform::selection::init_com();
+                // 1.8.3：这个线程也会算窗口尺寸（投机预热），而 `dpi::px()` 读的是
+                // **线程本地** DPI。不 seed 的话它按 96 算，与 UI 线程算出的 w/h 不一致，
+                // 而 `pagecache` 的 key 含 w/h → 预热永远打不中，白烧 CPU 还看不出效果。
+                dpi::seed_thread(dpi::system_dpi());
                 // 已经通知过、但 UI 没切过去（比如"不支持"被跳过）：别每 90 ms 抖一次消息。
                 let mut notified: Option<PathBuf> = None;
                 loop {
@@ -6383,6 +6394,10 @@ fn on_hotkey(vk: usize, pressed_at: u32) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // 1.8.3：每条消息先对齐到本窗口的 DPI。放在最前面有两个作用：
+        // 1) 绘制前 `dpi::px()` 拿到的是本窗口 DPI（预热线程、设置窗、跨屏拖动都靠它）；
+        // 2) `WM_DPICHANGED` 到达时 DPI 已经变了，`enter` 会发现变化并触发字体重建钩子。
+        dpi::enter(hwnd);
         log_debug!(SCOPE, "wm=0x{msg:04X}");
         match msg {
             // 去掉系统边框/标题栏，同时保留 DWM 阴影与亚克力。
@@ -6723,6 +6738,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1.8.3：开窗尺寸必须随 DPI 变，且"宽随 DPI、高随工作区比例"这条口径不能被改坏。
+    ///
+    /// 这是 DPI 改动唯一能自动断言的部分（视觉要靠 `scripts\baseline-shot.ps1` +
+    /// 用户真机）。它同时锁住两个曾经的坑：
+    /// - 文本窗宽度要 ×DPI（否则 200% 下只有 440 DIP 宽的一条缝）；
+    /// - 文本窗高度**不能** ×DPI（高度 = 工作区 × height_ratio，卡里写的"2478 px"
+    ///   就是这么算错的：1080 高的屏上根本放不下）。
+    #[test]
+    fn window_size_scales_with_dpi() {
+        // 用一块比窗口大得多的"工作区"，免得 0.92 的上限夹住宽度，让 2× 关系可断言。
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
+        let cfg = Config::default();
+
+        dpi::seed_thread(96);
+        let text96 = window_size_for(work, format::Kind::Text, None, &cfg, None);
+        let pdf96 = window_size_for(work, format::Kind::Pdf, Some((794, 1123)), &cfg, None);
+
+        dpi::seed_thread(192);
+        let text192 = window_size_for(work, format::Kind::Text, None, &cfg, None);
+        let pdf192 = window_size_for(work, format::Kind::Pdf, Some((794, 1123)), &cfg, None);
+        dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
+
+        assert_eq!(text192.0, text96.0 * 2, "文本窗宽度应该 ×DPI");
+        assert_eq!(text192.1, text96.1, "文本窗高度按工作区比例，不随 DPI 变");
+        // PDF 的自然尺寸也是 ×DPI 的：200% 下一页 A4 明显更大（受工作区 86% 夹持，
+        // 所以只能断言"明显变大"，不能断言恰好 2 倍）。
+        assert!(
+            pdf192.0 as f64 >= pdf96.0 as f64 * 1.5,
+            "PDF 200% 下应该明显变大：{} -> {}",
+            pdf96.0,
+            pdf192.0
+        );
+        assert!(pdf192.1 >= pdf96.1, "PDF 高度也不该变小");
+    }
 
     /// 滚动位置永远落在 [0, total - rows]：不能滚成负数，也不能滚过头看不到最后一行。
     #[test]
