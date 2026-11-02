@@ -111,8 +111,8 @@ const EXTRA_ROWS: usize = 2;
 
 /// 设置窗客户区应有的高度。绘制与实际窗口都从这里取，避免两处各算一遍。
 fn client_height() -> i32 {
-    window::SETTINGS_PADDING_TOP * 2
-        + (layout().len() + EXTRA_ROWS) as i32 * window::SETTINGS_ROW_HEIGHT
+    window::settings_padding_top() * 2
+        + (layout().len() + EXTRA_ROWS) as i32 * window::settings_row_height()
 }
 
 struct Ui {
@@ -357,7 +357,7 @@ fn value_text(ui: &Ui, target: Edit) -> String {
 fn on_click(hwnd: HWND, lparam: LPARAM) {
     // WM_LBUTTONDOWN 的 lparam：低 16 位 x、高 16 位 y，**都是有符号**的。
     let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-    let index = (y - window::SETTINGS_PADDING_TOP) / window::SETTINGS_ROW_HEIGHT;
+    let index = (y - window::settings_padding_top()) / window::settings_row_height();
     if index < 0 {
         return;
     }
@@ -639,8 +639,8 @@ mod tests {
         assert!(matches!(rows[2], Row::Item(Action::Toggle)));
         // 命中测试的换算：y = padding + index * row_height。
         let index = 2;
-        let y = window::SETTINGS_PADDING_TOP + index * window::SETTINGS_ROW_HEIGHT + 3;
-        let got = (y - window::SETTINGS_PADDING_TOP) / window::SETTINGS_ROW_HEIGHT;
+        let y = window::settings_padding_top() + index * window::settings_row_height() + 3;
+        let got = (y - window::settings_padding_top()) / window::settings_row_height();
         assert_eq!(got, index);
     }
 
@@ -658,7 +658,7 @@ mod tests {
         // 客户区能放下的行数（扣掉上下 padding）必须 ≥ 实际会画的行数，
         // 否则最后那行提示会被裁掉半截。
         let fits =
-            (client_height() - window::SETTINGS_PADDING_TOP * 2) / window::SETTINGS_ROW_HEIGHT;
+            (client_height() - window::settings_padding_top() * 2) / window::settings_row_height();
         let painted = (layout().len() + EXTRA_ROWS) as i32;
         assert!(
             fits >= painted,

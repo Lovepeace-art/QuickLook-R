@@ -43,8 +43,6 @@ const PREVIEW_CLASS: &str = "QLRust.PreviewWindow";
 const SHADOW_CLASS: &str = "QLRust.ShadowWindow";
 const TRAY_ID: u32 = 1;
 
-/// 文本行高，必须与 `qlr-platform::window::paint_text` 里的值一致（那边画、这边算可见行数）。
-const LINE_HEIGHT: i32 = 24;
 /// 放大镜默认倍数与上下限（Shift + 滚轮每一格 ±1）。
 const LENS_DEFAULT_ZOOM: f32 = 3.0;
 const LENS_MIN_ZOOM: f32 = 1.5;
@@ -98,11 +96,24 @@ const SHELL_RING_DIP: i32 = 4;
 /// 定 3 s 的理由：本机最慢的正常帧（200 页 PDF 首页、48MP JPEG）都在 100 ms 量级，
 /// 3 s 已是 30 倍；再久基本就是解析器卡住或文件躺在慢速网络盘上。
 const RENDER_TIMEOUT_MS: u128 = 3000;
-/// 拖边改大小的热区宽度（像素）。太小不好抓，太大会吃掉顶栏按钮。
-const RESIZE_MARGIN: i32 = 6;
-/// 拖边之后的窗口最小尺寸（再小就只剩顶栏，用户没法再拖回来）。
-const MIN_WINDOW_W: i32 = 240;
-const MIN_WINDOW_H: i32 = 160;
+/// 拖边改大小的热区宽度（DIP）。太小不好抓，太大会吃掉顶栏按钮。
+const RESIZE_MARGIN_DIP: i32 = 6;
+/// 拖边之后的窗口最小尺寸（DIP；再小就只剩顶栏，用户没法再拖回来）。
+///
+/// 1.8.3：这两个值改成"设计值 + DPI 换算"。200% 缩放下如果还按 240 物理像素算，
+/// 最小窗口只有 120 DIP 宽——比顶栏上三个按钮还窄，拖到极限就再也拖不回来了。
+const MIN_WINDOW_W_DIP: i32 = 240;
+const MIN_WINDOW_H_DIP: i32 = 160;
+
+/// 最小窗口宽（物理像素，随 DPI）。
+fn min_window_w() -> i32 {
+    dpi::px(MIN_WINDOW_W_DIP)
+}
+
+/// 最小窗口高（物理像素，随 DPI）。
+fn min_window_h() -> i32 {
+    dpi::px(MIN_WINDOW_H_DIP)
+}
 
 /// `HWND` 不是 `Send`，而全局状态需要 `Send`。项目是单线程 GUI，
 /// 这个包装只用来把句柄跨函数传递，不代表可以在别的线程用。
@@ -2233,7 +2244,7 @@ fn view_size(preview: HWND) -> (u32, u32) {
     let rc = window::client_rect(preview);
     // 顶栏（1.0.9 起四种格式统一）占一条，内容区只有剩下的高度——按整窗渲染的话
     // 最后一条会被顶栏切掉。
-    let reserve = window::CHROME_HEIGHT;
+    let reserve = window::chrome_height();
     let (w, h) = (
         (rc.right - rc.left).max(1) as u32,
         ((rc.bottom - rc.top) - reserve).max(1) as u32,
@@ -2286,7 +2297,7 @@ fn set_zoom_to(new: f32, old: f32, render: bool) {
             let cw = ((bw as f32) * new).round().max(1.0) as u32;
             let ch = ((bh as f32) * new).round().max(1.0) as u32;
             // base 记的是**内容区**尺寸：PDF 的窗口还要多出一条页码栏的高度。
-            let reserve = window::CHROME_HEIGHT;
+            let reserve = window::chrome_height();
             window::resize_around_center(preview.raw(), cw as i32, (ch as i32) + reserve);
             (cw, ch)
         }
@@ -2366,7 +2377,7 @@ fn scroll_clamp(current: usize, delta: isize, total: usize, rows: usize) -> usiz
 /// 状态行占一行，正文能用的行数要减 1。
 /// 一屏能放几行正文（不含顶部留白与状态行）。
 ///
-/// 1.0.8 修：以前按 `h / LINE_HEIGHT - 1` 算，**没扣顶部留白**，748 高的窗口算出
+/// 1.0.8 修：以前按 `h / window::line_height() - 1` 算，**没扣顶部留白**，748 高的窗口算出
 /// 30 行正文，加上状态行就是 `16 + 31*24 = 760 > 748` —— 最后一行被窗口裁掉半截，
 /// 用户看到的就是"md 和文本最后一行显示不全"。
 fn visible_rows(hwnd: HWND) -> usize {
@@ -2378,8 +2389,8 @@ fn visible_rows(hwnd: HWND) -> usize {
 /// 1.0.9 起顶栏、目录栏、滚动条都会吃掉内容区，所以行数必须按**内容区**算，
 /// 否则文本最后一行会跑到顶栏下面去（或反过来多留一条空白）。
 fn rows_in(content: RECT) -> usize {
-    let usable = (content.bottom - content.top) - window::TEXT_PADDING_TOP;
-    let rows = (usable / LINE_HEIGHT).max(1) as usize;
+    let usable = (content.bottom - content.top) - window::text_padding_top();
+    let rows = (usable / window::line_height()).max(1) as usize;
     // 再让出一行给状态行（状态行画在正文之上，两行一起必须塞得下）。
     rows.saturating_sub(1).max(1)
 }
@@ -2700,9 +2711,9 @@ fn resize_margin(hwnd: HWND) -> i32 {
     let live_shell =
         with_state(|s| s.shell_preview.is_some() && !s.shell_owns_input).unwrap_or(false);
     if live_shell {
-        return ring.max(RESIZE_MARGIN / 2);
+        return ring.max(dpi::px(RESIZE_MARGIN_DIP) / 2);
     }
-    dpi::scaled(hwnd, 8).max(RESIZE_MARGIN)
+    dpi::scaled(hwnd, 8).max(dpi::px(RESIZE_MARGIN_DIP))
 }
 
 /// 按下：命中边缘就进入"改大小"模式（否则交给移动窗口）。
@@ -2737,16 +2748,16 @@ fn clamp_media_resize(rc: RECT, edges: ResizeEdges, aspect: f64, bar: i32) -> RE
     if !(aspect.is_finite() && aspect > 0.0) {
         return rc;
     }
-    let extra = window::CHROME_HEIGHT + bar;
+    let extra = window::chrome_height() + bar;
     let mut out = rc;
     let vertical_only = (edges.top || edges.bottom) && !(edges.left || edges.right);
     let (content_w, content_h) = if vertical_only {
-        let ch = ((out.bottom - out.top) - extra).max(MIN_WINDOW_H);
-        let cw = (ch as f64 * aspect).round().max(MIN_WINDOW_W as f64) as i32;
+        let ch = ((out.bottom - out.top) - extra).max(min_window_h());
+        let cw = (ch as f64 * aspect).round().max(min_window_w() as f64) as i32;
         (cw, ch)
     } else {
-        let cw = (out.right - out.left).max(MIN_WINDOW_W);
-        let ch = (cw as f64 / aspect).round().max(MIN_WINDOW_H as f64) as i32;
+        let cw = (out.right - out.left).max(min_window_w());
+        let ch = (cw as f64 / aspect).round().max(min_window_h() as f64) as i32;
         (cw, ch)
     };
     // 水平：拖左边 → 右边不动；拖右边 → 左边不动（两种都拖 = 右边不动）；
@@ -2785,16 +2796,16 @@ fn on_resize_move(lparam: LPARAM) {
     let (dx, dy) = (x - x0, y - y0);
     let mut rc = original;
     if edges.left {
-        rc.left = (original.left + dx).min(original.right - MIN_WINDOW_W);
+        rc.left = (original.left + dx).min(original.right - min_window_w());
     }
     if edges.right {
-        rc.right = (original.right + dx).max(original.left + MIN_WINDOW_W);
+        rc.right = (original.right + dx).max(original.left + min_window_w());
     }
     if edges.top {
-        rc.top = (original.top + dy).min(original.bottom - MIN_WINDOW_H);
+        rc.top = (original.top + dy).min(original.bottom - min_window_h());
     }
     if edges.bottom {
-        rc.bottom = (original.bottom + dy).max(original.top + MIN_WINDOW_H);
+        rc.bottom = (original.bottom + dy).max(original.top + min_window_h());
     }
     // 图片/视频（1.8.1）：窗口比例锁死素材比例——无论拖哪条边，先夹回等比再落地。
     // （1.8.2 起拖边这条路对图片/视频已关闭，这里保留兜底：万一别处真的在改大小，
@@ -2830,7 +2841,7 @@ fn on_resize_move(lparam: LPARAM) {
 fn content_size_of(client: RECT) -> (u32, u32) {
     (
         (client.right - client.left).max(1) as u32,
-        ((client.bottom - client.top) - window::CHROME_HEIGHT).max(1) as u32,
+        ((client.bottom - client.top) - window::chrome_height()).max(1) as u32,
     )
 }
 
@@ -3239,7 +3250,7 @@ fn maybe_prewarm() {
 
 /// 文本拖拽滚动：把像素位移折算成"行"。
 ///
-/// 攒零头是必须的：`LINE_HEIGHT` = 24 px，鼠标一次只动 3–5 px，
+/// 攒零头是必须的：`window::line_height()` = 24 px，鼠标一次只动 3–5 px，
 /// 每帧取整会让慢速拖动完全不动（体验上像"拖不动"）。
 fn scroll_text_by_pixels(pixels: i32) -> bool {
     if !matches!(get_content().as_deref(), Some(Canvas::Text(_))) {
@@ -3256,8 +3267,8 @@ fn scroll_text_by_pixels(pixels: i32) -> bool {
 /// 像素位移 + 零头 → 要滚几行（负数 = 向上）。纯函数，便于单测。
 fn pixels_to_rows(residual: &mut i32, pixels: i32) -> isize {
     *residual += pixels;
-    let rows = *residual / LINE_HEIGHT;
-    *residual -= rows * LINE_HEIGHT;
+    let rows = *residual / window::line_height();
+    *residual -= rows * window::line_height();
     rows as isize
 }
 
@@ -3458,7 +3469,7 @@ fn paint_lens_if_any(hwnd: HWND) {
     // 镜头整体留在窗口里：靠边时把镜头往里推，而不是让 GDI 裁掉一半。
     let rc = window::client_rect(hwnd);
     let (r, cw, ch) = (
-        window::LENS_RADIUS,
+        window::lens_radius(),
         (rc.right - rc.left).max(1),
         (rc.bottom - rc.top).max(1),
     );
@@ -3583,11 +3594,11 @@ fn window_size_for(
     // 顶栏（1.0.9）四种格式都有：只有"按内容开窗"的格式才需要额外留一条。
     // 视频再加一条进度条的高度（1.7.9）：不留的话画面会被进度条挤扁一圈。
     let reserve = if natural.is_some() {
-        window::CHROME_HEIGHT
+        window::chrome_height()
     } else {
         0
     } + if kind == format::Kind::Video {
-        window::AUDIO_BAR_H
+        window::audio_bar_h()
     } else {
         0
     };
@@ -3613,8 +3624,8 @@ fn window_size_for(
     // 尺寸记忆（1.0.14）：用户自己改过这个格式的窗口大小就照它开。
     if let Some((w, h)) = remembered {
         let (ww, wh) = (work.right - work.left, work.bottom - work.top);
-        width = w.clamp(MIN_WINDOW_W, ww);
-        height = h.clamp(MIN_WINDOW_H, wh);
+        width = w.clamp(min_window_w(), ww);
+        height = h.clamp(min_window_h(), wh);
     }
     // 图片/视频（1.8.1）：窗口比例 = 素材比例，记忆下来的尺寸也要夹回来——
     // 否则上次拖成方形，下次开图又变成"内容在方窗口里留白/变形"。
@@ -3629,10 +3640,10 @@ fn window_size_for(
     (width, height)
 }
 
-/// 视频画面下面还有一条进度条（`window::AUDIO_BAR_H`），图片没有。
+/// 视频画面下面还有一条进度条（`window::audio_bar_h()`），图片没有。
 fn media_bar(kind: format::Kind) -> i32 {
     if kind == format::Kind::Video {
-        window::AUDIO_BAR_H
+        window::audio_bar_h()
     } else {
         0
     }
@@ -3643,12 +3654,12 @@ fn media_bar(kind: format::Kind) -> i32 {
 /// `content_w` 是"想开多宽"，高度由比例反算；超出工作区就先压高度再反算宽度，
 /// 绝不把内容算出 0。返回的是**整窗**尺寸（内容 + 顶栏 + 进度条）。
 fn media_window_size(work: RECT, aspect: f64, content_w: i32, bar: i32) -> (i32, i32) {
-    let extra = window::CHROME_HEIGHT + bar;
+    let extra = window::chrome_height() + bar;
     let (ww, wh) = (work.right - work.left, work.bottom - work.top);
-    let mut cw = content_w.max(MIN_WINDOW_W);
+    let mut cw = content_w.max(min_window_w());
     let mut ch = (cw as f64 / aspect).round().max(1.0) as i32;
     if ch + extra > wh {
-        ch = (wh - extra).max(MIN_WINDOW_H);
+        ch = (wh - extra).max(min_window_h());
         cw = (ch as f64 * aspect).round().max(1.0) as i32;
     }
     if cw > ww {
@@ -3717,7 +3728,7 @@ fn show_preview(path: Option<PathBuf>) {
         window_size_for(work, kind, natural, &config, remembered_size(kind_key));
     // 顶栏（1.0.9）：只有按内容开窗的格式才把顶栏算在内容之外。
     let reserve = if natural.is_some() {
-        window::CHROME_HEIGHT
+        window::chrome_height()
     } else {
         0
     };
@@ -4044,7 +4055,7 @@ fn remember_size() {
         return;
     };
     // 太小的不记（拖到最小尺寸时的一瞬间），否则下次开窗只有一条缝。
-    if w < MIN_WINDOW_W || h < MIN_WINDOW_H {
+    if w < min_window_w() || h < min_window_h() {
         return;
     }
     with_state(|s| {
@@ -4845,7 +4856,7 @@ fn frame(hwnd: HWND) -> Frame {
     let mut content = below;
     // 窗口太窄就不显示目录：正文被挤到 300 px 还不如没有目录。
     let toc = if has_toc && (below.right - below.left) > 520 {
-        content.left += window::TOC_WIDTH;
+        content.left += window::toc_width();
         Some(window::toc_rect(below))
     } else {
         None
@@ -4854,13 +4865,13 @@ fn frame(hwnd: HWND) -> Frame {
     // 所以这里单独问一次；命中测试和绘制都读同一个 `Frame`，两边才不会错位。
     let bar = if has_archive_view() {
         if archive_scroll_info(below).is_some() {
-            content.right -= window::SCROLLBAR_W;
+            content.right -= window::scrollbar_w();
             Some(window::scrollbar_rect(below))
         } else {
             None
         }
     } else if scroll_info().is_some() {
-        content.right -= window::SCROLLBAR_W;
+        content.right -= window::scrollbar_w();
         Some(window::scrollbar_rect(below))
     } else {
         None
@@ -5372,14 +5383,14 @@ fn archive_rows() -> Vec<ArchiveRow> {
 
 /// 点 `y` 落在第几行（已加上当前滚动偏移）。落在内容区之外返回 `None`。
 ///
-/// 口径必须和 `window::paint_list` 完全一致：起点同样加 `TEXT_PADDING_TOP`，
-/// 行高同样用 `LIST_ROW_HEIGHT`，否则"看到的行"和"点到的行"会差一行。
+/// 口径必须和 `window::paint_list` 完全一致：起点同样加 `window::text_padding_top()`，
+/// 行高同样用 `window::list_row_height()`，否则"看到的行"和"点到的行"会差一行。
 fn archive_row_index(content: RECT, scroll: usize, y: i32) -> Option<usize> {
-    let top = content.top + window::TEXT_PADDING_TOP;
+    let top = content.top + window::text_padding_top();
     if y < top || y >= content.bottom {
         return None;
     }
-    Some(scroll + ((y - top) / window::LIST_ROW_HEIGHT) as usize)
+    Some(scroll + ((y - top) / window::list_row_height()) as usize)
 }
 
 /// 压缩包列表的点击（1.7.3）：选中这一行；目录再翻转展开。
@@ -5485,7 +5496,7 @@ fn has_archive_view() -> bool {
 
 /// 一屏能放下几行。绘制与滚轮/命中测试共用同一份口径，否则"看到的行"和"点到的行"会错位。
 fn archive_rows_per_screen(content: RECT) -> usize {
-    ((content.bottom - content.top) / window::LIST_ROW_HEIGHT).max(1) as usize
+    ((content.bottom - content.top) / window::list_row_height()).max(1) as usize
 }
 
 /// 画压缩包列表（1.7.3）。
@@ -5840,7 +5851,7 @@ fn repaint(hwnd: HWND) {
                     current_kind(),
                     Some(format::Kind::Html) | Some(format::Kind::Audio)
                 );
-                let gutter = if plain_doc { 0 } else { window::TEXT_GUTTER };
+                let gutter = if plain_doc { 0 } else { window::text_gutter() };
                 let width = ((rc.right - rc.left) - 48 - gutter).max(0) as u32;
                 // 折行需要"这段文字有多宽"，只能问 GDI：抓一次 DC 量一屏，
                 // 量不到（拿 DC 失败）就退回不折行 —— 宁可不折行也不能画错。
@@ -5978,7 +5989,7 @@ fn repaint(hwnd: HWND) {
                         "STYLED 屏幕 {} 行（样式分布：{}）行号栏={}px",
                         styled.len() - 1,
                         parts.join(" "),
-                        window::TEXT_GUTTER
+                        window::text_gutter()
                     );
                 }
                 let _ = t.encoding;
@@ -6189,7 +6200,7 @@ fn paint_code(
             tally[2],
             tally[3],
             tally[4],
-            window::TEXT_GUTTER
+            window::text_gutter()
         );
     }
     window::paint_doc(hwnd, Some(chrome), Some(layout.content), &doc);
@@ -6934,7 +6945,7 @@ mod tests {
 
     #[test]
     fn content_size_of_subtracts_chrome_height() {
-        // 顶栏占 `CHROME_HEIGHT`，内容区 = 客户区减去它（渲染尺寸与 `base` 都按内容区算）。
+        // 顶栏占 `window::chrome_height()`，内容区 = 客户区减去它（渲染尺寸与 `base` 都按内容区算）。
         let client = RECT {
             left: 0,
             top: 0,
@@ -6943,7 +6954,7 @@ mod tests {
         };
         let (w, h) = content_size_of(client);
         assert_eq!(w, 800);
-        assert_eq!(h, (600 - window::CHROME_HEIGHT) as u32);
+        assert_eq!(h, (600 - window::chrome_height()) as u32);
         // 窗口被夹到极矮时不能出 0（0 高会让渲染线程直接报错）。
         let tiny = RECT {
             left: 0,
@@ -6958,7 +6969,7 @@ mod tests {
     fn content_of(rc: RECT) -> (i32, i32) {
         (
             rc.right - rc.left,
-            rc.bottom - rc.top - window::CHROME_HEIGHT,
+            rc.bottom - rc.top - window::chrome_height(),
         )
     }
 
@@ -6999,7 +7010,7 @@ mod tests {
         assert_eq!(h, 900);
         // 视频（1.8.1 同图片口径）：比例锁死，但要额外留出底部进度条的高度。
         let (w, h) = window_size_for(work, format::Kind::Video, Some((1280, 720)), &config, None);
-        let content_h = h - window::CHROME_HEIGHT - window::AUDIO_BAR_H;
+        let content_h = h - window::chrome_height() - window::audio_bar_h();
         let want = (w as f64 * 720.0 / 1280.0).round() as i32;
         assert!(
             (content_h - want).abs() <= 1,
@@ -7082,8 +7093,8 @@ mod tests {
             bottom: true,
             ..ResizeEdges::default()
         };
-        let out = clamp_media_resize(rc, edges, 2.0, window::AUDIO_BAR_H);
-        let content_h = out.bottom - out.top - window::CHROME_HEIGHT - window::AUDIO_BAR_H;
+        let out = clamp_media_resize(rc, edges, 2.0, window::audio_bar_h());
+        let content_h = out.bottom - out.top - window::chrome_height() - window::audio_bar_h();
         assert_eq!(out.right - out.left, content_h * 2);
         assert_eq!(out.top, 0, "拖下边时上边界不能动");
     }
@@ -7303,7 +7314,7 @@ mod tests {
         );
     }
 
-    /// 点击反算行号：口径必须和 `paint_list` 一致（内容区顶 + `TEXT_PADDING_TOP`，行高 26）。
+    /// 点击反算行号：口径必须和 `paint_list` 一致（内容区顶 + `window::text_padding_top()`，行高 `window::list_row_height()`）。
     #[test]
     fn archive_row_index_matches_paint_list_metrics() {
         let content = RECT {
@@ -7312,14 +7323,14 @@ mod tests {
             right: 800,
             bottom: 748,
         };
-        let top = 30 + window::TEXT_PADDING_TOP;
+        let top = 30 + window::text_padding_top();
         assert_eq!(archive_row_index(content, 0, top), Some(0));
         assert_eq!(
-            archive_row_index(content, 0, top + window::LIST_ROW_HEIGHT - 1),
+            archive_row_index(content, 0, top + window::list_row_height() - 1),
             Some(0)
         );
         assert_eq!(
-            archive_row_index(content, 0, top + window::LIST_ROW_HEIGHT),
+            archive_row_index(content, 0, top + window::list_row_height()),
             Some(1)
         );
         // 滚动 10 行后，同样的 y 对应第 10 行。
