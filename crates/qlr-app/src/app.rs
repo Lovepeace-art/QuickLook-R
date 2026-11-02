@@ -38,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::cli::{self, Command};
+use crate::layout;
 use crate::pagecache;
 use crate::settings;
 
@@ -2687,7 +2688,7 @@ const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 8.0;
 
 fn scaled(value: u32, zoom: f32) -> u32 {
-    ((value as f32 * zoom).round() as i64).clamp(1, 16_384) as u32
+    layout::scaled(value, zoom)
 }
 
 /// 当前该按多大像素渲染：客户区尺寸（扣掉顶部状态条）× 缩放。
@@ -2701,13 +2702,9 @@ fn view_size(preview: HWND) -> (u32, u32) {
     // 现场日志就是这条：`STRETCH 位图 1044x1477 != 内容区 1020x1479`。
     //
     // 顶栏（1.0.9 起四种格式统一）也已经在 `chrome_rects().content` 里扣过了。
-    let f = frame(preview);
-    let (w, h) = (
-        (f.content.right - f.content.left).max(1) as u32,
-        (f.content.bottom - f.content.top).max(1) as u32,
-    );
-    let zoom = with_state(|s| s.zoom).unwrap_or(1.0);
-    (scaled(w, zoom), scaled(h, zoom))
+    // 1.8.3 起四套"内容区尺寸"统一由 `layout::Layout` 产出，这里直接取 `render_box`：
+    // 它和 `frame().content × zoom` 是同一份算术，不会再各算一遍。
+    frame(preview).render_box
 }
 
 /// 复位到"适应窗口"（100%）。
@@ -3370,26 +3367,11 @@ fn on_resize_move(lparam: LPARAM) {
 /// 窗口客户区尺寸 → 内容区尺寸（扣掉顶栏，下限 1）。
 ///
 /// 全局约定：`request_render` 与 `s.base` 都用**内容区**尺寸（见 `view_size()`、
-/// `show_preview` 里 `height - reserve`、`set_zoom_to` 里 `+ reserve`）。
+/// `show_preview` 里 `layout::reserve_for_window`、`set_zoom_to` 里 `+ reserve`）。
 /// 拖边结束时以前把整窗高度当内容高度传下去，于是位图比内容区高 30px →
 /// 上屏走拉伸（图片/PDF 拖完发虚），`base` 也高 30px → 之后每缩放一次高度再漂 30px。
 fn content_size_of(client: RECT) -> (u32, u32) {
-    (
-        (client.right - client.left).max(1) as u32,
-        ((client.bottom - client.top) - window::chrome_height()).max(1) as u32,
-    )
-}
-
-/// 这一类内容在内容区里会不会占掉一条竖向滚动条。
-///
-/// 渲染盒、绘制布局（`frame()`）、预热三条路必须给出同一个答案，否则位图和内容区
-/// 宽度差出一条滚动条：右边那一截被滚动条压住，上屏还得拉伸（每帧重采样）。
-/// 现场日志就是这么来的：`STRETCH 位图 1044x1477 != 内容区 1020x1479`。
-///
-/// 只有 PDF 是"位图 + 滚动条"同时存在的：图片/SVG/视频没有条，文本没有位图。
-/// 单页 PDF 放得下，不画条（`ScrollInfo::new` 的规则），这也是唯一需要看页数的地方。
-fn render_reserves_scrollbar(kind: format::Kind, pages: Option<usize>) -> bool {
-    kind == format::Kind::Pdf && pages.is_none_or(|n| n > 1)
+    layout::content_size_of(client)
 }
 
 /// 内容区尺寸 → 渲染盒（已扣掉滚动条、已按缩放放大）。
@@ -3397,6 +3379,8 @@ fn render_reserves_scrollbar(kind: format::Kind, pages: Option<usize>) -> bool {
 /// 跟 `view_size()` 同一个口径：`view_size` 是"窗口已经有了，直接量绘制用的内容区"，
 /// 这里是"窗口还没开，按算出来的尺寸推"。两边算出来的必须是同一个数，
 /// 否则页缓存 key 对不上、预热也永远打不中（1.3.0 的坑）。
+///
+/// 1.8.3 起两边都由 `layout::Layout` 产出：这里只是"没有窗口时"的入口。
 fn render_box(
     kind: format::Kind,
     pages: Option<usize>,
@@ -3404,15 +3388,19 @@ fn render_box(
     height: i32,
     zoom: f32,
 ) -> (u32, u32) {
-    let width = if render_reserves_scrollbar(kind, pages) {
-        width - window::scrollbar_w()
-    } else {
-        width
-    };
-    (
-        scaled(width.max(1) as u32, zoom),
-        scaled(height.max(1) as u32, zoom),
+    layout::from_window_size(
+        width,
+        height,
+        0,
+        layout::Opts {
+            kind,
+            pages,
+            zoom,
+            toc: false,
+            bar: layout::Bar::Auto,
+        },
     )
+    .render_box
 }
 
 /// 抬起：结束改大小，并按新尺寸重画（位图内容需要重新光栅化到新尺寸）。
@@ -4323,11 +4311,9 @@ fn show_preview(path: Option<PathBuf>) {
     let (content_w, content_h) =
         window_size_for(work, kind, natural, &config, remembered_size(kind_key));
     // 顶栏（1.0.9）：只有按内容开窗的格式才把顶栏算在内容之外。
-    let reserve = if natural.is_some() {
-        window::chrome_height()
-    } else {
-        0
-    };
+    // 这条规则与 `window_size_for` 里那个 `reserve` 是同一件事，1.8.3 起由
+    // `layout::reserve_for_window` 一处给出。
+    let reserve = layout::reserve_for_window(natural);
     // 居中的"底稿"只用来定 left/top，宽高一律以 `window_size_for` 为准。
     let mut rect = match natural {
         Some((w, h)) => {
@@ -5516,50 +5502,36 @@ fn scroll_info() -> Option<window::ScrollInfo> {
 }
 
 /// 内容区布局。绘制与命中测试都从这里取，保证"看到的位置"和"点到的位置"一致。
-struct Frame {
-    /// 扣掉顶栏后的区域（目录栏 / 滚动条都从它里面切）。
-    below_chrome: RECT,
-    /// 真正排版内容的区域。
-    content: RECT,
-    /// 目录栏（Markdown 且窗口够宽才有）。
-    toc: Option<RECT>,
-    /// 滚动条（内容放不下才有）。
-    bar: Option<RECT>,
-}
+///
+/// 1.8.3 起它就是 `layout::Layout`：几何只在 `layout.rs` 里算一次，这里只负责
+/// **把状态翻译成输入**（有没有目录、这一帧画不画滚动条），不再自己切矩形。
+type Frame = layout::Layout;
 
 fn frame(hwnd: HWND) -> Frame {
     let client = window::client_rect(hwnd);
+    // 问滚动条信息要一块"顶栏以下"的区域（纯函数，代价可忽略）；几何本身交给
+    // `layout::from_client` 统一算，这里不切矩形。
     let below = window::chrome_rects(client).content;
-    let has_toc = with_state(|s| !s.toc.is_empty()).unwrap_or(false);
-    let mut content = below;
-    // 窗口太窄就不显示目录：正文被挤到 300 px 还不如没有目录。
-    let toc = if has_toc && (below.right - below.left) > 520 {
-        content.left += window::toc_width();
-        Some(window::toc_rect(below))
-    } else {
-        None
-    };
+    // 目录、缩放、页数一次锁里取完（布局的输入必须是"同一瞬间"的状态）。
+    let (has_toc, zoom, pages) =
+        with_state(|s| (!s.toc.is_empty(), s.zoom, s.pages)).unwrap_or((false, 1.0, None));
     // 压缩包列表（1.7.3）：内容单位是"展平后的行"，和文本/PDF 的 `scroll_info()` 不是一套，
     // 所以这里单独问一次；命中测试和绘制都读同一个 `Frame`，两边才不会错位。
-    let bar = if has_archive_view() {
-        if archive_scroll_info(below).is_some() {
-            content.right -= window::scrollbar_w();
-            Some(window::scrollbar_rect(below))
-        } else {
-            None
-        }
-    } else if scroll_info().is_some() {
-        content.right -= window::scrollbar_w();
-        Some(window::scrollbar_rect(below))
+    let visible_bar = if has_archive_view() {
+        archive_scroll_info(below).is_some()
     } else {
-        None
+        scroll_info().is_some()
     };
-    Frame {
-        below_chrome: below,
-        content,
-        toc,
-        bar,
-    }
+    layout::from_client(
+        client,
+        layout::Opts {
+            kind: current_kind().unwrap_or(format::Kind::Unsupported),
+            pages,
+            zoom,
+            toc: has_toc,
+            bar: layout::Bar::from_visible(visible_bar),
+        },
+    )
 }
 
 /// 跳到第 `page` 页（1 基，越界会被夹住）。
