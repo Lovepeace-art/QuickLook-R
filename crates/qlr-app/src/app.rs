@@ -47,6 +47,15 @@ const PREVIEW_CLASS: &str = "QLRust.PreviewWindow";
 const SHADOW_CLASS: &str = "QLRust.ShadowWindow";
 const TRAY_ID: u32 = 1;
 
+/// 托盘注册失败、还没告诉过用户（1.8.3）。
+///
+/// 为什么用"待办标记"而不是当场弹窗：托盘失败发生在 `State` 还没建好、预览窗
+/// 还没显示的时候（裸启动），此刻既没有可以挂 toast 的窗口，也不该阻塞启动。
+/// 所以只记一笔，等第一次真的把窗口显示出来时用顶栏 toast 说一次，然后清掉——
+/// 每次打开都提示会把预览变成噪音。
+static TRAY_FAILURE_NOTICE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 放大镜默认倍数与上下限（Shift + 滚轮每一格 ±1）。
 const LENS_DEFAULT_ZOOM: f32 = 3.0;
 const LENS_MIN_ZOOM: f32 = 1.5;
@@ -808,28 +817,20 @@ pub fn run() -> ExitCode {
             // 托盘失败时程序会静默常驻后台、用户完全找不到入口（也没法退出），
             // 所以必须显式告知 —— 否则用户只会看到"程序好像没起来"。
             //
-            // 两个刻意的约束：
-            // 1. 只在"用户双击启动"（没有路径、动作是裸 Toggle）时弹，
-            //    自动化/命令行调用不弹，否则脚本会被模态框卡死；
-            // 2. 放独立线程弹，UI 线程继续跑（托盘没了但空格预览还得能用）。
+            // 1.8.3 改：不再单独起线程弹模态 MessageBox。
+            // 老弹框的三个副作用（实测都成立）：
+            // 1. 那条 `std::thread::spawn` 让进程形态变样（线程 7 → 9），
+            //    任何"常驻资源"对比都会被它带偏（上一版 +9 线程 / +46% WS 就是这么来的）；
+            // 2. 模态框会盖住屏幕、只能点"确定"，自动化脚本会被它卡住；
+            // 3. 框关掉之后用户仍然不知道程序还在跑——信息只活在那一次弹窗里。
+            //
+            // 现在改成"日志 + 第一次显示窗口时的顶栏 toast"（见 `notify_tray_failure_once`）：
+            // 无窗口时也能在日志里查到根因和手工退出方式，第一次预览时再用非模态提示说一次。
+            // 仍然只在"用户双击启动"（没有路径、动作是裸 Toggle）时标记，
+            // 命令行/自动化调用不打扰（这条约束从 1.0.x 就有，别去掉）。
             let bare_launch = request.path.is_none() && matches!(request.action, Action::Toggle);
             if bare_launch {
-                let code = code.to_string();
-                std::thread::spawn(move || {
-                    window::warn_box(
-                        "QLRust：托盘图标加不上",
-                        &format!(
-                            "程序已经在后台运行（选中文件按空格可以预览），\
-                             但**没能把图标加到右下角托盘**。\n\n\
-                             原因：{code}\n\n\
-                             最可能的情况：这个 qlrust.exe 放在受限目录里（例如 DSH 工作目录），\
-                             文件被系统打上了 Low 完整性标签，无法与任务栏通信。\n\n\
-                             解决办法：把 qlrust.exe 复制到普通目录（例如 D:\\qlrust\\ 或桌面）\
-                             再双击运行。\n\n\
-                             退出当前这个实例：qlrust.exe --quit"
-                        ),
-                    );
-                });
+                TRAY_FAILURE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             false
         }
@@ -1803,9 +1804,22 @@ struct FrameKey {
 ///
 /// 内存代价接近 0：这一帧同时被 `CONTENT` 和这里各持一个 `Arc`，是同一块内存；
 /// 真正多出来的只是"换文件之后旧那一帧还活着"的那几 MB。
-/// 上一帧缓存最多留几帧：3 帧足够覆盖"在 A 和 B 之间来回看"的常见用法，
-/// 内存上限也就是 3 张窗口大小的位图（4K 级别约 10 MB），远比 QuickLook 的常驻小。
+/// 上一帧缓存最多留几帧：3 帧足够覆盖"在 A 和 B 之间来回看"的常见用法。
 const LAST_FRAME_CAP: usize = 3;
+
+/// 上一帧缓存的总内存上限（字节）。1.8.3：从"只数帧数"改成"帧数 + 字节"双限。
+///
+/// 为什么必须按字节兜一道：一帧位图的体积 = 宽 × 高 × 4，跟文件格式无关——
+/// 1080p 一帧 5.7 MB，放大预览（8×，按 32 MP 上限截断）一帧能到 128 MB。
+/// 只数帧数的话"3 帧"最坏是 ~260 MB，而用户换文件时对此毫无感知，
+/// 收盘后内存一直挂着（实测每预览一个文件 Private 就 +5.7 MB 且收起不回落）。
+///
+/// 24 MB 这个数的取舍：
+/// - 1080p（5.7 MB/帧）能留 4 帧，"A/B 来回看"这个主要收益还在；
+/// - 换过 4 个 1080p 文件后常驻约 23 MB，而不是"一人一帧"线性涨到几十 MB；
+/// - 单帧就超过 24 MB 时（大窗口 / 放大预览）靠 `trim_last_frames` 里的
+///   `len() > 1` 仍然保留最近 1 帧——"同一文件重开秒开"这条最大收益不能整条扔掉。
+const LAST_FRAME_MAX_BYTES: usize = 24 * 1024 * 1024;
 
 /// 上一帧们的 LRU：头是最久没用到，尾是刚用过。
 type LastFrames = std::collections::VecDeque<(FrameKey, Arc<Canvas>)>;
@@ -1865,8 +1879,32 @@ fn remember_last_frame(key: FrameKey, canvas: Arc<Canvas>) {
         guard.remove(pos);
     }
     guard.push_back((key, canvas));
-    while guard.len() > LAST_FRAME_CAP {
-        guard.pop_front();
+    trim_last_frames(&mut guard);
+}
+
+/// 一帧占多少字节（只用于"上一帧缓存"的预算，不做精确统计）。
+fn canvas_bytes(canvas: &Canvas) -> usize {
+    match canvas {
+        Canvas::Bitmap(b) => b.bgra.len(),
+        // 文本帧是重排结果，量级只有几十 KB：按行估一个偏大的上限即可。
+        Canvas::Text(t) => t.lines.len().saturating_mul(256),
+    }
+}
+
+/// 淘汰最旧的帧，直到同时满足"帧数 ≤ [`LAST_FRAME_CAP`]"和"总字节 ≤ [`LAST_FRAME_MAX_BYTES`]"。
+///
+/// 唯一的例外是**至少保留最近 1 帧**：单帧就可能超预算（放大预览一帧 128 MB），
+/// 这时限额给"同一文件重开秒开"让路——宁可超一点，也不要每次重开都重新渲染。
+fn trim_last_frames(frames: &mut LastFrames) {
+    while frames.len() > LAST_FRAME_CAP {
+        frames.pop_front();
+    }
+    let mut total: usize = frames.iter().map(|(_, canvas)| canvas_bytes(canvas)).sum();
+    while total > LAST_FRAME_MAX_BYTES && frames.len() > 1 {
+        let Some((_, evicted)) = frames.pop_front() else {
+            break;
+        };
+        total = total.saturating_sub(canvas_bytes(&evicted));
     }
 }
 
@@ -4406,6 +4444,8 @@ fn show_preview(path: Option<PathBuf>) {
         window::show_at(preview_hwnd.raw(), rect, config.topmost);
         sync_shadow();
         hotkey::set_active(true);
+        // 托盘没加上时，第一次"窗口真的可见"就用 toast 说一次（1.8.3）。
+        notify_tray_failure_once(preview_hwnd.raw());
         with_state(|s| {
             s.visible = true;
             s.last_path = Some(p.to_path_buf());
@@ -4539,6 +4579,8 @@ fn show_preview(path: Option<PathBuf>) {
     // 开着的时候才需要旁听翻页键。
     // 跟随计时器从启动就跑（1.1.0）：窗口收着的时候它负责预渲染，所以这里不再重开。
     hotkey::set_active(true);
+    // 托盘没加上时，第一次"窗口真的可见"就用 toast 说一次（1.8.3）。
+    notify_tray_failure_once(preview_hwnd.raw());
 
     // 声音与画面（1.7.9）：窗口已经可见，音频自动开始播、视频自动开始放；
     // 其它格式一律停掉（从 wav 切到图片时不能继续在后台响）。
@@ -5398,12 +5440,40 @@ fn file_title() -> String {
 /// 用在"翻页到边界"这种"用户按了但内容不会再动"的场合——不给反馈的话，
 /// 用户会以为按键没生效（PPT 以前就是按到底直接切到 PowerPoint 自己的黑屏结束页）。
 fn show_toast(hwnd: HWND, text: impl Into<String>) {
-    let until = Instant::now() + std::time::Duration::from_millis(1200);
+    show_toast_ms(hwnd, text, 1200);
+}
+
+/// 带时长的提示：[`show_toast`] 的通用版本。
+///
+/// 翻页到边界那种"按了但内容不再动"的瞬时反馈 1.2 s 够；而"托盘图标没加上、
+/// 程序还在后台跑"这种需要读两遍的信息给 5 s，否则用户只看到一闪。
+fn show_toast_ms(hwnd: HWND, text: impl Into<String>, ms: u64) {
+    let until = Instant::now() + std::time::Duration::from_millis(ms);
     with_state(|s| s.toast = Some((text.into(), until)));
     unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_TOAST, 1200, None);
+        let _ = SetTimer(Some(hwnd), TIMER_TOAST, ms as u32, None);
     }
     window::invalidate(hwnd);
+}
+
+/// 托盘注册失败后的第一次"可见提示"（1.8.3）。
+///
+/// 必须在**窗口已经显示出来之后**调用：toast 画在顶栏上，窗口没显示时写进去
+/// 谁也看不见，而且定时器一过就被擦掉了。所以 `show_preview` 在每次成功
+/// `show_at` 之后都问一次这里，标记被取走之后就不再打扰。
+fn notify_tray_failure_once(hwnd: HWND) {
+    if !TRAY_FAILURE_NOTICE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log_warn!(
+        SCOPE,
+        "托盘图标没加上（见启动日志）：已在预览窗顶栏提示一次，退出用 qlrust.exe --quit"
+    );
+    show_toast_ms(
+        hwnd,
+        "托盘图标没加上：后台常驻，qlrust.exe --quit 可退出",
+        5000,
+    );
 }
 
 /// 当前还该显示的那条提示（过期的不返回）。
@@ -8100,5 +8170,66 @@ mod tests {
             !desc.contains("someone"),
             "日志不许出现完整用户路径：{desc}"
         );
+    }
+
+    /// 造一帧"占 `mb` 兆字节"的位图：`canvas_bytes` 只看 `bgra.len()`。
+    fn fake_frame(mb: usize, tag: u8) -> Arc<Canvas> {
+        let bytes = mb * 1024 * 1024;
+        Arc::new(Canvas::Bitmap(qlr_render::Bitmap {
+            width: 1024,
+            height: (bytes / 4 / 1024) as u32,
+            bgra: vec![tag; bytes],
+        }))
+    }
+
+    fn fake_key(n: usize) -> FrameKey {
+        FrameKey {
+            path: PathBuf::from(format!("f{n}.png")),
+            mtime: 0,
+            size: 0,
+            page: 0,
+            width: 1024,
+            height: 1024,
+            upscale: false,
+        }
+    }
+
+    /// 1.8.3：上一帧缓存同时受"帧数 ≤ 3"和"总字节 ≤ 24 MB"两条上限约束，
+    /// 且单帧就超预算时仍保留最近 1 帧（"同一文件重开秒开"这条收益不能被限额吃掉）。
+    #[test]
+    fn last_frame_cache_respects_byte_budget() {
+        // 3 帧 × 10 MB = 30 MB > 24 MB → 只能留 2 帧，且被淘汰的必须是最旧那帧。
+        let mut frames: LastFrames = std::collections::VecDeque::new();
+        for i in 0..3 {
+            frames.push_back((fake_key(i), fake_frame(10, i as u8)));
+        }
+        trim_last_frames(&mut frames);
+        assert_eq!(frames.len(), 2, "24 MB 预算下 10 MB 的帧最多留 2 帧");
+        assert_eq!(
+            frames.back().expect("至少要留一帧").0.path,
+            PathBuf::from("f2.png"),
+            "最新的那帧不许被淘汰"
+        );
+
+        // 单帧 30 MB 已超预算：留 1 帧；再来一帧 30 MB 时淘汰旧的，仍留 1 帧。
+        let mut frames: LastFrames = std::collections::VecDeque::new();
+        frames.push_back((fake_key(0), fake_frame(30, 0)));
+        trim_last_frames(&mut frames);
+        assert_eq!(frames.len(), 1, "单帧超预算也要保住最近 1 帧");
+        frames.push_back((fake_key(1), fake_frame(30, 1)));
+        trim_last_frames(&mut frames);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames.back().expect("至少要留一帧").0.path,
+            PathBuf::from("f1.png")
+        );
+
+        // 小帧照旧受"最多 3 帧"约束（1 MB × 5 → 3）。
+        let mut frames: LastFrames = std::collections::VecDeque::new();
+        for i in 0..5 {
+            frames.push_back((fake_key(i), fake_frame(1, i as u8)));
+        }
+        trim_last_frames(&mut frames);
+        assert_eq!(frames.len(), LAST_FRAME_CAP);
     }
 }

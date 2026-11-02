@@ -1,0 +1,34 @@
+{
+  "dpi": [
+    {
+      "DPI": 96,
+      "窗口": "631x924",
+      "RENDER行": 1,
+      "STRETCH": 0,
+      "LETTERBOX": 1,
+      "SLOWPAINT": 0,
+      "PAINT行": 1,
+      "STRETCH_翻页后": 0,
+      "LETTERBOX_翻页后": 2,
+      "末条PAINT": "2026-11-02T12:58:20.702Z DEBUG [ThreadId(1)] app        PAINT bitmap 619x876 pan=(0, 0) client=631x924 ink=7041",
+      "末条LETTERBOX": "2026-11-02T12:58:20.702Z DEBUG [ThreadId(1)] app        LETTERBOX 位图高 876 < 内容区 894（页面比例所限，正常留白）",
+      "末条STRETCH": "",
+      "末条RENDER": "2026-11-02T12:58:18.627Z INFO  [ThreadId(3)] app        RENDER gen=1 bitmap 619x876 bytes=2168976 ink=7019 elapsed=4ms (请求 619x894)"
+    },
+    {
+      "DPI": 192,
+      "窗口": "631x954",
+      "RENDER行": 1,
+      "STRETCH": 0,
+      "LETTERBOX": 1,
+      "SLOWPAINT": 0,
+      "PAINT行": 1,
+      "STRETCH_翻页后": 0,
+      "LETTERBOX_翻页后": 2,
+      "末条PAINT": "2026-11-02T12:58:25.945Z DEBUG [ThreadId(1)] app        PAINT bitmap 607x859 pan=(0, 0) client=631x954 ink=6918",
+      "末条LETTERBOX": "2026-11-02T12:58:25.945Z DEBUG [ThreadId(1)] app        LETTERBOX 位图高 859 < 内容区 894（页面比例所限，正常留白）",
+      "末条STRETCH": "",
+      "末条RENDER": "2026-11-02T12:58:23.935Z INFO  [ThreadId(3)] app        RENDER gen=1 bitmap 607x859 bytes=2085652 ink=6901 elapsed=3ms (请求 607x894)"
+    }
+  ]
+}
