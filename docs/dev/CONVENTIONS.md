@@ -1436,3 +1436,30 @@ Excel 滚轮 / 横向滚动条拖动 / Shift+滚轮 全 True。
 `QLRUST_MEDIA_FIXTURES` 的绝对路径就能打开）。修法：`fixture()` 命中文件后先
 `std::fs::canonicalize(&path).unwrap_or(path)` 再返回。
 教训：**任何传给 MCI 的路径都必须是解析好的绝对路径**；顺便，`canonicalize` 也能消掉 8.3 短名与符号链接的差异。
+
+### #52 `dpi::enter` 不许缓存 hwnd：`if CURRENT == hwnd { return }` 会自锁
+
+症状：把一个窗口从 100% 屏拖到 150% 屏，字号/行高/顶栏高度全按旧 DPI 画，而且**永远**不恢复。
+根因：缓存以 hwnd 为键，判断"同一个窗口就直接返回"。跨屏时 hwnd 没变、DPI 变了，于是永不重查；
+而"该失效的条件"补不完（跨屏、改缩放、RDP 重连都会变）。
+修法：`enter(hwnd)` 每次都调 `GetDpiForWindow`（用户态 O(1)，内核侧已有缓存），只缓存 **DPI 值**，
+值变化时才清字体缓存（`FontSet::clear()`）并 invalidate。
+数字：`GetDpiForWindow` 一帧几十次的成本在微秒级，`bench.ps1` 的连续 200 帧重绘项可作回归门禁。
+
+### #53 `GetGUIThreadInfo` 的 `cbSize` 必须手填，否则失败长得像"没在打字"
+
+症状：前台明明在输入框里打字，判据却返回 false，空格照样被吞。
+根因：`GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() }` ——
+若写成 `let mut gti = GUITHREADINFO::default(); gti.cbSize = ...`，clippy 会拦；
+而**忘记填**（`cbSize = 0`）时 API 直接失败，返回 false，和"前台确实没在打字"完全无法区分。
+规矩：这个结构体的 `cbSize` 与 `MONITORINFO` / `OSVERSIONINFO` 一样，是入参不是出参，
+必须显式赋值并加注释；判失败时按"不在打字"处理（宁可吞键，也不能让钩子超时被摘）。
+
+### #54 判断"在打字"不能用 `DirectUIHWND` / `SysListView32`
+
+症状（若这么写）：资源管理器里所有预览都失效。
+根因：Win11 文件列表本身就是 `DirectUIHWND`，且**永远处于焦点**；把它当"编辑框"就等于
+把空格热键整体禁用。
+规矩：只认真正的编辑框类（`Edit` / `RichEdit20W` / `RichEdit50W` / `RichEditD2DPT`）。
+首选判据仍然是 caret（`hwndCaret` 非空），类名只作兜底；并记录"哪一级命中"（`text_focus_level`），
+否则换一台系统版本就不知道退化到哪一级了。
