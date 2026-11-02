@@ -2270,13 +2270,19 @@ fn scaled(value: u32, zoom: f32) -> u32 {
 
 /// 当前该按多大像素渲染：客户区尺寸（扣掉顶部状态条）× 缩放。
 fn view_size(preview: HWND) -> (u32, u32) {
-    let rc = window::client_rect(preview);
-    // 顶栏（1.0.9 起四种格式统一）占一条，内容区只有剩下的高度——按整窗渲染的话
-    // 最后一条会被顶栏切掉。
-    let reserve = window::chrome_height();
+    // 渲染盒必须**等于绘制/命中用的内容区**（`frame().content`）。
+    //
+    // 以前这里用整窗客户区减顶栏，比 `frame().content` 多出一条滚动条的宽度：
+    // 位图按全宽渲染、上屏却只铺在"扣掉滚动条"的内容区里，于是
+    // ①页面右边那条被滚动条压住（96 DPI 下 12 px，200% 下 24 px）；
+    // ②宽高都和内容区差几像素，`StretchDIBits` 只能拉伸 → 每帧重采样。
+    // 现场日志就是这条：`STRETCH 位图 1044x1477 != 内容区 1020x1479`。
+    //
+    // 顶栏（1.0.9 起四种格式统一）也已经在 `chrome_rects().content` 里扣过了。
+    let f = frame(preview);
     let (w, h) = (
-        (rc.right - rc.left).max(1) as u32,
-        ((rc.bottom - rc.top) - reserve).max(1) as u32,
+        (f.content.right - f.content.left).max(1) as u32,
+        (f.content.bottom - f.content.top).max(1) as u32,
     );
     let zoom = with_state(|s| s.zoom).unwrap_or(1.0);
     (scaled(w, zoom), scaled(h, zoom))
@@ -2952,6 +2958,41 @@ fn content_size_of(client: RECT) -> (u32, u32) {
     )
 }
 
+/// 这一类内容在内容区里会不会占掉一条竖向滚动条。
+///
+/// 渲染盒、绘制布局（`frame()`）、预热三条路必须给出同一个答案，否则位图和内容区
+/// 宽度差出一条滚动条：右边那一截被滚动条压住，上屏还得拉伸（每帧重采样）。
+/// 现场日志就是这么来的：`STRETCH 位图 1044x1477 != 内容区 1020x1479`。
+///
+/// 只有 PDF 是"位图 + 滚动条"同时存在的：图片/SVG/视频没有条，文本没有位图。
+/// 单页 PDF 放得下，不画条（`ScrollInfo::new` 的规则），这也是唯一需要看页数的地方。
+fn render_reserves_scrollbar(kind: format::Kind, pages: Option<usize>) -> bool {
+    kind == format::Kind::Pdf && pages.is_none_or(|n| n > 1)
+}
+
+/// 内容区尺寸 → 渲染盒（已扣掉滚动条、已按缩放放大）。
+///
+/// 跟 `view_size()` 同一个口径：`view_size` 是"窗口已经有了，直接量绘制用的内容区"，
+/// 这里是"窗口还没开，按算出来的尺寸推"。两边算出来的必须是同一个数，
+/// 否则页缓存 key 对不上、预热也永远打不中（1.3.0 的坑）。
+fn render_box(
+    kind: format::Kind,
+    pages: Option<usize>,
+    width: i32,
+    height: i32,
+    zoom: f32,
+) -> (u32, u32) {
+    let width = if render_reserves_scrollbar(kind, pages) {
+        width - window::scrollbar_w()
+    } else {
+        width
+    };
+    (
+        scaled(width.max(1) as u32, zoom),
+        scaled(height.max(1) as u32, zoom),
+    )
+}
+
 /// 抬起：结束改大小，并按新尺寸重画（位图内容需要重新光栅化到新尺寸）。
 fn finish_resize(edges: ResizeEdges) {
     window::allow_shadow();
@@ -3350,13 +3391,22 @@ fn maybe_prewarm() {
     })
     .flatten();
     let (width, height) = window_size_for(work, kind, natural, &config, remembered);
+    // 预热必须用和上屏**同一个**渲染尺寸，否则结果永远打不中缓存键
+    // （1.8.3：PDF 要扣掉滚动条，见 `render_box`）。页数在这里多读一次文件头，
+    // 代价远小于"预热永远白做"。
+    let pages = if kind == format::Kind::Pdf {
+        qlr_render::pdf_page_count(&path)
+    } else {
+        None
+    };
+    let (width, height) = render_box(kind, pages, width, height, 1.0);
     log_debug!(
         SCOPE,
         "PREWARM 开始 {} {width}x{height}（自然 {:?}）",
         path.display(),
         natural
     );
-    request_prewarm(&path, width.max(1) as u32, height.max(1) as u32);
+    request_prewarm(&path, width.max(1), height.max(1));
 }
 
 /// 文本拖拽滚动：把像素位移折算成"行"。
@@ -3985,8 +4035,14 @@ fn show_preview(path: Option<PathBuf>) {
     // 先看预渲染槽（1.1.0）：命中的话直接上屏，省掉一次 16–60 ms 的渲染。
     // 渲染尺寸要和翻页时算的一致（PDF 扣掉顶栏）：`view_size` 就是这么算的，
     // 两边不一致的话页缓存 key 永远对不上，缓存等于白做（1.3.0 踩过）。
-    let render_w = scaled(width, zoom);
-    let render_h = scaled((height as i32 - reserve).max(1) as u32, zoom);
+    // 渲染盒要扣掉滚动条：`view_size` 量的就是这个宽度（1.8.3，见 `render_box`）。
+    let (render_w, render_h) = render_box(
+        kind,
+        pages,
+        width as i32,
+        (height as i32 - reserve).max(1),
+        zoom,
+    );
     // 1.4.0：重开同一个文件（没改过）直接上屏上一帧，连渲染都省掉。
     // 先查这个再看预渲染槽：上一帧是"刚刚真的显示过"的，比预热结果更新。
     let wanted = target
@@ -3999,7 +4055,11 @@ fn show_preview(path: Option<PathBuf>) {
     let prepared = if last.is_some() {
         None
     } else {
+        // 预热结果是按"当时算出来的尺寸"渲的，窗口/页数一变就对不上了。
+        // 尺寸不匹配还拿去上屏，就是一次满屏拉伸（发虚 + 每帧重采样），
+        // 还不如就地下场重渲（下一页缓存/预渲染还会命中）。
         take_prepared(target.as_deref(), render_w, render_h)
+            .filter(|canvas| frame_matches_size(canvas, render_w, render_h))
     };
     // 1.4.1：系统装了 Office 预览处理器就优先交给它（真排版）。
     // 这里只做"判断"：真正 DoPreview 必须等窗口 show 出来之后——在隐藏窗口上 DoPreview
@@ -4948,6 +5008,13 @@ fn scroll_info() -> Option<window::ScrollInfo> {
     let content = get_content()?;
     let (page, pages, scroll, consumed) =
         with_state(|s| (s.page, s.pages, s.scroll, s.wrapped_consumed)).unwrap_or((0, None, 0, 1));
+    // PDF：滚动条只看**页数**，和"现在上屏的是占位文字还是真页面"无关。
+    // 这一条必须放在 match 之前：`view_size()` 要靠它算出"内容区宽不宽"，
+    // 而算渲染尺寸时上屏的往往还是那句"正在渲染…"——按占位文字算出来的
+    // "没有滚动条"会让位图按全宽渲染，右边正好被滚动条压掉一条。
+    if let Some(total) = pages {
+        return window::ScrollInfo::new(page as f32, 1.0, total as f32);
+    }
     match &*content {
         Canvas::Text(doc) => {
             let total = doc.lines.len() as f32;
@@ -5935,17 +6002,24 @@ fn repaint(hwnd: HWND) {
                     );
                     // 只统计"真的差很多"的情况：位图按宽高比取整，和内容区常常差 1–2 px，
                     // 那种拉伸肉眼看不出来、代价也可以忽略，不该刷日志。
+                    //
+                    // 判据只认**宽度**：宽度对不上说明"渲染口径"和"绘制口径"又不一致了
+                    // （1.8.3 修过一次：渲染盒多了滚动条宽，右边被压住 24 px）。
+                    // 高度对不上是正常的——PDF 页面有固定宽高比，比内容区矮的那一截
+                    // 就是留白，不该被当成 bug 报警（现场日志里那 3 行 STRETCH 就是这么来的）。
                     let off_w = (b.width as i32 - cw).abs();
-                    let off_h = (b.height as i32 - ch).abs();
-                    if (off_w > 16 || off_h > 16)
-                        && !with_state(|s| s.zoom_preview).unwrap_or(false)
-                    {
+                    if off_w > 16 && !with_state(|s| s.zoom_preview).unwrap_or(false) {
                         log_warn!(
                             SCOPE,
-                            "STRETCH 位图 {}x{} != 内容区 {cx}x{cy}（每帧重采样，会发虚/卡）",
+                            "STRETCH 位图宽 {} != 内容区 {cx}（渲染口径不一致，上屏要拉伸）",
                             b.width,
+                            cx = cw
+                        );
+                    } else if (b.height as i32 - ch).abs() > 16 {
+                        log_debug!(
+                            SCOPE,
+                            "LETTERBOX 位图高 {} < 内容区 {cy}（页面比例所限，正常留白）",
                             b.height,
-                            cx = cw,
                             cy = ch
                         );
                     }

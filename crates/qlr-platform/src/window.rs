@@ -2740,6 +2740,11 @@ pub fn paint_bitmap_at(
         // 少 1 px（实测 `render=734x1040` 却是 `bitmap 734x1039`）。居中绘制会在
         // 上下各留半像素，合成一条深色细线——用户看到的就是"pdf 缩小后有一点黑边"。
         // 差 1 px 的拉伸肉眼看不出来，却能把那条线彻底抹掉。
+        //
+        // 1.8.3：但"少一大截"是另一回事。PDF 页面有自己的宽高比，比内容区矮几十像素
+        // 是**正常留白**；把它拉伸到铺满则是每帧整张重采样（HALFTONE），页面还会
+        // 被纵向拉长几毫米。所以只有"差几像素"才铺满，差得多就居中 1:1（不重采样）。
+        const FILL_SLACK: i32 = 4;
         let (dw, dx, sx, sw) = if bw > cw {
             let pan = offset_x.clamp(0, bw - cw);
             // 坑：本函数的 DIB 是 top-down（biHeight 取负），但 StretchDIBits 的
@@ -2747,12 +2752,17 @@ pub fn paint_bitmap_at(
             // 图像的另一端——实测表现是"放大后窗口里一片纯白"（其实画的是页面底部
             // 的空白），平移几步才偶然露出一点字。所以这里换算成从底部量。
             (cw, content.left, bw - cw - pan, cw)
+        } else if cw - bw > FILL_SLACK {
+            // 居中 1:1：目的尺寸 = 源尺寸，不插值。
+            (bw, content.left + (cw - bw) / 2, 0, bw)
         } else {
             (cw, content.left, 0, bw)
         };
         let (dh, dy, sy, sh) = if bh > ch {
             let pan = offset_y.clamp(0, bh - ch);
             (ch, content.top, bh - ch - pan, ch)
+        } else if ch - bh > FILL_SLACK {
+            (bh, content.top + (ch - bh) / 2, 0, bh)
         } else {
             (ch, content.top, 0, bh)
         };
@@ -2772,7 +2782,12 @@ pub fn paint_bitmap_at(
         };
 
         // 1:1 拷贝不需要插值（拖动/平移每帧都走这里，HALFTONE 会明显发卡）。
-        if dw == sw && dh == sh {
+        // 顺带：位图和内容区只差几个像素（"页面比例所限"的留白填充、按宽高比取整）
+        // 也不值得上 HALFTONE——3% 以内的补边肉眼分不出，HALFTONE 却要整张重采样一遍，
+        // 每一帧都来一次就是"滚动频闪 + 拖动掉帧"。真正需要插值的是缩放预览/缩放视频，
+        // 那种差距远超 3%。
+        let near = (dw - sw).abs() * 32 <= cw.abs() && (dh - sh).abs() * 32 <= ch.abs();
+        if near {
             SetStretchBltMode(hdc, COLORONCOLOR);
         } else {
             SetStretchBltMode(hdc, HALFTONE);
