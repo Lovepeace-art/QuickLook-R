@@ -3888,6 +3888,16 @@ fn show_preview(path: Option<PathBuf>) {
     };
     let target = path.or(last);
 
+    // 现场报障："md 有时候第一次点 × 没反应，第二次才关"。如果这次 SHOW 紧跟在一次
+    // HIDE 之后，用户看到的就是"点了没反应"——不管是谁（渲染回调、跟随计时器、
+    // 热键）把窗口叫回来的，先把这条痕留下，下次复现直接看日志定位。
+    if let Some(at) = *last_hide_slot() {
+        let gap = at.elapsed().as_millis();
+        if gap < 1500 {
+            log_info!(SCOPE, "HIDE→SHOW 间隔 {gap}ms（会表现为「点了 × 没反应」）");
+        }
+    }
+
     // 换文件就把页缓存清掉（1.3.0）：缓存按路径记，旧文档的几十页继续占内存没意义。
     // 同一个文件翻页不清——那正是缓存要服务的场景。
     if let Some(new) = target.as_deref() {
@@ -4896,6 +4906,17 @@ fn hide_preview() {
         window::set_activatable(preview.raw(), false);
     }
     log_info!(SCOPE, "HIDE elapsed={elapsed}ms");
+    *last_hide_slot() = Some(Instant::now());
+}
+
+static LAST_HIDE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// 上一次"收起预览"的时刻（见 `LAST_HIDE`）。
+fn last_hide_slot() -> MutexGuard<'static, Option<Instant>> {
+    LAST_HIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn quit() {
@@ -5215,9 +5236,29 @@ fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
     if y < rects.content.top {
         // ---- 顶栏 ----
         if point_in(x, y, rects.close) {
-            log_debug!(SCOPE, "顶栏：关闭");
+            // 现场报障："md 有时候第一次点 × 没反应"。这一行留在 info：
+            // 有它就说明点击**确实到了**关闭按钮（窗口却还在 = 收起后又被谁 SHOW 回来，
+            // 见 `show_preview` 里那条 HIDE→SHOW 追踪）；没有它就要往别处查
+            // （命中区不对 / 被非客户区当成改大小吞掉）。
+            log_info!(SCOPE, "顶栏：关闭（{x},{y}）");
             hide_preview();
             return true;
+        }
+        // 挨着 × 却没点中：记一条，专门用来抓"差几像素"的命中问题。
+        // 顶栏 + 内容区都没命中时才会走到，不会刷屏（只有真的贴边点才触发）。
+        let near_close = x >= rects.close.left - 6
+            && x < rects.close.right + 6
+            && y >= rects.close.top - 6
+            && y < rects.close.bottom + 6;
+        if near_close {
+            log_info!(
+                SCOPE,
+                "顶栏：点击 ({x},{y}) 贴着关闭按钮但没命中，close=({},{})-({},{})",
+                rects.close.left,
+                rects.close.top,
+                rects.close.right,
+                rects.close.bottom
+            );
         }
         if point_in(x, y, rects.external) {
             open_external();
