@@ -26,6 +26,8 @@ pub mod image_view;
 pub mod markdown;
 pub mod media;
 pub mod pdf;
+pub mod scale;
+pub mod source_cache;
 pub mod svg;
 pub mod text;
 pub mod wrap;
@@ -421,6 +423,13 @@ pub fn natural_size(path: &Path, kind: Kind) -> Option<(u32, u32)> {
 /// 壳层用它做"日志 + 顶栏提示"；读不到返回 `None`（不是错误：老容器/缺解码器都这样）。
 pub fn media_info(path: &Path) -> Option<MediaInfo> {
     media::probe(path)
+}
+
+/// 只给日志用的文件名（**不含目录**：日志里禁止出现用户的完整路径）。
+pub(crate) fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "（无文件名）".to_string())
 }
 
 /// JPEG 缩放解码失败时退回通用路径的痕迹（debug 级，不打扰用户）。
