@@ -939,12 +939,15 @@ pub fn run() -> ExitCode {
         let stats = hotkey::stats();
         log_info!(
             SCOPE,
-            "热键统计 callbacks={} swallowed={} reinstall={} passed={} wheels={}",
+            "热键统计 callbacks={} swallowed={} reinstall={} passed={} wheels={} \
+             passed_text_focus={} text_focus_level={}",
             stats.callbacks,
             stats.swallowed,
             stats.reinstalls,
             stats.passed_other_class,
-            stats.wheels
+            stats.wheels,
+            stats.passed_text_focus,
+            stats.text_focus_level
         );
         guard.stop();
     }
@@ -4661,10 +4664,22 @@ fn hide_preview() {
         s.toast = None;
         s.shell_input_pending = false;
         s.hold_frame = false;
+        // 1.8.3（T03）：页码输入状态必须跟预览一起收起。
+        // 以前这里不清：点开页码框输到一半按空格/`--hide` 收起窗口，`page_edit` 留在
+        // 状态里、`CAPTURE_DIGITS` 还开着 → 全局钩子继续吞数字/退格/回车，用户在**别的
+        // 程序**里打不出数字（这个"谁吞了我的按键"极难自查）。`finish_page_edit(false)`
+        // 会同时把 `page_edit` 清掉并 `set_capture_digits(false)`。
+        s.page_edit = None;
         (s.preview, s.request_started.elapsed().as_millis())
     }) else {
         return;
     };
+    // 数字输入模式的开关是**全局**的，所以放在锁外关（与 capture 一起收拾临时状态）。
+    // 记一行日志：smoke 脚本可以按稳定字符串断言"收起之后确实释放了"。
+    if hotkey::capture_digits() {
+        hotkey::set_capture_digits(false);
+        log_info!(SCOPE, "收起预览：数字输入模式已释放（capture=false）");
+    }
     // capture 也要放掉：它挂在窗口上，隐藏窗口持有 capture 会吞掉后续鼠标消息。
     window::release_capture();
     window::allow_shadow();

@@ -92,6 +92,15 @@ impl Action {
         }
     }
 
+    /// 匹配时是否忽略 Shift（1.8.3）。
+    ///
+    /// 只有放大/缩小：`=`/`+` 在物理上是同一个键（`VK_OEM_PLUS`），`-`/`_` 同理。
+    /// 严格比对之后，用户按 `Shift+=`（打出 `+`）会不再命中——那是回归，所以放宽
+    /// 这一维。其它动作保持严格：`Ctrl+Space`、`Alt+Space` 绝不能被吞。
+    pub fn ignores_shift(self) -> bool {
+        matches!(self, Action::ZoomIn | Action::ZoomOut)
+    }
+
     pub fn category(self) -> Category {
         match self {
             Action::Toggle | Action::Close => Category::Global,
@@ -241,6 +250,16 @@ impl Binding {
     /// 预览已经够激进，再"包含式匹配"会连这两个组合一起抢走。
     pub fn matches(self, vk: u16, ctrl: bool, alt: bool, shift: bool) -> bool {
         self.vk == vk && self.ctrl == ctrl && self.alt == alt && self.shift == shift
+    }
+
+    /// 同 [`Binding::matches`]，但**不强求 Shift 的状态**。
+    ///
+    /// 只给"物理上是同一个键"的动作用（放大/缩小：`=` 与 `+` 都是 `VK_OEM_PLUS`）。
+    /// 1.8.2 之前这类动作能工作，是因为匹配时"没声明的修饰键一律当 false"——
+    /// 那是个 bug（`Ctrl+Space` 会被空格热键吞掉），修好它就会顺带打死 `Shift+=`，
+    /// 所以这里显式放宽 Shift 这一维。
+    pub fn matches_ignoring_shift(self, vk: u16, ctrl: bool, alt: bool, _shift: bool) -> bool {
+        self.vk == vk && self.ctrl == ctrl && self.alt == alt
     }
 }
 
@@ -633,5 +652,43 @@ mod tests {
             total += actions.len();
         }
         assert_eq!(total, Action::COUNT, "分组漏了动作");
+    }
+
+    /// 1.8.3 T04：修饰键必须**精确**匹配。
+    ///
+    /// 曾经的 bug 不在 `matches` 里（它一直是严格相等），而在调用方：没声明的修饰键
+    /// 被直接当成 false，于是 `Ctrl+Space`（输入法切换）被空格热键吞掉。
+    #[test]
+    fn modifiers_must_match_exactly() {
+        let space = parse("Space").unwrap();
+        assert!(space.matches(0x20, false, false, false), "裸空格要命中");
+        assert!(
+            !space.matches(0x20, true, false, false),
+            "Ctrl+Space 不该命中"
+        );
+        assert!(
+            !space.matches(0x20, false, true, false),
+            "Alt+Space 不该命中"
+        );
+        assert!(
+            !space.matches(0x20, false, false, true),
+            "Shift+Space 不该命中"
+        );
+    }
+
+    /// 放大/缩小是"同一物理键的两个字符"（`=`/`+`），匹配时忽略 Shift。
+    #[test]
+    fn zoom_actions_ignore_shift() {
+        assert!(Action::ZoomIn.ignores_shift() && Action::ZoomOut.ignores_shift());
+        assert!(!Action::Toggle.ignores_shift(), "空格必须严格");
+        assert!(!Action::PageNext.ignores_shift(), "翻页必须严格");
+
+        let eq = parse("=").unwrap();
+        // 按 `=`（没有 Shift）和按 `Shift+=`（打出 `+`）都要放大。
+        assert!(eq.matches_ignoring_shift(0xBB, false, false, false));
+        assert!(eq.matches_ignoring_shift(0xBB, false, false, true));
+        // 但 Ctrl+= / Alt+= 不算：那一维仍然严格。
+        assert!(!eq.matches_ignoring_shift(0xBB, true, false, false));
+        assert!(!eq.matches_ignoring_shift(0xBB, false, true, true));
     }
 }
