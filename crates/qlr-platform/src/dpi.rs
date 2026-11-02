@@ -35,12 +35,34 @@ pub fn enable_per_monitor_v2() -> bool {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_ok() }
 }
 
+/// 假 DPI（`QLRUST_DPI_FAKE=192` 之类），**只给开发和自动化验证用**。
+///
+/// 为什么需要它：开发机是 96 DPI，而"200% 缩放"是用户真实报障的场景。手改系统缩放
+/// 既影响全局又不能自动化。设了这个环境变量后，`window_dpi` / `system_dpi` 一律返回它，
+/// 于是所有 DIP→物理换算、开窗尺寸、字体大小都按 200% 算——可以在 96 DPI 机器上复现
+/// "布局按 2 倍"的整条路径。
+///
+/// 注意：屏幕物理尺寸不变，所以窗口会显得很大甚至超出屏幕。它验证的是**数值与命中**，
+/// 不是观感；视觉验收仍然必须在真 200% 机器上做。
+fn fake_dpi() -> Option<u32> {
+    static FAKE: OnceLock<Option<u32>> = OnceLock::new();
+    *FAKE.get_or_init(|| {
+        std::env::var("QLRUST_DPI_FAKE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|d| (96..=480).contains(d))
+    })
+}
+
 /// 这个窗口所在显示器的 DPI（96 = 100%；取不到按 96 算）。
 ///
 /// 为什么需要它：开了 PMv2 之后窗口坐标一律是**物理像素**，而"边缘热区 6px 好抓"
 /// 这个直觉是 DIP 的。125% 屏上 6 物理像素只有 4.8 DIP，用户会觉得"贴得不够准就拖不动"
 /// （1.7.3 反馈的拖边问题里就有一条）。
 pub fn window_dpi(hwnd: HWND) -> u32 {
+    if let Some(fake) = fake_dpi() {
+        return fake;
+    }
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0 { 96 } else { dpi }
 }
@@ -51,6 +73,9 @@ pub fn window_dpi(hwnd: HWND) -> u32 {
 /// [`enter`] 查到的窗口 DPI 为准；只有"建窗前那一次算尺寸"可能偏。
 /// 单屏用户（本次报障的机器）不受影响。
 pub fn system_dpi() -> u32 {
+    if let Some(fake) = fake_dpi() {
+        return fake;
+    }
     let dpi = unsafe { GetDpiForSystem() };
     if dpi == 0 { 96 } else { dpi }
 }

@@ -198,6 +198,13 @@ struct State {
     hover_button: Option<window::ChromeButton>,
     /// 页码输入框里正在输入的内容；`None` = 没在编辑。
     page_edit: Option<String>,
+    /// 滚轮进量的"零头"（1.8.3）。
+    ///
+    /// 为什么需要：一格滚轮是 120，但**高分辨率滚轮和精密触控板每次只发 30/60**。
+    /// 1.8.2 的算法是 `delta / 120`，零头直接扔掉 → 每一次都算出 0 档 → 滚轮在这类设备上
+    /// **彻底没反应**（缩放开不了、正文不滚、目录不滚，而且日志里一条记录都没有）。
+    /// 现在把零头攒起来：4 次 30 = 1 档。实测复现与修复见 `wheel_take` 的单测。
+    wheel_acc: i32,
     /// 是否正在拖右侧滚动条。
     scroll_drag: bool,
     /// 当前内容的目录（Markdown 才有）：`(级别, 标题, 显示行下标)`。
@@ -769,6 +776,7 @@ pub fn run() -> ExitCode {
         lens_zoom: LENS_DEFAULT_ZOOM,
         hover_button: None,
         page_edit: None,
+        wheel_acc: 0,
         scroll_drag: false,
         toc: Vec::new(),
         toc_active: None,
@@ -2451,31 +2459,41 @@ fn text_total_lines() -> usize {
 /// - **图片**：放得下就保持老习惯（滚轮 = 缩放）；放大到超出窗口后可上下滑动。
 /// - **缩放**：图片/PDF 都改用**右键上下拖**（`on_zoom_drag_*`），滚轮不再改缩放。
 fn on_wheel(delta: i32) {
+    // 档数走**带零头累积**的入口（1.8.3）。这里有一个真实事故：
+    // 高分辨率滚轮/触控板每次只发 30–60，`delta / 120` 永远是 0，
+    // 于是"滚轮完全没反应"——图片不缩放、正文不滚、目录不滚，日志里也没有任何记录。
+    let notches = take_wheel_notches(delta);
+    // 这个函数有 8 条分支，出问题（"滚轮没反应"）时必须能一眼看出停在哪一支。
+    log_debug!(
+        SCOPE,
+        "WHEEL 进入 delta={delta} 本次档数={notches} 累计零头={}",
+        with_state(|s| s.wheel_acc).unwrap_or(0)
+    );
     // 音频/视频（1.7.9）：滚轮 = 快进/快退（一格 5 秒）。放在最前面——它们没有可滚内容，
     // 落到下面会去缩放/翻页，用户听到的是"声音还在放、画面莫名其妙变了"。
     if playback_active() {
-        let notches = wheel_notches(delta) as i64;
         if notches != 0 {
             // 往上滚 = 往回（与"翻到前面"同一方向约定）。
-            playback_seek(-notches.signum() * AUDIO_SEEK_STEP_MS);
+            playback_seek(-(notches.signum() as i64) * AUDIO_SEEK_STEP_MS);
         }
         return;
     }
     // PPT（1.7.4）：翻页由我们接管，滚轮 = 翻页（和 PDF 一致：往下滚 = 下一页）。
     // 必须放在 `forward_wheel_to_shell` 前面：那个函数会把滚轮转给处理器的子窗口，
     // 而它的翻页计数只有我们自己在维护，转出去就失准了。
-    let notches = wheel_notches(delta) as isize;
     if with_state(|s| s.slide).flatten().is_some() {
         if notches != 0 {
             step_slide(if notches > 0 { -1 } else { 1 });
         }
         return;
     }
-    // 系统预览处理器接管时，滚轮归它（它自己有滚动条/翻页），我们不抢。
-    if forward_wheel_to_shell(delta as i16) {
+    // 零头还没攒够一整档：什么都不做，等下一发继续攒（**不要**在这里调 wheel_zoom，
+    // 否则高分辨率滚轮会拿 delta=30 去缩放，一格变成十几次缩放）。
+    if notches == 0 {
         return;
     }
-    if notches == 0 {
+    // 系统预览处理器接管时，滚轮归它（它自己有滚动条/翻页），我们不抢。
+    if forward_wheel_to_shell(delta as i16) {
         return;
     }
     // Shift + 滚轮：调放大镜倍数（按住 Shift 时用户在看细节，不该拿去滚动/缩放内容）。
@@ -2502,7 +2520,7 @@ fn on_wheel(delta: i32) {
     }
     // 图片：本来就没得滚（整张放得下）→ 保留"滚轮缩放"的老习惯。
     if !moved {
-        wheel_zoom(delta);
+        wheel_zoom(notches);
     }
 }
 
@@ -2557,9 +2575,9 @@ fn bitmap_height() -> Option<i32> {
 
 /// 滚轮缩放：一格（`WHEEL_DELTA`=120）放大 1.25 倍，负向缩小。
 ///
-/// 一次最多处理 4 格：笔记本触控板会一口气甩出几十格，全给会瞬间冲到 800%。
-fn wheel_zoom(delta: i32) {
-    let notches = wheel_notches(delta);
+/// 入参是**档数**（已经过 `take_wheel_notches` 的零头累积），不是原始 delta：
+/// 高分辨率滚轮单发只有 30，再在这里除一次 120 就又变回 0 —— 1.8.3 前就是这个问题。
+fn wheel_zoom(notches: isize) {
     if notches == 0 {
         return;
     }
@@ -2571,12 +2589,41 @@ fn wheel_zoom(delta: i32) {
     for _ in 0..notches.abs() {
         set_zoom(factor);
     }
-    log_debug!(SCOPE, "WHEEL delta={delta} notches={notches}");
+    log_debug!(SCOPE, "ZOOM 档数={notches}");
 }
 
 /// 滚轮增量 → 档数（一格 `WHEEL_DELTA`=120，一次最多 4 档）。
 fn wheel_notches(delta: i32) -> i32 {
     (delta / 120).clamp(-4, 4)
+}
+
+/// 把滚轮增量攒成"档"（1.8.3）：**零头不再扔掉**。
+///
+/// 一格滚轮 = 120，但高分辨率滚轮 / 精密触控板每次只发 30–60。
+/// 1.8.2 直接 `delta / 120`，零头被丢 → 这类设备上每一发都算出 0 档 →
+/// 图片不缩放、正文不滚、目录不滚，**而且日志里一条都不留**（看起来像"功能消失了"）。
+///
+/// 纯函数便于单测：`acc` 是跨事件累积的零头，本次拿走整档后把余数写回。
+fn wheel_take(acc: &mut i32, delta: i32) -> i32 {
+    *acc = acc.saturating_add(delta);
+    let notches = (*acc / 120).clamp(-4, 4);
+    if notches != 0 {
+        if notches.abs() == 4 {
+            // 触控板一次甩出几百，别把余数留成巨款（否则停止后还会继续滚）。
+            *acc = 0;
+        } else {
+            *acc -= notches * 120;
+        }
+    }
+    // 长时间不滚时零头可能慢慢攒；夹一下防止异常设备把它撑爆。
+    *acc = (*acc).clamp(-119, 119);
+    notches
+}
+
+/// 取本次滚轮对应的档数（带零头累积，见 [`wheel_take`]）。
+fn take_wheel_notches(delta: i32) -> isize {
+    with_state(|s| wheel_take(&mut s.wheel_acc, delta)).unwrap_or_else(|| wheel_notches(delta))
+        as isize
 }
 
 /// 客户区坐标（`lparam` 的低/高 16 位是**有符号**的，别直接用 `& 0xFFFF`）。
@@ -6837,6 +6884,35 @@ mod tests {
         // 触控板甩一下可能几百格，必须钳到 4
         assert_eq!(wheel_notches(12000), 4);
         assert_eq!(wheel_notches(-12000), -4);
+    }
+
+    /// 1.8.3 真实事故：高分辨率滚轮/精密触控板每次只发 30–60，
+    /// `delta / 120` 恒为 0 → 滚轮在整台机器上"完全失效"（不缩放、不滚动、日志无记录）。
+    /// 修法是把零头攒起来：4 次 30 = 1 档。
+    #[test]
+    fn wheel_residual_accumulates_into_notches() {
+        let mut acc = 0;
+        // 触控板细碎增量：前三发不动，第四发凑满一格
+        assert_eq!(wheel_take(&mut acc, -30), 0);
+        assert_eq!(wheel_take(&mut acc, -30), 0);
+        assert_eq!(wheel_take(&mut acc, -30), 0);
+        assert_eq!(wheel_take(&mut acc, -30), -1, "4×30=120，正好一档");
+        assert_eq!(acc, 0, "整档用掉之后零头要清零");
+
+        // 普通滚轮一格一档，行为不变
+        assert_eq!(wheel_take(&mut acc, 120), 1);
+        assert_eq!(acc, 0);
+
+        // 触控板甩一下：钳到 4 档，且零头清零（否则松手后还会继续滚）
+        assert_eq!(wheel_take(&mut acc, 12000), 4);
+        assert_eq!(acc, 0);
+
+        // 方向反转不能卡住
+        assert_eq!(wheel_take(&mut acc, 60), 0);
+        assert_eq!(wheel_take(&mut acc, -60), 0, "先 +60 再 -60 应该回到 0");
+        assert_eq!(acc, 0);
+        assert_eq!(wheel_take(&mut acc, -60), 0);
+        assert_eq!(wheel_take(&mut acc, -60), -1, "反向攒够一格要能出档");
     }
 
     #[test]

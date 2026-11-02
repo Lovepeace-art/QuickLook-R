@@ -1110,6 +1110,10 @@ impl Drop for FontSet {
 /// 丢掉本线程的字体缓存。**这是 `dpi::set_change_hook` 的回调**：DPI 一变就调，
 /// 下次绘制按新字号重建。
 pub fn fonts_invalidate() {
+    // 正常情况下一个窗口生命周期里只会调 1–2 次（跨屏拖动、改缩放）。
+    // 如果在同一次预览里反复看到这行，说明线程 DPI 在**来回跳**——那是设计问题，
+    // 不是正常路径（每跳一次就要重建 14 个 HFONT，绘制会明显变慢）。
+    qlr_core::log_debug!("window", "字体缓存失效（DPI 变化）");
     FONTS.with(|cell| cell.borrow_mut().clear());
 }
 
