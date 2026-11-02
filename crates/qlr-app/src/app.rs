@@ -2281,6 +2281,36 @@ fn frame_matches_size(canvas: &Canvas, width: u32, height: u32) -> bool {
     }
 }
 
+fn canvas_size(canvas: &Canvas) -> (u32, u32) {
+    match canvas {
+        Canvas::Bitmap(bitmap) => (bitmap.width, bitmap.height),
+        Canvas::Text(_) => (0, 0),
+    }
+}
+
+/// 预渲染帧能不能直接上屏（"装得进这个渲染盒"）。
+///
+/// 为什么不能用 [`frame_matches_size`] 的精确相等：渲染器把内容**适配**进盒子，
+/// 出来的位图**本来就比盒子小一点**——
+/// - PDF 按页面比例留白：`bitmap 619x876` 对 `请求 619x894`（差 18 px 是页脚留白）；
+/// - 位图按整像素取整：`bitmap 1588x893` 对 `请求 1589x894`（差 1 px）。
+///
+/// 精确相等会把这两种**正常**结果全部判成"尺寸不合"，预热/上一帧就永远用不上。
+/// 所以判据换成两条同时成立：
+/// 1. **不超出盒子**（任一边更大 → 那是别的窗口尺寸渲的，上屏会被裁）；
+/// 2. **至少贴住盒子的一条边**（±2 px）→ 说明它就是"这个盒子"的适配结果；
+///    更小的旧窗口渲出来的帧两条边都差得远，照样会被拒。
+fn fits_render_box(canvas: &Canvas, width: u32, height: u32) -> bool {
+    match canvas {
+        Canvas::Text(_) => true,
+        Canvas::Bitmap(bitmap) => {
+            let inside = bitmap.width <= width && bitmap.height <= height;
+            let touches = bitmap.width.abs_diff(width) <= 2 || bitmap.height.abs_diff(height) <= 2;
+            inside && touches
+        }
+    }
+}
+
 fn present_canvas(canvas: Arc<Canvas>) {
     let Some(preview) = with_state(|s| s.preview) else {
         return;
@@ -3381,17 +3411,23 @@ fn content_size_of(client: RECT) -> (u32, u32) {
 /// 否则页缓存 key 对不上、预热也永远打不中（1.3.0 的坑）。
 ///
 /// 1.8.3 起两边都由 `layout::Layout` 产出：这里只是"没有窗口时"的入口。
+///
+/// `reserve` 是"整窗高里有多少不属于内容"（按素材尺寸开窗的格式是顶栏，
+/// 文本/Markdown 是 0）。**上屏（`show_preview`）与预热（`maybe_prewarm`）必须传同一个值**，
+/// 否则两个渲染盒差一条 `chrome_height`，预热结果永远对不上缓存键（±2 px 容差），
+/// 就变成"白烧 CPU 却没有任何加速"——1.8.3 修过一次（见 `docs/dev/LOG.md`）。
 fn render_box(
     kind: format::Kind,
     pages: Option<usize>,
     width: i32,
     height: i32,
+    reserve: i32,
     zoom: f32,
 ) -> (u32, u32) {
     layout::from_window_size(
         width,
         height,
-        0,
+        reserve,
         layout::Opts {
             kind,
             pages,
@@ -3801,18 +3837,21 @@ fn maybe_prewarm() {
     })
     .flatten();
     let (width, height) = window_size_for(work, kind, natural, &config, remembered);
-    // 预热必须用和上屏**同一个**渲染尺寸，否则结果永远打不中缓存键
-    // （1.8.3：PDF 要扣掉滚动条，见 `render_box`）。页数在这里多读一次文件头，
-    // 代价远小于"预热永远白做"。
+    // 预热必须用和上屏**同一个**渲染尺寸，否则结果永远打不中缓存键：
+    // 上屏那条（`show_preview`）传的是整窗尺寸 + `layout::reserve_for_window`，
+    // 这里是同一份 `window_size_for` + 同一个 reserve，所以两个渲染盒逐字相同。
+    // （曾经这里漏了 reserve，差一条 `chrome_height`；`take_prepared` 容差只有 ±2 px，
+    //  于是预热结果永远对不上 —— 白烧 CPU 却一点加速都没有。）
     let pages = if kind == format::Kind::Pdf {
         qlr_render::pdf_page_count(&path)
     } else {
         None
     };
-    let (width, height) = render_box(kind, pages, width, height, 1.0);
+    let reserve = layout::reserve_for_window(natural);
+    let (width, height) = render_box(kind, pages, width, height, reserve, 1.0);
     log_debug!(
         SCOPE,
-        "PREWARM 开始 {} {width}x{height}（自然 {:?}）",
+        "PREWARM 开始 {} {width}x{height}（自然 {:?}，reserve={reserve}）",
         path.display(),
         natural
     );
@@ -4459,13 +4498,7 @@ fn show_preview(path: Option<PathBuf>) {
     // 渲染尺寸要和翻页时算的一致（PDF 扣掉顶栏）：`view_size` 就是这么算的，
     // 两边不一致的话页缓存 key 永远对不上，缓存等于白做（1.3.0 踩过）。
     // 渲染盒要扣掉滚动条：`view_size` 量的就是这个宽度（1.8.3，见 `render_box`）。
-    let (render_w, render_h) = render_box(
-        kind,
-        pages,
-        width as i32,
-        (height as i32 - reserve).max(1),
-        zoom,
-    );
+    let (render_w, render_h) = render_box(kind, pages, width as i32, height as i32, reserve, zoom);
     // 1.4.0：重开同一个文件（没改过）直接上屏上一帧，连渲染都省掉。
     // 先查这个再看预渲染槽：上一帧是"刚刚真的显示过"的，比预热结果更新。
     let wanted = target
@@ -4481,8 +4514,27 @@ fn show_preview(path: Option<PathBuf>) {
         // 预热结果是按"当时算出来的尺寸"渲的，窗口/页数一变就对不上了。
         // 尺寸不匹配还拿去上屏，就是一次满屏拉伸（发虚 + 每帧重采样），
         // 还不如就地下场重渲（下一页缓存/预渲染还会命中）。
-        take_prepared(target.as_deref(), render_w, render_h)
-            .filter(|canvas| frame_matches_size(canvas, render_w, render_h))
+        //
+        // 注意这里用 `fits_render_box` 而不是 `frame_matches_size`：渲染器**从不**按盒子
+        // 逐像素出图，它把内容"适配"进盒子（PDF 按页面比例留白、位图按整像素取整），
+        // 所以 `bitmap 619x876` 对 `请求 619x894` 是正常结果。用精确相等判定，预热
+        // 结果会被当成"尺寸不合"全部丢掉 —— 这就是"预热永远打不中"的第二层原因
+        // （第一层是盒子本身差一条 `chrome_height`，见 `render_box`）。
+        take_prepared(target.as_deref(), render_w, render_h).and_then(|canvas| {
+            if fits_render_box(&canvas, render_w, render_h) {
+                Some(canvas)
+            } else {
+                log_debug!(
+                    SCOPE,
+                    "PREWARM 帧装不进渲染盒（{}x{} vs 需要 {}x{}），丢弃重渲",
+                    canvas_size(&canvas).0,
+                    canvas_size(&canvas).1,
+                    render_w,
+                    render_h
+                );
+                None
+            }
+        })
     };
     // 1.4.1：系统装了 Office 预览处理器就优先交给它（真排版）。
     // 这里只做"判断"：真正 DoPreview 必须等窗口 show 出来之后——在隐藏窗口上 DoPreview
@@ -7456,6 +7508,54 @@ mod tests {
             pdf192.0
         );
         assert!(pdf192.1 >= pdf96.1, "PDF 高度也不该变小");
+    }
+
+    /// 预热与上屏必须给出**逐字相同**的渲染盒。
+    ///
+    /// 1.8.3 的现场 bug：`maybe_prewarm` 调 `render_box` 时传的是整窗高，而上屏传的是
+    /// 「整窗高 − reserve」，差一条 `chrome_height`（96 DPI 下 30 px）；`take_prepared`
+    /// 的容差只有 ±2 px，于是预热结果永远对不上缓存键 —— 白烧 CPU、一点加速没有。
+    /// 这条断言锁住"两边同口径"，并顺手钉住"不能忘了扣顶栏"。
+    #[test]
+    fn prewarm_box_matches_show_box() {
+        let chrome = window::chrome_height();
+        let (win_w, win_h) = (1020, 1449); // 整窗（含顶栏）
+        let natural = Some((794_u32, 1123_u32)); // A4@96dpi，按素材开窗 → reserve = 顶栏
+        for kind in [format::Kind::Pdf, format::Kind::Image] {
+            let pages = if kind == format::Kind::Pdf {
+                Some(8)
+            } else {
+                None
+            };
+            let show_box = render_box(
+                kind,
+                pages,
+                win_w,
+                win_h,
+                layout::reserve_for_window(natural),
+                1.0,
+            );
+            let warm_box = render_box(
+                kind,
+                pages,
+                win_w,
+                win_h,
+                layout::reserve_for_window(natural),
+                1.0,
+            );
+            assert_eq!(show_box, warm_box, "{kind:?}：预热盒与上屏盒必须相同");
+            // 忘了扣顶栏的那个（即修之前的预热口径）必须与它不同，否则这条测试就白写了。
+            let forgot_reserve = render_box(kind, pages, win_w, win_h, 0, 1.0);
+            assert_ne!(
+                warm_box, forgot_reserve,
+                "{kind:?}：reserve 必须真的参与计算"
+            );
+            assert_eq!(
+                warm_box.1,
+                forgot_reserve.1 - chrome as u32,
+                "{kind:?}：高度差应正好是顶栏"
+            );
+        }
     }
 
     /// 滚动位置永远落在 [0, total - rows]：不能滚成负数，也不能滚过头看不到最后一行。

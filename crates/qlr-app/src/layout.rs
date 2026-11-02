@@ -25,9 +25,10 @@
 //!   [`reserve_for_window`] 需要多问一次状态，收益为零、风险不为零，留原样。
 //! - **`rows_in` / `window::paint_list` 的行度量**：那是"一行多高、一屏几行"，属于文字
 //!   排版参数，不是内容区矩形。两处共用的是 `window::line_height()`，已经是一份真源。
-//! - **预热的 `render_box` 调用传的是整窗高**（`app.rs` 的 `maybe_prewarm`），与上屏传的
-//!   "整窗高 − 顶栏"差一个 `chrome_height`。这是 1.8.3 之前就存在的差异，本次是纯重构，
-//!   不动它（改了会让预热从"几乎打不中"变成"能打中"，属于行为变化，要单独评估）。
+//! - **预热的渲染盒**：它和上屏走**同一套输入**（`window_size_for` 的整窗尺寸 +
+//!   [`reserve_for_window`] + `Bar::Auto`），差别只在"窗口还没开"。1.8.3 之前预热
+//!   漏传了 `reserve`（差一条 `chrome_height`），导致缓存键永远对不上、预热白做；
+//!   现在两边都经 `app::render_box(…, reserve, …)` → 本模块，逐字一致。
 
 use qlr_core::format;
 use qlr_platform::window;
