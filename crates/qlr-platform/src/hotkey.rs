@@ -33,17 +33,17 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjects;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetWindowRect, GetWindowThreadProcessId, HHOOK, IsWindowVisible, KBDLLHOOKSTRUCT, MSG,
-    MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GA_ROOT, GUITHREADINFO, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, HHOOK,
+    IsWindowVisible, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW,
+    QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const SCOPE: &str = "hotkey";
@@ -132,6 +132,11 @@ static CALLBACKS: AtomicU32 = AtomicU32::new(0);
 static SWALLOWED: AtomicU32 = AtomicU32::new(0);
 static REINSTALLS: AtomicU32 = AtomicU32::new(0);
 static PASSED_OTHER_CLASS: AtomicU32 = AtomicU32::new(0);
+/// 因为"前台正在输入文字"而放行的按键数（1.8.3 T02 的验收依据：
+/// 用户在桌面改名时按空格，这个数应当 > 0；如果它一直是 0，说明判据没生效）。
+static PASSED_TEXT_FOCUS: AtomicU32 = AtomicU32::new(0);
+/// "前台在打字"是靠哪一级判据认出来的：1 = caret，2 = 焦点窗口类名，0 = 还没认过。
+static TEXT_FOCUS_LEVEL: AtomicU32 = AtomicU32::new(0);
 
 /// 钩子运行统计，给日志/冒烟测试看。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,6 +147,10 @@ pub struct Stats {
     pub passed_other_class: u32,
     /// 被我们吞掉的滚轮事件数（只有光标在预览窗上时才会计数）。
     pub wheels: u32,
+    /// 因为"前台在输入文字"而放行的按键数（1.8.3）。
+    pub passed_text_focus: u32,
+    /// 上次识别出"在打字"用的是哪一级判据（1=caret，2=类名，0=未触发）。
+    pub text_focus_level: u32,
 }
 
 pub fn stats() -> Stats {
@@ -151,6 +160,8 @@ pub fn stats() -> Stats {
         reinstalls: REINSTALLS.load(Ordering::Relaxed),
         passed_other_class: PASSED_OTHER_CLASS.load(Ordering::Relaxed),
         wheels: WHEELS.load(Ordering::Relaxed),
+        passed_text_focus: PASSED_TEXT_FOCUS.load(Ordering::Relaxed),
+        text_focus_level: TEXT_FOCUS_LEVEL.load(Ordering::Relaxed),
     }
 }
 
@@ -202,6 +213,52 @@ pub fn foreground_is_ours() -> bool {
 /// 而 `IShellWindows` 那套调用在慢机器上要几毫秒——先看类名能省掉绝大部分。
 pub fn foreground_is_shell() -> bool {
     foreground_class().is_some_and(|name| is_shell_class(&name))
+}
+
+/// 前台是不是"正在输入文字"（1.8.3 T02）。
+///
+/// 报障：桌面选中文件夹按 F2 改名，输入法**打不出字**。根因是空格键被空格热键吞了
+/// （重命名框里打空格就是空格字符）。
+///
+/// 两级判据，从便宜到贵：
+/// 1. `GetGUIThreadInfo(0, ...)`（0 = 前台线程）看 `hwndCaret` / `GUI_CARETBLINKING`；
+/// 2. Win11 桌面的就地重命名可能是 DirectUI 自绘、拿不到 `hwndCaret`，退一步看
+///    **焦点窗口类名**——但只认真正的编辑框类，绝不放 `DirectUIHWND`/`SysListView32`
+///    （那两个在资源管理器里永远处于焦点，会把所有预览都禁掉）。
+///
+/// 钩子里调用，必须快且**绝不阻塞**：`GetGUIThreadInfo` 读的是内核侧共享数据，
+/// 不做 `SendMessage`；任何失败一律当"不在打字"（宁可吞键，也不能让钩子超时被摘）。
+fn foreground_is_text_entry() -> bool {
+    unsafe {
+        // 级 1：caret 是否存在于前台线程。
+        // `cbSize` 必须手填：`Default` 出来是 0，`GetGUIThreadInfo` 会直接返回失败，
+        // 而且这个失败**看起来像"前台没在打字"**，极难发现。
+        let mut gti = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(0, &mut gti).is_ok() && !gti.hwndCaret.is_invalid() {
+            TEXT_FOCUS_LEVEL.store(1, Ordering::Relaxed);
+            return true;
+        }
+        // 级 2：焦点窗口类名（只认编辑框）。
+        let focus = GetFocus();
+        if !focus.is_invalid() {
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(focus, &mut buf);
+            if n > 0 {
+                let name = String::from_utf16_lossy(&buf[..n as usize]);
+                if matches!(
+                    name.as_str(),
+                    "Edit" | "RichEdit20W" | "RichEdit50W" | "RichEditD2DPT"
+                ) {
+                    TEXT_FOCUS_LEVEL.store(2, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 重放标记，放在 `KEYBDINPUT.dwExtraInfo` 里，便于以后要区分"自己发的键"。
@@ -485,12 +542,15 @@ fn hook_thread(stop: HANDLE, ready: std::sync::mpsc::Sender<windows::core::Resul
     let s = stats();
     log_info!(
         SCOPE,
-        "键盘钩子已卸载 callbacks={} swallowed={} reinstall={} passed={} wheels={}",
+        "键盘钩子已卸载 callbacks={} swallowed={} reinstall={} passed={} wheels={} \
+         passed_text_focus={} text_focus_level={}",
         s.callbacks,
         s.swallowed,
         s.reinstalls,
         s.passed_other_class,
-        s.wheels
+        s.wheels,
+        s.passed_text_focus,
+        s.text_focus_level
     );
 }
 
@@ -572,14 +632,20 @@ fn reinstall(old: HHOOK, hmod: Option<HINSTANCE>) -> HHOOK {
 
 /// 读当前修饰键状态。回调里只在"这条绑定确实要求修饰"时才调用
 /// （`GetAsyncKeyState` 每次约 0.1 µs，但钩子回调有 300 ms 硬预算，能省则省）。
-fn modifiers_down() -> (bool, bool) {
+/// 三个修饰键当前是否按下。
+///
+/// 1.8.3 起**无条件查全三个**。以前是"只查绑定里声明过的修饰键，没声明的当 false"，
+/// 于是绑 `Space` 时按 `Ctrl+Space`（中文输入法切换）和 `Alt+Space`（系统菜单）
+/// 都被当成命中并吞掉——钩子一吞，输入法就切不了、系统菜单也弹不出来。
+fn modifiers_down() -> (bool, bool, bool) {
     let query = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
         (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0
     };
-    (
-        query(VK_CONTROL) || query(VK_LCONTROL) || query(VK_RCONTROL),
-        query(VK_MENU) || query(VK_LMENU) || query(VK_RMENU),
-    )
+    let ctrl = query(VK_CONTROL) || query(VK_LCONTROL) || query(VK_RCONTROL);
+    let alt = query(VK_MENU) || query(VK_LMENU) || query(VK_RMENU);
+    // Shift 要单独查左右键：低层钩子拿到的是物理键码，左右各一个。
+    let shift = query(VK_SHIFT) || query(VK_LSHIFT) || query(VK_RSHIFT);
+    (ctrl, alt, shift)
 }
 
 /// 这条动作的绑定是否命中本次按键。
@@ -592,21 +658,15 @@ fn action_hits(action: Action, vk: u16) -> bool {
     if binding.vk != vk {
         return false;
     }
-    let (ctrl, alt) = if binding.ctrl || binding.alt {
-        modifiers_down()
+    let (ctrl, alt, shift) = modifiers_down();
+    if action.ignores_shift() {
+        // 放大/缩小例外：`=` 和 `+`、`-` 和 `_` 在物理上是同一个键（VK_OEM_PLUS /
+        // VK_OEM_MINUS），严格比对会让用户"按 Shift+= 放大"失效（1.8.2 之前它其实
+        // 能工作，是靠"没声明的修饰键一律当 false"这个 bug 意外实现的）。
+        binding.matches_ignoring_shift(vk, ctrl, alt, shift)
     } else {
-        (false, false)
-    };
-    let shift = if binding.shift {
-        unsafe {
-            (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0
-                || (GetAsyncKeyState(VK_LSHIFT.0 as i32) as u16 & 0x8000) != 0
-                || (GetAsyncKeyState(VK_RSHIFT.0 as i32) as u16 & 0x8000) != 0
-        }
-    } else {
-        false
-    };
-    binding.matches(vk, ctrl, alt, shift)
+        binding.matches(vk, ctrl, alt, shift)
+    }
 }
 
 /// 投一句"这个键被按了"给 UI 线程（wparam = 规范化后的键码）。
@@ -634,6 +694,15 @@ static CAPTURE_DIGITS: AtomicBool = AtomicBool::new(false);
 /// 开关数字输入模式。壳层进入/退出"编辑页码"时调用。
 pub fn set_capture_digits(on: bool) {
     CAPTURE_DIGITS.store(on, Ordering::Relaxed);
+}
+
+/// 当前是否处于数字输入模式（1.8.3）。
+///
+/// 为什么要这个 getter：这个开关是**全局**的，而"关"的调用点分散在
+/// 收起预览 / 关闭预览 / 取消编辑三处，漏一处就会出现"预览早就关了，全局还在吞数字键"
+/// （用户在别的程序里打不出数字）。有了它就能在 smoke 脚本里断言"收起后必须是 false"。
+pub fn capture_digits() -> bool {
+    CAPTURE_DIGITS.load(Ordering::Relaxed)
 }
 
 /// 输入模式下要截获的键：0–9（主键盘与数字小键盘）、退格、回车、Esc。
@@ -680,18 +749,6 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
-        // ---- 数字输入模式（顶栏页码框 / 设置页数字项）----
-        // 预览窗是 `WS_EX_NOACTIVATE`，永远拿不到键盘焦点，所以"在窗口里打字"只能
-        // 借钩子：进入输入模式后把数字键、退格、回车、Esc 转给宿主并吞掉。
-        // 只认这几类键，其余一律放行——避免"输入模式下别的键失灵"。
-        if CAPTURE_DIGITS.load(Ordering::Relaxed)
-            && is_capture_key(vk)
-            && post_action(NOTIFY_MSG.load(Ordering::Relaxed), vk, GetTickCount())
-        {
-            SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            return LRESULT(1);
-        }
-
         // ---- 打开/关闭预览：吞键，且只在"前台是文件管理器/我们自己的窗口"时生效 ----
         // 这是"绝不抢别人的空格"的唯一保障：记事本里的空格必须还是空格。
         if action_hits(Action::Toggle, vk) {
@@ -703,6 +760,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let shell = foreground_class().is_some_and(|class| is_shell_class(&class));
             if !(ours || shell) {
                 PASSED_OTHER_CLASS.fetch_add(1, Ordering::Relaxed);
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+            // 1.8.3（T02）：前台**正在输入文字**时绝不吞键。
+            // 报障场景：桌面上按 F2 给文件夹改名，空格被我们吞掉 → 输入法打不出字。
+            // 只在 shell 场景检查（我们自己的窗口里没有"别人的编辑框"），
+            // 这样多出来的两次轻量 API 调用只在真正需要时发生。
+            if shell && foreground_is_text_entry() {
+                PASSED_TEXT_FOCUS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(None, code, wparam, lparam);
             }
             if post_action(NOTIFY_MSG.load(Ordering::Relaxed), vk, GetTickCount()) {

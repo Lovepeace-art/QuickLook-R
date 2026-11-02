@@ -1436,3 +1436,57 @@ Excel 滚轮 / 横向滚动条拖动 / Shift+滚轮 全 True。
 `QLRUST_MEDIA_FIXTURES` 的绝对路径就能打开）。修法：`fixture()` 命中文件后先
 `std::fs::canonicalize(&path).unwrap_or(path)` 再返回。
 教训：**任何传给 MCI 的路径都必须是解析好的绝对路径**；顺便，`canonicalize` 也能消掉 8.3 短名与符号链接的差异。
+
+## #152 拍视觉基线必须先把 exe 复制到"中性目录"，否则会拍到托盘失败的 toast
+
+症状：同一套 exe、同一份夹具，`scripts\baseline-shot.ps1` 在仓库目录
+（`<桌面>\DSH\quicklook-rs\target\release`）跑出来 **text 截图多一个顶栏气泡**
+（「托盘图标没加上：后台常驻，qlrust.exe --quit 可退出」），`baseline-diff` 报
+`text DIFF 7580 px 最大通道差 200`，看着像 1.8.3 的视觉回归；把 exe 复制到
+`<桌面>\qlr-ab\base` 再拍就 5/5 SAME。
+
+根因：仓库/工作目录里的可执行文件会被打上 **Low Mandatory Level** 标签，低完整性进程给 explorer
+加托盘图标会被 UIPI 拒成 `0x80070005`；1.8.3 起"托盘失败"改成**第一次显示窗口时弹一条顶栏 toast**
+（不再起线程弹模态框，见 `app.rs::notify_tray_failure_once`），而基线脚本第一张恰好是 text，于是
+toast 进了基准图。这是环境噪音，不是绘制差异。
+
+修法（脚本已内置，别绕开）：
+- `scripts\baseline-shot.ps1` 默认把 `qlrust.exe` + `pdfium.dll` + 插件复制到
+  `<桌面>\qlr-ab\base`（可用 `-NeutralDir` 改）再拍，并清掉该目录的 `UserData`；
+  想复现"低完整性 + toast"的样子才加 `-NoNeutral`。
+- 同时加了**尺寸稳定**判据：show 之后窗口还会被缩放/自然尺寸路径改一次大小，早 200 ms 截会拍到
+  "小一号的中间态"（实测同一套 exe 两次跑出 `814x488` 与 `1589x924`）。现在要求连续两次
+  `GetWindowRect` 一致才截；截完再比一次矩形，变了就丢掉重拍（最多 3 次），仍在变就直接报错——
+  宁可脚本失败，也不往基准目录写中间态。
+- 刷新基准的固定流程（1.8.3 起）：备份 `baseline\before` → 用脚本重拍 → 立刻再拍一次
+  `baseline\after-check` → `baseline-diff -A baseline\before -B baseline\after-check` 必须 5/5 SAME。
+
+教训：**跑任何"像素级"脚本之前先问一句"这个进程在当前目录里能不能加托盘"**；环境降级会通过
+1.8.3 新增的 toast 混进画面。
+
+### #52 `dpi::enter` 不许缓存 hwnd：`if CURRENT == hwnd { return }` 会自锁
+
+症状：把一个窗口从 100% 屏拖到 150% 屏，字号/行高/顶栏高度全按旧 DPI 画，而且**永远**不恢复。
+根因：缓存以 hwnd 为键，判断"同一个窗口就直接返回"。跨屏时 hwnd 没变、DPI 变了，于是永不重查；
+而"该失效的条件"补不完（跨屏、改缩放、RDP 重连都会变）。
+修法：`enter(hwnd)` 每次都调 `GetDpiForWindow`（用户态 O(1)，内核侧已有缓存），只缓存 **DPI 值**，
+值变化时才清字体缓存（`FontSet::clear()`）并 invalidate。
+数字：`GetDpiForWindow` 一帧几十次的成本在微秒级，`bench.ps1` 的连续 200 帧重绘项可作回归门禁。
+
+### #53 `GetGUIThreadInfo` 的 `cbSize` 必须手填，否则失败长得像"没在打字"
+
+症状：前台明明在输入框里打字，判据却返回 false，空格照样被吞。
+根因：`GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() }` ——
+若写成 `let mut gti = GUITHREADINFO::default(); gti.cbSize = ...`，clippy 会拦；
+而**忘记填**（`cbSize = 0`）时 API 直接失败，返回 false，和"前台确实没在打字"完全无法区分。
+规矩：这个结构体的 `cbSize` 与 `MONITORINFO` / `OSVERSIONINFO` 一样，是入参不是出参，
+必须显式赋值并加注释；判失败时按"不在打字"处理（宁可吞键，也不能让钩子超时被摘）。
+
+### #54 判断"在打字"不能用 `DirectUIHWND` / `SysListView32`
+
+症状（若这么写）：资源管理器里所有预览都失效。
+根因：Win11 文件列表本身就是 `DirectUIHWND`，且**永远处于焦点**；把它当"编辑框"就等于
+把空格热键整体禁用。
+规矩：只认真正的编辑框类（`Edit` / `RichEdit20W` / `RichEdit50W` / `RichEditD2DPT`）。
+首选判据仍然是 caret（`hwndCaret` 非空），类名只作兜底；并记录"哪一级命中"（`text_focus_level`），
+否则换一台系统版本就不知道退化到哪一级了。

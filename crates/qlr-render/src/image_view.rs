@@ -14,6 +14,7 @@ use image::imageops::FilterType;
 use qlr_core::{Error, Result};
 
 use crate::canvas::{Bitmap, Canvas};
+use crate::source_cache;
 
 /// 解码并缩放到 `max_width × max_height` 以内（保持宽高比，不放大）。
 ///
@@ -196,7 +197,29 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// 通用路径：整图解码 → 盒式缩放。给所有非 JPEG 格式兜底。
+///
+/// 1.8.3：解码结果会先落进 `source_cache`，**同一张图再缩放时不再解码**。
+/// 缩放本身走 `scale` 那条快路径（缩小与 `thumbnail` 逐字节一致，放大用定点双线性）；
+/// 只有"一维放一维缩"这种极端长条才退回 `thumbnail`，保证历史口径不漂。
 fn render_via_image(path: &Path, max_width: u32, max_height: u32, upscale: bool) -> Result<Canvas> {
+    // 命中缓存：跳过整个"打开 + 解码 + 转 RGBA"（1920 PNG 省 4 ms，4K 截图省 30 ms 以上）。
+    if let Some(src) = source_cache::lookup(path) {
+        let (dst_w, dst_h) =
+            thumbnail_dims_for(src.width, src.height, max_width, max_height, upscale);
+        if let Some(bitmap) =
+            crate::scale::scale_rgba_to_bgra(&src.rgba, src.width, src.height, dst_w, dst_h)
+        {
+            qlr_core::log_debug!(
+                "render",
+                "IMGCACHE 命中 {}x{} -> {dst_w}x{dst_h}（{}）",
+                src.width,
+                src.height,
+                crate::display_name(path)
+            );
+            return Ok(Canvas::Bitmap(bitmap));
+        }
+    }
+
     let reader = image::ImageReader::open(path)
         .map_err(|e| Error::Message(format!("打不开图片：{e}")))?
         .with_guessed_format()
@@ -211,6 +234,25 @@ fn render_via_image(path: &Path, max_width: u32, max_height: u32, upscale: bool)
 
     let (src_w, src_h) = (img.width().max(1), img.height().max(1));
     let (dst_w, dst_h) = fit_within_opt(src_w, src_h, max_width, max_height, upscale);
+
+    // 值得缓存的（像素数在上限内）：先转成 RGBA 存起来，再**用同一套缩放**出帧。
+    // 命中与未命中必须走同一个缩放函数，否则同一档缩放在"第一次"和"第二次"会差 1 级色，
+    // 用户滚回去看一眼就能发现画面抖了一下。
+    if source_cache::cacheable(u64::from(src_w) * u64::from(src_h)) {
+        let (exact_w, exact_h) = thumbnail_dims_for(src_w, src_h, max_width, max_height, upscale);
+        let rgba = img.to_rgba8().into_raw();
+        let src = std::sync::Arc::new(source_cache::SourceImage {
+            width: src_w,
+            height: src_h,
+            rgba,
+        });
+        if let Some(bitmap) =
+            crate::scale::scale_rgba_to_bgra(&src.rgba, src_w, src_h, exact_w, exact_h)
+        {
+            source_cache::store(path, src);
+            return Ok(Canvas::Bitmap(bitmap));
+        }
+    }
 
     // `thumbnail` 是盒式采样，比 `resize(CatmullRom)` 快约一个量级；预览场景看不出差别。
     let scaled = if (dst_w, dst_h) == (src_w, src_h) {
@@ -229,6 +271,25 @@ fn render_via_image(path: &Path, max_width: u32, max_height: u32, upscale: bool)
 /// 任意一维传 0 视为"该维不限制"。返回至少 1×1，避免下游除零。
 pub fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     fit_within_opt(src_w, src_h, max_w, max_h, false)
+}
+
+/// 出帧的**最终**尺寸：`fit_within_opt` 算出盒子，再按 `image` 的口径等比缩进盒子。
+///
+/// 为什么要单独一步：老路径是 `img.thumbnail(dst_w, dst_h)`，而 `DynamicImage::thumbnail`
+/// 内部先做 `resize_dimensions`（等比、**四舍五入**、至少 1）再精确缩到那个尺寸。
+/// 我们若直接按"填满盒子"的尺寸缩，结果会差 1 px：1920×1080 进 1589×893 的盒子，
+/// `thumbnail` 给 1588×893。差这 1 px 等于把画面纵向拉伸 0.06%，
+/// 逐像素的视觉基线立刻不成立（实测 7.3 万个像素不同）。所以这一步必须照抄。
+fn thumbnail_dims_for(src_w: u32, src_h: u32, max_w: u32, max_h: u32, upscale: bool) -> (u32, u32) {
+    let (box_w, box_h) = fit_within_opt(src_w, src_h, max_w, max_h, upscale);
+    let (src_w, src_h) = (src_w.max(1), src_h.max(1));
+    if (box_w, box_h) == (src_w, src_h) {
+        return (src_w, src_h);
+    }
+    let ratio = (f64::from(box_w) / f64::from(src_w)).min(f64::from(box_h) / f64::from(src_h));
+    let w = ((f64::from(src_w) * ratio).round() as u32).max(1);
+    let h = ((f64::from(src_h) * ratio).round() as u32).max(1);
+    (w, h)
 }
 
 /// `fit_within` 的可放大版本（`upscale = true` 时允许超过原始尺寸）。
@@ -318,5 +379,65 @@ mod tests {
     fn missing_file_is_a_clean_error() {
         let err = render(Path::new(r"C:\definitely\not\here.png"), 100, 100).unwrap_err();
         assert!(format!("{err}").contains("打不开图片"), "{err}");
+    }
+
+    /// 同一个请求"第一次（未命中）"与"第二次（命中缓存）"必须给出**逐字节相同**的位图。
+    ///
+    /// 这两次走的是两条不同的前置路径（前者解码 + 缓存 + 缩放，后者纯缩放），
+    /// 只要有一处算错（尺寸、取整、通道顺序），用户来回滚一下就能看到画面抖。
+    #[test]
+    fn cache_hit_and_miss_produce_identical_bitmaps() {
+        let path = crate::testutil::dir("image").join("cache-same.png");
+        let mut img = image::RgbaImage::new(320, 180);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8, 255]);
+        }
+        img.save(&path).unwrap();
+
+        for (w, h) in [(160u32, 90u32), (200, 120), (400, 240)] {
+            let cold = match render(&path, w, h).unwrap() {
+                Canvas::Bitmap(b) => b,
+                other => panic!("期望 Bitmap，得到 {}", other.kind_name()),
+            };
+            let warm = match render(&path, w, h).unwrap() {
+                Canvas::Bitmap(b) => b,
+                other => panic!("期望 Bitmap，得到 {}", other.kind_name()),
+            };
+            assert_eq!((cold.width, cold.height), (warm.width, warm.height));
+            assert_eq!(cold.bgra, warm.bgra, "{w}x{h} 命中缓存后像素变了");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 出帧尺寸必须与 `image` 自己挑的尺寸一致（它是历史像素口径）。
+    ///
+    /// 这条测试是"换了缩放实现但基线一个像素都不动"的凭据：
+    /// 尺寸差 1 px 就等于把画面拉伸千分之几，140 万像素的截图里会有几万个像素不同。
+    #[test]
+    fn frame_dims_match_image_crate_thumbnail() {
+        let cases = [
+            (1920u32, 1080u32, 1589u32, 894u32, false),
+            (1920, 1080, 1588, 894, false),
+            (1920, 1080, 880, 748, false),
+            (4000, 3000, 1000, 1000, false),
+            (641, 479, 1589, 894, true),
+            (1920, 1080, 1986, 1118, true),
+            (1920, 1080, 3879, 2183, true),
+            (97, 61, 13, 7, false),
+            (1920, 1080, 0, 893, false),
+        ];
+        for (sw, sh, bw, bh, up) in cases {
+            // 老路径先 `fit_within_opt` 得到盒子，再 `img.thumbnail(盒子)`；
+            // 我们只是把这两步的结果摊平成一个函数，尺寸必须一模一样。
+            let (box_w, box_h) = fit_within_opt(sw, sh, bw, bh, up);
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(sw, sh));
+            let want = img.thumbnail(box_w, box_h);
+            let got = thumbnail_dims_for(sw, sh, bw, bh, up);
+            assert_eq!(
+                got,
+                (want.width(), want.height()),
+                "{sw}x{sh} 放进 {bw}x{bh}（upscale={up}）尺寸不一致"
+            );
+        }
     }
 }

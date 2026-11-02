@@ -1,0 +1,62 @@
+{
+  "runs": [
+    {
+      "组": "1.8.2 DSH 目录（low）",
+      "版本": "1.8.2.0",
+      "目录": "C:\\Users\\Administrator\\Desktop\\DSH\\_qlr-lowtest\\a182-low",
+      "就绪ms": 58,
+      "PrivateMB": 3.0,
+      "WSMB": 14.5,
+      "句柄": 248,
+      "线程": 9,
+      "GDI": 23,
+      "USER": 16,
+      "托盘": "失败",
+      "完整性": "low",
+      "插件": "loaded=2 ext=28"
+    },
+    {
+      "组": "1.8.2 DSH 目录（low）",
+      "版本": "1.8.2.0",
+      "目录": "C:\\Users\\Administrator\\Desktop\\DSH\\_qlr-lowtest\\a182-low",
+      "就绪ms": 30,
+      "PrivateMB": 3.07,
+      "WSMB": 14.52,
+      "句柄": 248,
+      "线程": 9,
+      "GDI": 23,
+      "USER": 16,
+      "托盘": "失败",
+      "完整性": "low",
+      "插件": "loaded=2 ext=28"
+    },
+    {
+      "组": "1.8.2 DSH 目录（low）",
+      "版本": "1.8.2.0",
+      "目录": "C:\\Users\\Administrator\\Desktop\\DSH\\_qlr-lowtest\\a182-low",
+      "就绪ms": 32,
+      "PrivateMB": 3.34,
+      "WSMB": 14.63,
+      "句柄": 248,
+      "线程": 9,
+      "GDI": 23,
+      "USER": 16,
+      "托盘": "失败",
+      "完整性": "low",
+      "插件": "loaded=2 ext=28"
+    }
+  ],
+  "medians": {
+    "组": "1.8.2 DSH 目录（low）",
+    "版本": "1.8.2.0",
+    "Private": 3.07,
+    "WS": 14.52,
+    "句柄": 248.0,
+    "线程": 9.0,
+    "GDI": 23.0,
+    "USER": 16.0,
+    "托盘": "失败",
+    "完整性": "low",
+    "插件": "loaded=2 ext=28"
+  }
+}

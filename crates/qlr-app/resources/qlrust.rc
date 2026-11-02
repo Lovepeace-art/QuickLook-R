@@ -9,8 +9,8 @@
 1 24 "qlrust.manifest"
 
 1 VERSIONINFO
-FILEVERSION     1,8,2,0
-PRODUCTVERSION  1,8,2,0
+FILEVERSION     1,8,3,0
+PRODUCTVERSION  1,8,3,0
 FILEOS          0x40004L
 FILETYPE        0x1L
 BEGIN
@@ -20,12 +20,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "QLRust contributors"
             VALUE "FileDescription",  "QLRust - 按空格预览文件（Rust 版 QuickLook 重写）"
-            VALUE "FileVersion",     "1.8.2.0"
+            VALUE "FileVersion",     "1.8.3.0"
             VALUE "InternalName",     "qlrust"
             VALUE "LegalCopyright",   "GPL-3.0-or-later"
             VALUE "OriginalFilename", "qlrust.exe"
             VALUE "ProductName",      "QLRust"
-            VALUE "ProductVersion",  "1.8.2.0"
+            VALUE "ProductVersion",  "1.8.3.0"
         END
     END
     BLOCK "VarFileInfo"

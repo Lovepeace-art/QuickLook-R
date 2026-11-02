@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::keymap::Hotkeys;
 
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
 
 /// 投机预渲染档位（1.1.0）。
 ///
@@ -119,11 +119,23 @@ pub struct Config {
     /// 所以老配置文件升级后不需要手改。
     pub hotkeys: Hotkeys,
 
-    /// 图片初始缩放（百分比，1.0.9 起可配置，默认 50）。
+    /// 图片初始缩放（百分比，1.0.9 起可配置）。
     ///
-    /// 用户的原话是"图片初始预览给一个设置的选项，默认 50%"：大图按原尺寸开窗会
-    /// 顶到工作区 86%，反而看不出全貌。50% 起步、需要细节再滚轮放大/开放大镜。
+    /// 1.0.9 的默认是 50%（用户当时的原话"默认 50%"），理由是"大图按原尺寸开窗会顶到
+    /// 工作区 86%，反而看不出全貌"。**1.8.3 改成 100%**：200% 缩放的机器上 50% 叠上
+    /// 未做 DPI 换算，图片只占屏幕一小块（用户报障"内容也小很多"）；而且窗口尺寸有记忆
+    /// （`window_sizes`），觉得大的人拖一次就记住了，比"每次都太小"好救。
+    ///
+    /// 老配置的迁移见 [`Config::migrate`]（schema 1 → 2）。
     pub image_zoom_percent: u32,
+
+    /// 预览窗口**内容**的缩放（百分比；`0` = 自动）。1.8.3 新增。
+    ///
+    /// 为什么要把"内容"和"外壳"分开：外壳（顶栏 / 页码框 / 滚动条 / 设置窗）必须跟着
+    /// DPI 走，否则 200% 下按钮小得点不着；但正文也跟着翻倍就变成"字很大、一屏没几行"。
+    /// `0` = 自动（按 `sqrt(dpi/96)` 压缩，200% 下 ≈1.41 倍而不是 2 倍）；
+    /// 填具体百分比就按它；填 `100` 等于"完全跟随 DPI"。
+    pub content_scale_percent: u32,
 
     /// 上次预览窗口的位置（屏幕坐标，左上角；1.0.13 起记忆）。
     ///
@@ -172,7 +184,8 @@ impl Default for Config {
             hold_key_ms: 0,
             hotkey_enabled: true,
             hotkeys: Hotkeys::default(),
-            image_zoom_percent: 50,
+            image_zoom_percent: 100,
+            content_scale_percent: 0,
             window_pos: None,
             window_sizes: std::collections::BTreeMap::new(),
             prewarm: Prewarm::default(),
@@ -187,7 +200,7 @@ impl Config {
     pub fn load(path: &Path) -> (Self, Option<crate::error::Error>) {
         match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<Config>(&bytes) {
-                Ok(cfg) => (cfg.sanitized(), None),
+                Ok(cfg) => (cfg.migrate().sanitized(), None),
                 Err(e) => (
                     Config::default(),
                     Some(crate::error::Error::config(format!(
@@ -203,6 +216,24 @@ impl Config {
                 ))),
             ),
         }
+    }
+
+    /// 老配置迁移（1.8.3 起**真有了这个函数**：此前 `migrate` 只写在文档里，并不存在）。
+    ///
+    /// 原则：只做确定安全的改动，并且**认得出用户自己改过的值就别碰**。
+    ///
+    /// schema 1 → 2：`image_zoom_percent` 50 → 100。
+    /// 老配置里那个 50 是 1.0.9 落盘的默认值；不迁移的话，200% 缩放的机器上升级完
+    /// "图片还是小一半"，等于白改。所以**恰好等于 50 才改**：用户自己设成 60/80/120
+    /// 的一律不动（他有明确偏好，而 50 只是历史默认）。
+    fn migrate(mut self) -> Self {
+        if self.schema_version < 2 {
+            if self.image_zoom_percent == 50 {
+                self.image_zoom_percent = 100;
+            }
+            self.schema_version = 2;
+        }
+        self
     }
 
     /// 原子保存：先写 `.tmp` 再 rename，避免掉电/崩溃留下半个文件。
@@ -227,6 +258,12 @@ impl Config {
         self.hotkeys = self.hotkeys.sanitized();
         // 1% 太小、400% 太大（4 倍已经要跨屏拖了），夹在中间。
         self.image_zoom_percent = self.image_zoom_percent.clamp(10, 400);
+        // 内容缩放：0 = 自动；手填的离谱值夹到 50–400（太小看不清，太大一屏放不下一行）。
+        self.content_scale_percent = if self.content_scale_percent == 0 {
+            0
+        } else {
+            self.content_scale_percent.clamp(50, 400)
+        };
         // 记住的窗口尺寸是用户可手改的 JSON：丢掉明显不合理的（负数、0、比任何显示器都大）。
         self.window_sizes
             .retain(|_, (w, h)| (200..=20000).contains(w) && (120..=20000).contains(h));
@@ -425,5 +462,40 @@ mod tests {
         assert_eq!(loaded.window_size_for("image"), None, "0 尺寸要丢掉");
         assert_eq!(loaded.window_size_for("pdf"), Some((700, 1000)));
         assert_eq!(loaded.window_size_for("text"), None, "离谱尺寸要丢掉");
+    }
+
+    /// 1.8.3：图片默认缩放 50% → 100%，老配置要跟着迁。
+    #[test]
+    fn image_zoom_default_is_one_hundred() {
+        assert_eq!(Config::default().image_zoom_percent, 100);
+    }
+
+    /// schema 1 的老配置（值是 1.0.9 落盘的 50）→ 迁移成 100，并把版本抬到 2。
+    #[test]
+    fn schema1_migrates_legacy_fifty_percent_to_one_hundred() {
+        let s = r#"{"schema_version":1,"image_zoom_percent":50}"#;
+        let c: Config = serde_json::from_str::<Config>(s).unwrap().migrate();
+        assert_eq!(c.image_zoom_percent, 100);
+        assert_eq!(c.schema_version, 2);
+    }
+
+    /// 用户自己设过的值（不是老默认的 50）不许被迁移改掉。
+    #[test]
+    fn migration_leaves_custom_zoom_alone() {
+        for kept in [60u32, 80, 120, 400] {
+            let s = format!(r#"{{"schema_version":1,"image_zoom_percent":{kept}}}"#);
+            let c: Config = serde_json::from_str::<Config>(&s).unwrap().migrate();
+            assert_eq!(c.image_zoom_percent, kept, "自定义 {kept}% 不该被改");
+        }
+    }
+
+    /// 迁移必须幂等：跑两遍结果一样（load() 每次启动都会跑一遍）。
+    #[test]
+    fn migration_is_idempotent() {
+        let s = r#"{"schema_version":1,"image_zoom_percent":50}"#;
+        let once: Config = serde_json::from_str::<Config>(s).unwrap().migrate();
+        let twice = once.clone().migrate();
+        assert_eq!(once.image_zoom_percent, twice.image_zoom_percent);
+        assert_eq!(twice.schema_version, 2);
     }
 }

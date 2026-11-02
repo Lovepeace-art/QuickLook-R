@@ -1,7 +1,15 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-01 · **1.8.2**：**图片/视频不再能拖边改窗口大小**——看细节用滚轮缩放就够，窗口只在打开时按素材比例定一次（`resizable_kind()` + `resize_margin()` 返回 0 + `edges_at()` 短路，光标也不再变双向箭头）。最大化/外部改大小这类情况仍按"比例差 >2% 就等比居中"处理，不会把图拉变形。
+> 更新时间：2026-11-02 · **1.8.3**：**修好"Win11 200% 缩放下界面小一半"**——根因是窗口坐标是物理像素，而 30/24/15 这些几何量是照 100% 写的（顶栏只剩 15 DIP、正文 7.5 DIP）。17 个几何常量改成 DIP→物理像素的函数（161 处引用），字号表、PDF/图片的自然尺寸、预热线程一并换算；图片默认缩放 50% → 100%（老配置有 schema 1→2 迁移）。**空格热键不再偷按键**：修饰键改成精确匹配（`Ctrl+Space`/`Alt+Space` 不再被吞，`Shift+=` 单独放行），前台在输入文字时（桌面 F2 改名）直接放行；**收起预览时释放数字输入模式**（此前会一直吞数字键）。
+> 回归：`cargo test` **264 passed / 3 ignored**、fmt/clippy 零输出、`smoke.ps1` 17 PASS（1 SKIP=管理员会话 UIPI）、**视觉基线 5 张截图与改前逐字节一致**（96 DPI 下必须零变化）。200% 视觉验收待用户真机。
+>
+> <details><summary>1.8.2 图片/视频固定窗口大小</summary>
+
+> **1.8.2**：**图片/视频不再能拖边改窗口大小**——看细节用滚轮缩放就够，窗口只在打开时按素材比例定一次（`resizable_kind()` + `resize_margin()` 返回 0 + `edges_at()` 短路，光标也不再变双向箭头）。最大化/外部改大小这类情况仍按"比例差 >2% 就等比居中"处理，不会把图拉变形。
 > 回归：`verify-mediashape.ps1` **13 PASS · 0 FAIL · 0 SKIP**（图片 `640x390`、视频 `640x442` 拖边前后一致）、`verify-office.ps1` 23 PASS（docx/pptx 拖边仍能改大小）、`verify-archive.ps1` 11 PASS、`verify-media.ps1` 15 PASS、`smoke.ps1` 全过、`cargo test` **251 passed**、fmt/clippy 干净。
+>
+>
+> </details>
 >
 > <details><summary>1.8.1 Excel 点选单元格 / 媒体比例锁定</summary>
 > **Excel 预览里左键能点选单元格了**——真因是焦点只给到 Excel 的容器层 `EXCEL9`，画表格的 `EXCEL7` 从来没拿到 UI 激活；改成让处理器自己设焦点（`IPreviewHandler::SetFocus`），并且只能放到"输入同步呼叫退栈后"的定时器里调（`WM_ACTIVATE`/`WM_SETFOCUS` 里会被 `0x8001010D` 拒，`WM_MOUSEACTIVATE` 里会把这一次点击吃掉）。**图片/视频改成锁窗口比例**，**交给系统处理器的类型不再画文字占位页**。

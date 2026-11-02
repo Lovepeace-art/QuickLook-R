@@ -8,6 +8,7 @@
 
 mod app;
 mod cli;
+mod layout;
 mod pagecache;
 mod settings;
 

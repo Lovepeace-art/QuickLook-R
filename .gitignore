@@ -11,3 +11,6 @@ Thumbs.db
 
 # 本机测试残留
 _bench_tmp/
+
+# 视觉基线截图（scripts\baseline-shot.ps1 的产物，只用于逐像素对比，不入库）
+/baseline/

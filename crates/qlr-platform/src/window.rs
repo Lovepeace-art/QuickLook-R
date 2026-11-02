@@ -51,6 +51,10 @@ unsafe extern "system" {
 
 use crate::wide::to_wide;
 
+// 1.8.3：几何量一律写 DIP，用 `dpi::px()` 换到物理像素。这个模块里用得最密，
+// 直接 use 进来，免得每处写全路径。
+use crate::dpi;
+
 /// 弹一个原生告警框。
 ///
 /// 只用于"程序还能跑，但用户必须知道某件事"的场景（例如托盘加不上 —— 否则程序
@@ -150,7 +154,9 @@ pub fn create_shadow_window(class: &str, title: &str) -> windows::core::Result<H
 }
 
 /// 投影的外扩宽度（像素）：阴影画在窗口外面这么宽的一圈里。
-pub const SHADOW_MARGIN: i32 = 16;
+pub fn shadow_margin() -> i32 {
+    dpi::px(16)
+}
 /// 投影最深处的 alpha（0–255）。太黑会像"贴了张黑纸"，80–110 附近最像 CSS 阴影。
 pub const SHADOW_ALPHA: f32 = 96.0;
 
@@ -172,8 +178,8 @@ pub fn sync_shadow(shadow: HWND, target: HWND) {
             return;
         }
     }
-    let width = (rc.right - rc.left) + SHADOW_MARGIN * 2;
-    let height = (rc.bottom - rc.top) + SHADOW_MARGIN * 2;
+    let width = (rc.right - rc.left) + shadow_margin() * 2;
+    let height = (rc.bottom - rc.top) + shadow_margin() * 2;
     if width <= 0 || height <= 0 {
         return;
     }
@@ -182,8 +188,8 @@ pub fn sync_shadow(shadow: HWND, target: HWND) {
         let _ = SetWindowPos(
             shadow,
             Some(target),
-            rc.left - SHADOW_MARGIN,
-            rc.top - SHADOW_MARGIN,
+            rc.left - shadow_margin(),
+            rc.top - shadow_margin(),
             width,
             height,
             SWP_NOACTIVATE,
@@ -215,7 +221,7 @@ fn paint_shadow(shadow: HWND, width: i32, height: i32) {
 
     // 逐像素预乘 alpha 的 32 位位图：中间挖空（被预览窗盖住）+ 向内 16 px 柔和衰减。
     let mut pixels = vec![0u8; (width * height * 4) as usize];
-    let m = SHADOW_MARGIN as f32;
+    let m = shadow_margin() as f32;
     for y in 0..height {
         for x in 0..width {
             // 到"内框"（= 预览窗）的带符号距离：框内为负，框外为正式像素数。
@@ -546,7 +552,13 @@ pub fn paint_window_frame(hwnd: HWND) {
         }
         let rc = client_rect(hwnd);
         frame_solid(hdc, rc, FRAME_HAIRLINE_RGB);
-        // DC 由调用方持有/释放（1.5.2）
+        // 1.8.3 修 GDI 泄漏：这里以前只有 `GetDC` 没有 `ReleaseDC`，注释还写着
+        // "DC 由调用方持有/释放"——但函数既不返回 DC，唯一调用点
+        // （`app.rs::paint_overlays`）也拿不到它，于是每画一帧就漏 1 个 GDI 对象。
+        // 表现为"每预览一个文件 GDI +1、收起不回收"：每次 show 至少跑一次
+        // `paint_overlays`，而 `ReleaseDC` 一次都没有。现在配对释放，
+        // 和同文件的 `paint_scrollbar` / `paint_toc` 保持一致。
+        ReleaseDC(Some(hwnd), hdc);
     }
 }
 
@@ -694,10 +706,10 @@ pub fn clamp_into(rc: &mut RECT, work: RECT) {
 ///
 /// 用户反馈"文本默认窗口有点大"：以前宽高都跟着屏幕比例走，在 1080p 上是一个
 /// 1200×750 的大窗，但一屏正文其实只用到中间一条。文字类内容没有"原始尺寸"，
-/// 所以给一个阅读宽度（`TEXT_WINDOW_WIDTH`）更合适，剩下的上下留白用户自己看着调。
+/// 所以给一个阅读宽度（`text_window_width()`）更合适，剩下的上下留白用户自己看着调。
 pub fn text_rect(work: RECT, height_ratio: f32) -> RECT {
     let (ww, wh) = (work.right - work.left, work.bottom - work.top);
-    let width = TEXT_WINDOW_WIDTH.min((ww as f32 * 0.92) as i32).max(320);
+    let width = text_window_width().min((ww as f32 * 0.92) as i32).max(320);
     let height = ((wh as f32) * height_ratio).clamp(240.0, wh as f32 * 0.92) as i32;
     let left = work.left + (ww - width) / 2;
     let top = work.top + (wh - height) / 2;
@@ -711,10 +723,30 @@ pub fn text_rect(work: RECT, height_ratio: f32) -> RECT {
 
 /// 文本/Markdown 的默认窗口宽度（像素）。880 在 100% 缩放下大约 70–80 个汉字宽，
 /// 是长文档比较舒服的阅读宽度；宽度不再随屏幕变大而膨胀。
-pub const TEXT_WINDOW_WIDTH: i32 = 880;
+pub fn text_window_width() -> i32 {
+    dpi::px(880)
+}
 
 pub fn is_visible(hwnd: HWND) -> bool {
     unsafe { IsWindowVisible(hwnd).as_bool() }
+}
+
+/// 当前进程的 GDI / USER 对象数（诊断用）。
+///
+/// 为什么需要它：现场报障"每预览一个文件，GDI 对象就 +1 且收起不释放"。
+/// GDI 对象是进程级配额（默认 1 万），一天几百次预览就会累积到图形界面开始掉字。
+/// 这个函数只读计数，成本是一次系统调用，只在 `show`/`hide` 各打一行日志时用。
+/// 进程句柄失效等异常情况返回 `(0, 0)`——诊断信息不该影响主流程。
+pub fn gui_resources() -> (u32, u32) {
+    use windows::Win32::System::Threading::{
+        GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
+    };
+    unsafe {
+        (
+            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+            GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
+        )
+    }
 }
 
 pub fn client_rect(hwnd: HWND) -> RECT {
@@ -786,8 +818,12 @@ pub fn natural_rect_scaled(work: RECT, width: i32, height: i32, factor: f32) -> 
 
     let ww = ((work.right - work.left) as f32 * NATURAL_FILL).max(1.0) as i32;
     let wh = ((work.bottom - work.top) as f32 * NATURAL_FILL).max(1.0) as i32;
-    let cw = width.max(1);
-    let ch = height.max(1);
+    // 1.8.3：入参 `width/height` 是**96 DPI 下的自然像素**（PDF 页 794×1123 = A4@96dpi，
+    // 图片 = 图片像素数），先按 DPI 换成物理像素再算缩放。
+    // 不换的话：200% 屏上一页 A4 只有 397×561 DIP，用户看到的是"内容小一半"
+    // （这是"顶栏小"之外的另一半，光改字号和行高不够）。
+    let cw = dpi::px(width.max(1));
+    let ch = dpi::px(height.max(1));
 
     // `fit` = 塞进工作区所需的系数；`min_scale` = 撑到最小可读尺寸所需的系数。
     let fit = (ww as f32 / cw as f32).min(wh as f32 / ch as f32);
@@ -827,6 +863,10 @@ pub fn zoomed_rect(work: RECT, natural: (u32, u32), zoom: f32) -> RECT {
     let ch = ((natural.1.max(1) as f32) * zoom.max(0.01))
         .round()
         .max(1.0);
+    // 1.8.3：与 `natural_rect_scaled` 同一套口径——自然尺寸是 96 DPI 像素，先换到物理像素。
+    // 这样"缩放 100%"在 200% 屏上仍然是一页实实在在的 A4，而不是半页。
+    let cw = dpi::pxf(cw);
+    let ch = dpi::pxf(ch);
     let scale = (ww as f32 / cw).min(wh as f32 / ch).min(1.0);
     let width = ((cw * scale).round() as i32).clamp(1, ww);
     let height = ((ch * scale).round() as i32).clamp(1, wh);
@@ -845,10 +885,14 @@ pub fn zoomed_rect(work: RECT, natural: (u32, u32), zoom: f32) -> RECT {
 pub const TEXT_BACKGROUND_RGB: u32 = BITMAP_BACKGROUND_RGB;
 
 /// 文本从客户区顶部往下留的空白（像素）。
-pub const TEXT_PADDING_TOP: i32 = 16;
+pub fn text_padding_top() -> i32 {
+    dpi::cpx(16)
+}
 
-/// 文本行高（像素）。**必须与 `qlr-app` 的 `LINE_HEIGHT` 一致**：那边用它算可见行数。
-pub const LINE_HEIGHT: i32 = 24;
+/// 文本行高（像素）。**必须与 `qlr-app` 的 `line_height()` 一致**：那边用它算可见行数。
+pub fn line_height() -> i32 {
+    dpi::cpx(24)
+}
 
 /// 行号栏宽度（像素）。行号靠右对齐画在这一栏里，正文从栏右侧开始。
 ///
@@ -856,7 +900,9 @@ pub const LINE_HEIGHT: i32 = 24;
 /// "画的宽度"（CONVENTIONS #38）。常数两边都不会算错；动态算就得让渲染折行和
 /// GDI 绘制各自量一遍数字宽度，量法一旦不同就会出现"折了行还被省略号吃掉"。
 /// 64 px 足够 6 位数行号（文本预算上限 20 万行）。
-pub const TEXT_GUTTER: i32 = 64;
+pub fn text_gutter() -> i32 {
+    dpi::cpx(64)
+}
 
 /// 上屏用的行样式（像素级：字号/字重/颜色/字体面）。
 ///
@@ -911,9 +957,13 @@ impl TextStyle {
         }
     }
 
-    /// 字号（像素，逻辑高度）。全部 ≤18 px，保证塞进 24 px 行高不被裁。
+    /// 字号（**物理像素**，逻辑高度）。全部 ≤18 DIP，保证塞进 24 DIP 行高不被裁。
+    ///
+    /// 1.8.3：表里写的是 DIP，实际传给 `CreateFontW` 的是按 DPI 换算后的值。
+    /// 200% 下正文 15 → 30，与 30×2=60 的顶栏、48 的行高成比例，
+    /// 这就是用户要的"字看起来和 100% 下一模一样大"。
     fn height(self) -> i32 {
-        match self {
+        let dip = match self {
             TextStyle::Heading1 => 18,
             TextStyle::Heading2 => 17,
             TextStyle::Heading3 => 16,
@@ -922,7 +972,8 @@ impl TextStyle {
             TextStyle::LineNumber => 12,
             TextStyle::Keyword | TextStyle::Str | TextStyle::Comment | TextStyle::Number => 14,
             _ => 15,
-        }
+        };
+        dpi::cpx(dip)
     }
 
     fn weight(self) -> i32 {
@@ -1056,6 +1107,43 @@ impl FontSet {
         self.fonts[idx] = Some(font);
         font
     }
+
+    /// 丢掉全部缓存字体（DPI 变化时用）：不丢的话跨屏之后还在用旧像素高度的字体，
+    /// 字会"半大不小"，而且每次都新建字体但不释放 → 每跨一次屏漏 14 个 HFONT。
+    fn clear(&mut self) {
+        for slot in &mut self.fonts {
+            if let Some(font) = slot.take() {
+                // 只删自己 `CreateFontW` 出来的；`get()` 里失败退回 stock 的那条路径
+                // **不缓存**，所以这里不可能拿到 stock 对象（删它会失败但也不致命）。
+                unsafe {
+                    let _ = DeleteObject(font.into());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FontSet {
+    /// 线程退出时兜底：`thread_local` 不保证 drop，但主线程退出前会走到这里的情况
+    /// （例如设置窗所在的线程）至少不把 HFONT 漏给系统。
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// 丢掉本线程的字体缓存。**这是 `dpi::set_change_hook` 的回调**：DPI 一变就调，
+/// 下次绘制按新字号重建。
+pub fn fonts_invalidate() {
+    // 正常情况下一个窗口生命周期里只会调 1–2 次（跨屏拖动、改缩放）。
+    // 如果在同一次预览里反复看到这行，说明线程 DPI 在**来回跳**——那是设计问题，
+    // 不是正常路径（每跳一次就要重建 14 个 HFONT，绘制会明显变慢）。
+    qlr_core::log_debug!("window", "字体缓存失效（DPI 变化）");
+    FONTS.with(|cell| cell.borrow_mut().clear());
+}
+
+/// 装上"DPI 变了 → 重建字体"的钩子。宿主启动时调一次即可。
+pub fn install_dpi_hook() {
+    dpi::set_change_hook(fonts_invalidate);
 }
 
 /// 画一组带样式的文本行（逐行上色，每行可以多段）。
@@ -1126,7 +1214,9 @@ pub struct ListRow<'a> {
 }
 
 /// 列表视图的行高。
-pub const LIST_ROW_HEIGHT: i32 = 26;
+pub fn list_row_height() -> i32 {
+    dpi::cpx(26)
+}
 
 /// 画一个文件列表（📁/📄 + 缩进 + 大小 + 时间），带双缓冲。
 ///
@@ -1165,14 +1255,14 @@ pub fn paint_list(
 
         FONTS.with(|cell| {
             let mut set = cell.borrow_mut();
-            let mut y = content.top + TEXT_PADDING_TOP;
+            let mut y = content.top + text_padding_top();
             for row in rows {
                 if row.selected {
                     let band = RECT {
                         left: content.left + 4,
                         top: y,
                         right: content.right - 4,
-                        bottom: y + LIST_ROW_HEIGHT,
+                        bottom: y + list_row_height(),
                     };
                     let hi = CreateSolidBrush(COLORREF(LIST_HIGHLIGHT_RGB));
                     FillRect(hdc, &band, hi);
@@ -1199,7 +1289,7 @@ pub fn paint_list(
                     left: indent,
                     right: size_left - 8,
                     top: y,
-                    bottom: y + LIST_ROW_HEIGHT,
+                    bottom: y + list_row_height(),
                 };
                 let mut buf: Vec<u16> = label.encode_utf16().collect();
                 DrawTextW(
@@ -1214,7 +1304,7 @@ pub fn paint_list(
                         left: size_left,
                         right: size_right,
                         top: y,
-                        bottom: y + LIST_ROW_HEIGHT,
+                        bottom: y + list_row_height(),
                     };
                     let mut sb: Vec<u16> = row.size.encode_utf16().collect();
                     DrawTextW(
@@ -1229,7 +1319,7 @@ pub fn paint_list(
                         left: size_right + 8,
                         right: time_right,
                         top: y,
-                        bottom: y + LIST_ROW_HEIGHT,
+                        bottom: y + list_row_height(),
                     };
                     let mut tb: Vec<u16> = row.time.encode_utf16().collect();
                     DrawTextW(
@@ -1240,7 +1330,7 @@ pub fn paint_list(
                     );
                 }
                 SelectObject(hdc, old);
-                y += LIST_ROW_HEIGHT;
+                y += list_row_height();
             }
         });
 
@@ -1308,11 +1398,11 @@ pub fn paint_doc_with(
         };
         let content = content.unwrap_or(after_chrome);
 
-        let mut y = content.top + TEXT_PADDING_TOP;
+        let mut y = content.top + text_padding_top();
 
         // 有任何一行带行号，就给全体正文空出一条行号栏（否则正文宽度会随滚动位置跳动）。
         let gutter = if rows.iter().any(|row| row.number.is_some()) {
-            TEXT_GUTTER
+            text_gutter()
         } else {
             0
         };
@@ -1328,7 +1418,7 @@ pub fn paint_doc_with(
                         left: text_left - 8,
                         top: y,
                         right: text_right + 8,
-                        bottom: y + LINE_HEIGHT,
+                        bottom: y + line_height(),
                     };
                     let brush = CreateSolidBrush(COLORREF(rgb));
                     FillRect(hdc, &band, brush);
@@ -1344,7 +1434,7 @@ pub fn paint_doc_with(
                         left: content.left + 24,
                         top: y,
                         right: content.left + 24 + gutter - 10,
-                        bottom: y + LINE_HEIGHT,
+                        bottom: y + line_height(),
                     };
                     DrawTextW(
                         hdc,
@@ -1360,7 +1450,7 @@ pub fn paint_doc_with(
                 // 空行只占高度、不画字。
                 let blank = row.spans.iter().all(|span| span.text.is_empty());
                 if blank {
-                    y += LINE_HEIGHT;
+                    y += line_height();
                     continue;
                 }
                 // 逐段画：先量宽度决定下一段的起点，再 DrawTextW（默认会裁到 rect，
@@ -1384,7 +1474,7 @@ pub fn paint_doc_with(
                         left: x,
                         top: y,
                         right: text_right,
-                        bottom: y + LINE_HEIGHT,
+                        bottom: y + line_height(),
                     };
                     DrawTextW(
                         hdc,
@@ -1395,7 +1485,7 @@ pub fn paint_doc_with(
                     SelectObject(hdc, old);
                     x += size.cx.max(0);
                 }
-                y += LINE_HEIGHT;
+                y += line_height();
             }
         });
 
@@ -1509,11 +1599,17 @@ pub fn paint_text_with(
 // ---------------------------------------------------------------------------
 
 /// 设置页的行高（像素）。比预览页的 24 大一点：设置项要能用鼠标点，热区太小难点。
-pub const SETTINGS_ROW_HEIGHT: i32 = 28;
+pub fn settings_row_height() -> i32 {
+    dpi::px(28)
+}
 /// 设置页内容距客户区顶部的留白。
-pub const SETTINGS_PADDING_TOP: i32 = 18;
+pub fn settings_padding_top() -> i32 {
+    dpi::px(18)
+}
 /// 设置页左右留白。
-pub const SETTINGS_PADDING_X: i32 = 28;
+pub fn settings_padding_x() -> i32 {
+    dpi::px(28)
+}
 /// 设置页高亮行的底色（比白色背景略深的浅灰，1.0.8 起浅色主题）。
 pub const SETTINGS_HIGHLIGHT_RGB: u32 = 0x00E8_E8E8;
 
@@ -1533,7 +1629,7 @@ pub struct SettingsRow<'a> {
 
 /// 画一整页设置内容。
 ///
-/// 行从顶部开始、每行 [`SETTINGS_ROW_HEIGHT`]，与 `qlr-app` 的命中测试共用同一组
+/// 行从顶部开始、每行 [`settings_row_height()`]，与 `qlr-app` 的命中测试共用同一组
 /// 常量（见 `settings::row_at`），保证"看到的行"和"点到的行"永远是同一行。
 pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
     unsafe {
@@ -1550,7 +1646,7 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
         FillRect(hdc, &rc, background);
         let _ = DeleteObject(background.into());
 
-        let mut y = rc.top + SETTINGS_PADDING_TOP;
+        let mut y = rc.top + settings_padding_top();
         let highlight = CreateSolidBrush(COLORREF(SETTINGS_HIGHLIGHT_RGB));
 
         FONTS.with(|cell| {
@@ -1561,7 +1657,7 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
                         left: rc.left + 8,
                         top: y,
                         right: rc.right - 8,
-                        bottom: y + SETTINGS_ROW_HEIGHT,
+                        bottom: y + settings_row_height(),
                     };
                     FillRect(hdc, &band, highlight);
                 }
@@ -1574,15 +1670,15 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
                     // 右边没有值（分类标题、说明行、底部提示）就把整行让给左列，
                     // 否则说明文字会被空着的值列挤掉半句（"按住它移动鼠标 = 放大镜；按住它…"）。
                     let right_edge = if row.right.is_empty() {
-                        rc.right - SETTINGS_PADDING_X
+                        rc.right - settings_padding_x()
                     } else {
-                        rc.right - SETTINGS_PADDING_X - 180
+                        rc.right - settings_padding_x() - 180
                     };
                     let mut rect = RECT {
-                        left: rc.left + SETTINGS_PADDING_X,
+                        left: rc.left + settings_padding_x(),
                         top: y,
                         right: right_edge,
-                        bottom: y + SETTINGS_ROW_HEIGHT,
+                        bottom: y + settings_row_height(),
                     };
                     DrawTextW(
                         hdc,
@@ -1598,10 +1694,10 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
                     SetTextColor(hdc, COLORREF(row.value_style.color()));
                     let mut buf: Vec<u16> = row.right.encode_utf16().collect();
                     let mut rect = RECT {
-                        left: rc.right - SETTINGS_PADDING_X - 172,
+                        left: rc.right - settings_padding_x() - 172,
                         top: y,
-                        right: rc.right - SETTINGS_PADDING_X,
-                        bottom: y + SETTINGS_ROW_HEIGHT,
+                        right: rc.right - settings_padding_x(),
+                        bottom: y + settings_row_height(),
                     };
                     DrawTextW(
                         hdc,
@@ -1611,7 +1707,7 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
                     );
                     SelectObject(hdc, old);
                 }
-                y += SETTINGS_ROW_HEIGHT;
+                y += settings_row_height();
             }
         });
         let _ = DeleteObject(highlight.into());
@@ -1630,7 +1726,9 @@ pub fn paint_settings(hwnd: HWND, rows: &[SettingsRow<'_>]) {
 // ---------------------------------------------------------------------------
 
 /// 顶栏高度（像素）。
-pub const CHROME_HEIGHT: i32 = 30;
+pub fn chrome_height() -> i32 {
+    dpi::px(30)
+}
 /// 顶栏底色：黑色。浅色内容区上面压一条黑边，一眼就是"这是预览器的框"。
 pub const CHROME_BG_RGB: u32 = 0x0020_2020;
 /// 顶栏主文字色。
@@ -1649,20 +1747,30 @@ pub const CHROME_PIN_RGB: u32 = 0x0050_4520;
 /// 发丝边的颜色（1.0.10 定稿：投影交给分层窗口，客户区只留一条 1 px）。
 pub const FRAME_HAIRLINE_RGB: u32 = 0x00C8_C8C8;
 /// 顶栏右侧每个按钮的宽度。
-pub const CHROME_BUTTON_W: i32 = 38;
+pub fn chrome_button_w() -> i32 {
+    dpi::px(38)
+}
 /// PDF 页码框宽度。
-pub const PAGE_BOX_W: i32 = 84;
+pub fn page_box_w() -> i32 {
+    dpi::px(84)
+}
 
 /// 右侧竖滚动条宽度（文本 / PDF / Markdown 用）。
-pub const SCROLLBAR_W: i32 = 12;
+pub fn scrollbar_w() -> i32 {
+    dpi::px(12)
+}
 /// 滚动条槽底色与滑块色（`hover` 时用深一点的那个）。
 pub const SCROLLBAR_TRACK_RGB: u32 = 0x00F2_F2F2;
 pub const SCROLLBAR_THUMB_RGB: u32 = 0x00C0_C0C0;
 pub const SCROLLBAR_THUMB_HOVER_RGB: u32 = 0x0090_9090;
 
 /// Markdown 目录栏宽度与每行高度。
-pub const TOC_WIDTH: i32 = 200;
-pub const TOC_ROW_HEIGHT: i32 = 24;
+pub fn toc_width() -> i32 {
+    dpi::px(200)
+}
+pub fn toc_row_height() -> i32 {
+    dpi::cpx(24)
+}
 pub const TOC_BG_RGB: u32 = 0x00F7_F7F7;
 pub const TOC_SEP_RGB: u32 = 0x00E4_E4E4;
 pub const TOC_TITLE_RGB: u32 = 0x00A0_9A94;
@@ -1671,7 +1779,9 @@ pub const TOC_TITLE_RGB: u32 = 0x00A0_9A94;
 ///
 /// 高度 52：上行放"0:05 / 0:15 · 播放中"，下行放轨道。再矮就挤成一团，
 /// 再高就明显吃掉卡片正文的位置。
-pub const AUDIO_BAR_H: i32 = 52;
+pub fn audio_bar_h() -> i32 {
+    dpi::px(52)
+}
 pub const AUDIO_BAR_BG_RGB: u32 = 0x00F7_F7F7;
 pub const AUDIO_TRACK_RGB: u32 = 0x00DC_DCDC;
 // COLORREF 是 0x00BBGGRR（低字节是红）——这两个不对称的常量要按这个顺序写。
@@ -1728,34 +1838,34 @@ pub struct ChromeRects {
 /// 由客户区算出顶栏各块的位置（纯函数，便于单测）。
 pub fn chrome_rects(rc: RECT) -> ChromeRects {
     let close = RECT {
-        left: rc.right - CHROME_BUTTON_W,
+        left: rc.right - chrome_button_w(),
         top: rc.top,
         right: rc.right,
-        bottom: rc.top + CHROME_HEIGHT,
+        bottom: rc.top + chrome_height(),
     };
     let external = RECT {
-        left: close.left - CHROME_BUTTON_W,
+        left: close.left - chrome_button_w(),
         right: close.left,
         top: rc.top,
-        bottom: rc.top + CHROME_HEIGHT,
+        bottom: rc.top + chrome_height(),
     };
     // 页码框在最左、紧跟"阻止关闭"（锁）；两者都离 × 远一点，避免点错。
     let pin = RECT {
-        left: external.left - CHROME_BUTTON_W,
+        left: external.left - chrome_button_w(),
         top: rc.top,
         right: external.left,
-        bottom: rc.top + CHROME_HEIGHT,
+        bottom: rc.top + chrome_height(),
     };
     let page = RECT {
-        left: pin.left - 10 - PAGE_BOX_W,
+        left: pin.left - 10 - page_box_w(),
         top: rc.top + 5,
         right: pin.left - 10,
-        bottom: rc.top + CHROME_HEIGHT - 5,
+        bottom: rc.top + chrome_height() - 5,
     };
     ChromeRects {
         content: RECT {
             left: rc.left,
-            top: rc.top + CHROME_HEIGHT,
+            top: rc.top + chrome_height(),
             right: rc.right,
             bottom: rc.bottom,
         },
@@ -1874,7 +1984,7 @@ pub fn paint_chrome(hdc: HDC, rc: RECT, chrome: &Chrome<'_>) -> RECT {
         left: rc.left,
         top: rc.top,
         right: rc.right,
-        bottom: rc.top + CHROME_HEIGHT,
+        bottom: rc.top + chrome_height(),
     };
     fill_solid(hdc, band, CHROME_BG_RGB);
 
@@ -1955,9 +2065,9 @@ pub fn paint_chrome(hdc: HDC, rc: RECT, chrome: &Chrome<'_>) -> RECT {
         let left = (anchor.right - width).max(rc.left + 4);
         let bubble = RECT {
             left,
-            top: rc.top + CHROME_HEIGHT + 4,
+            top: rc.top + chrome_height() + 4,
             right: left + width,
-            bottom: rc.top + CHROME_HEIGHT + 26,
+            bottom: rc.top + chrome_height() + 26,
         };
         fill_solid(hdc, bubble, CHROME_HINT_RGB);
         frame_solid(hdc, bubble, CHROME_BOX_BORDER_RGB);
@@ -1984,7 +2094,7 @@ pub fn paint_chrome(hdc: HDC, rc: RECT, chrome: &Chrome<'_>) -> RECT {
             left: (right - width).max(rc.left + 60),
             top: rc.top + 5,
             right,
-            bottom: rc.top + CHROME_HEIGHT - 5,
+            bottom: rc.top + chrome_height() - 5,
         };
         fill_solid(hdc, bubble, CHROME_BOX_RGB);
         frame_solid(hdc, bubble, CHROME_BOX_BORDER_RGB);
@@ -2033,7 +2143,7 @@ impl ScrollInfo {
 /// 滚动条占的那一条（内容区右侧）。
 pub fn scrollbar_rect(area: RECT) -> RECT {
     RECT {
-        left: area.right - SCROLLBAR_W,
+        left: area.right - scrollbar_w(),
         top: area.top,
         right: area.right,
         bottom: area.bottom,
@@ -2104,7 +2214,7 @@ pub fn scroll_start_at(area: RECT, y: i32, info: ScrollInfo) -> f32 {
 /// 音频进度条占的那一块（内容区底部一条；内容区比它矮时就占满整个内容区）。
 pub fn audio_bar_rect(area: RECT) -> RECT {
     let height = (area.bottom - area.top).max(0);
-    let h = AUDIO_BAR_H.min(height);
+    let h = audio_bar_h().min(height);
     RECT {
         left: area.left,
         top: area.bottom - h,
@@ -2258,7 +2368,7 @@ pub fn toc_rect(area: RECT) -> RECT {
     RECT {
         left: area.left,
         top: area.top,
-        right: (area.left + TOC_WIDTH).min(area.right),
+        right: (area.left + toc_width()).min(area.right),
         bottom: area.bottom,
     }
 }
@@ -2266,30 +2376,51 @@ pub fn toc_rect(area: RECT) -> RECT {
 /// 目录第 `index` 行的位置（命中测试用）。
 pub fn toc_item_rect(area: RECT, index: usize) -> RECT {
     let panel = toc_rect(area);
-    let top = panel.top + 8 + index as i32 * TOC_ROW_HEIGHT;
+    let top = panel.top + dpi::px(8) + index as i32 * toc_row_height();
     RECT {
         left: panel.left,
         top,
         right: panel.right,
-        bottom: top + TOC_ROW_HEIGHT,
+        bottom: top + toc_row_height(),
     }
 }
 
 /// 画 Markdown 目录栏（左侧竖排标题列表）。用 `GetDC`，理由同 [`paint_scrollbar`]。
-pub fn paint_toc(hwnd: HWND, area: RECT, items: &[TocItem<'_>], selected: Option<usize>) {
+///
+/// `first` = 从第几条开始画（目录本身可以滚动，1.8.3）。
+pub fn paint_toc(
+    hwnd: HWND,
+    area: RECT,
+    items: &[TocItem<'_>],
+    selected: Option<usize>,
+    first: usize,
+) {
     unsafe {
         let hdc = GetDC(Some(hwnd));
         if hdc.0.is_null() {
             return;
         }
-        paint_toc_dc(hdc, area, items, selected);
+        paint_toc_dc(hdc, area, items, selected, first);
         ReleaseDC(Some(hwnd), hdc);
     }
 }
 
+/// 目录一屏能放下几行（不含"目录"标题行）。滚动上限要用它算。
+pub fn toc_visible_rows(area: RECT) -> usize {
+    let panel = toc_rect(area);
+    let usable = (panel.bottom - panel.top) - dpi::px(8) - toc_row_height();
+    (usable.max(0) / toc_row_height().max(1)) as usize
+}
+
 #[allow(unused_unsafe)]
-/// 画到指定 DC（同 `paint_scrollbar_dc`）。
-pub fn paint_toc_dc(hdc: HDC, area: RECT, items: &[TocItem<'_>], selected: Option<usize>) {
+/// 画到指定 DC（同 `paint_scrollbar_dc`）。`first` = 首行下标（滚动位置）。
+pub fn paint_toc_dc(
+    hdc: HDC,
+    area: RECT,
+    items: &[TocItem<'_>],
+    selected: Option<usize>,
+    first: usize,
+) {
     let panel = toc_rect(area);
     unsafe {
         fill_solid(hdc, panel, TOC_BG_RGB);
@@ -2308,7 +2439,7 @@ pub fn paint_toc_dc(hdc: HDC, area: RECT, items: &[TocItem<'_>], selected: Optio
                 left: panel.left + 12,
                 top: panel.top + 8,
                 right: panel.right - 8,
-                bottom: panel.top + 8 + TOC_ROW_HEIGHT,
+                bottom: panel.top + dpi::px(8) + toc_row_height(),
             },
             "目录",
             TextStyle::LineNumber,
@@ -2316,8 +2447,9 @@ pub fn paint_toc_dc(hdc: HDC, area: RECT, items: &[TocItem<'_>], selected: Optio
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
         );
 
-        for (index, item) in items.iter().enumerate() {
-            let row = toc_item_rect(area, index + 1);
+        for (index, item) in items.iter().enumerate().skip(first) {
+            // 行号按"屏幕上的第几行"算（`index - first`），不是按文档里的序号，否则滚动后整列会跑出去。
+            let row = toc_item_rect(area, index - first + 1);
             if row.top >= panel.bottom {
                 break;
             }
@@ -2330,7 +2462,7 @@ pub fn paint_toc_dc(hdc: HDC, area: RECT, items: &[TocItem<'_>], selected: Optio
                 };
                 fill_solid(hdc, band, 0x00EC_ECEC);
             }
-            let indent = 12 + (item.level.saturating_sub(1) as i32) * 12;
+            let indent = dpi::px(12 + (item.level.saturating_sub(1) as i32) * 12);
             draw_line(
                 hdc,
                 RECT {
@@ -2354,13 +2486,16 @@ pub fn paint_toc_dc(hdc: HDC, area: RECT, items: &[TocItem<'_>], selected: Optio
 }
 
 /// 目录里第几行被点到（`y` 是客户区坐标）。返回的是 `items` 的下标。
-pub fn toc_item_at(area: RECT, y: i32) -> Option<usize> {
+///
+/// `first` 必须和绘制时用的一致（目录可滚动，1.8.3）——两边不一致就会出现
+/// "看到的行"和"点到的行"错开。
+pub fn toc_item_at(area: RECT, y: i32, first: usize) -> Option<usize> {
     let panel = toc_rect(area);
-    if y < panel.top + 8 + TOC_ROW_HEIGHT {
+    if y < panel.top + dpi::px(8) + toc_row_height() {
         return None; // "目录"标题那一行
     }
-    let index = ((y - panel.top - 8) / TOC_ROW_HEIGHT - 1).max(0) as usize;
-    Some(index)
+    let row = ((y - panel.top - dpi::px(8)) / toc_row_height() - 1).max(0) as usize;
+    Some(first + row)
 }
 
 /// 把整张位图**等比拉伸**铺进客户区（1.0.5 的缩放预览）。
@@ -2629,6 +2764,11 @@ pub fn paint_bitmap_at(
         // 少 1 px（实测 `render=734x1040` 却是 `bitmap 734x1039`）。居中绘制会在
         // 上下各留半像素，合成一条深色细线——用户看到的就是"pdf 缩小后有一点黑边"。
         // 差 1 px 的拉伸肉眼看不出来，却能把那条线彻底抹掉。
+        //
+        // 1.8.3：但"少一大截"是另一回事。PDF 页面有自己的宽高比，比内容区矮几十像素
+        // 是**正常留白**；把它拉伸到铺满则是每帧整张重采样（HALFTONE），页面还会
+        // 被纵向拉长几毫米。所以只有"差几像素"才铺满，差得多就居中 1:1（不重采样）。
+        const FILL_SLACK: i32 = 4;
         let (dw, dx, sx, sw) = if bw > cw {
             let pan = offset_x.clamp(0, bw - cw);
             // 坑：本函数的 DIB 是 top-down（biHeight 取负），但 StretchDIBits 的
@@ -2636,12 +2776,17 @@ pub fn paint_bitmap_at(
             // 图像的另一端——实测表现是"放大后窗口里一片纯白"（其实画的是页面底部
             // 的空白），平移几步才偶然露出一点字。所以这里换算成从底部量。
             (cw, content.left, bw - cw - pan, cw)
+        } else if cw - bw > FILL_SLACK {
+            // 居中 1:1：目的尺寸 = 源尺寸，不插值。
+            (bw, content.left + (cw - bw) / 2, 0, bw)
         } else {
             (cw, content.left, 0, bw)
         };
         let (dh, dy, sy, sh) = if bh > ch {
             let pan = offset_y.clamp(0, bh - ch);
             (ch, content.top, bh - ch - pan, ch)
+        } else if ch - bh > FILL_SLACK {
+            (bh, content.top + (ch - bh) / 2, 0, bh)
         } else {
             (ch, content.top, 0, bh)
         };
@@ -2661,7 +2806,12 @@ pub fn paint_bitmap_at(
         };
 
         // 1:1 拷贝不需要插值（拖动/平移每帧都走这里，HALFTONE 会明显发卡）。
-        if dw == sw && dh == sh {
+        // 顺带：位图和内容区只差几个像素（"页面比例所限"的留白填充、按宽高比取整）
+        // 也不值得上 HALFTONE——3% 以内的补边肉眼分不出，HALFTONE 却要整张重采样一遍，
+        // 每一帧都来一次就是"滚动频闪 + 拖动掉帧"。真正需要插值的是缩放预览/缩放视频，
+        // 那种差距远超 3%。
+        let near = (dw - sw).abs() * 32 <= cw.abs() && (dh - sh).abs() * 32 <= ch.abs();
+        if near {
             SetStretchBltMode(hdc, COLORONCOLOR);
         } else {
             SetStretchBltMode(hdc, HALFTONE);
@@ -2751,13 +2901,15 @@ pub fn modifier_state() -> (bool, bool, bool) {
     }
 }
 
-/// 放大镜的半径（像素）。镜头是 `2 * LENS_RADIUS` 见方。
-pub const LENS_RADIUS: i32 = 110;
+/// 放大镜的半径（像素）。镜头是 `2 * lens_radius()` 见方。
+pub fn lens_radius() -> i32 {
+    dpi::px(110)
+}
 
 /// 在客户区上叠加一个放大镜（跟随光标的方形镜头）。
 ///
 /// 做法是**放大屏幕像素**，不是重新渲染：先用 `StretchBlt` 把光标周围
-/// `2*LENS_RADIUS / zoom` 见方的一块画面放大到内存位图，再 `BitBlt` 贴回窗口，
+/// `2*lens_radius() / zoom` 见方的一块画面放大到内存位图，再 `BitBlt` 贴回窗口，
 /// 最后画一圈亮边框。好处是不管文件多大、缩放几倍，代价都是一次 GDI 搬运
 /// （<1 ms），也不需要知道当前是第几页、平移到哪里。
 ///
@@ -2766,9 +2918,9 @@ pub const LENS_RADIUS: i32 = 110;
 pub fn paint_lens(hwnd: HWND, center: (i32, i32), zoom: f32) {
     let zoom = zoom.clamp(1.5, 12.0);
     let (cx, cy) = center;
-    let size = LENS_RADIUS * 2;
+    let size = lens_radius() * 2;
     // 镜头里显示多少源像素：放大倍数越大，取的源区域越小。
-    let src_half = ((LENS_RADIUS as f32) / zoom).round().max(4.0) as i32;
+    let src_half = ((lens_radius() as f32) / zoom).round().max(4.0) as i32;
     unsafe {
         let hdc = GetDC(Some(hwnd));
         if hdc.0.is_null() {
@@ -2799,8 +2951,8 @@ pub fn paint_lens(hwnd: HWND, center: (i32, i32), zoom: f32) {
         );
         // 贴回：`COLORONCOLOR` 1:1 搬运，不做二次平滑。
         SetStretchBltMode(hdc, COLORONCOLOR);
-        let left = cx - LENS_RADIUS;
-        let top = cy - LENS_RADIUS;
+        let left = cx - lens_radius();
+        let top = cy - lens_radius();
         let _ = BitBlt(hdc, left, top, size, size, Some(mem), 0, 0, SRCCOPY);
 
         // 一圈亮边框 + 一圈暗边框，任何底色上都看得清镜头边界。
@@ -3270,10 +3422,10 @@ mod tests {
     fn text_rect_uses_a_fixed_reading_width() {
         // 1.0.5：文本不再按屏幕比例摊开，固定 880 宽（1080p 上以前是 1200 宽，用户嫌大）。
         let rc = text_rect(work(), 0.72);
-        assert_eq!(rc.right - rc.left, TEXT_WINDOW_WIDTH);
+        assert_eq!(rc.right - rc.left, text_window_width());
         assert_eq!(rc.bottom - rc.top, (1040.0 * 0.72) as i32);
         // 仍然居中
-        assert!((rc.left - (1920 - TEXT_WINDOW_WIDTH) / 2).abs() <= 1);
+        assert!((rc.left - (1920 - text_window_width()) / 2).abs() <= 1);
         // 窄屏：不能超过工作区 92%
         let narrow = RECT {
             left: 0,
@@ -3303,15 +3455,15 @@ mod tests {
         assert!(rects.page.right <= rects.pin.left);
         assert!(rects.page.left > rc.left);
         // 内容区从顶栏下沿开始（正文不能画到黑条上）。
-        assert_eq!(rects.content.top, rc.top + CHROME_HEIGHT);
+        assert_eq!(rects.content.top, rc.top + chrome_height());
         // 每个按钮宽度一致，且都在顶栏带内。
         for button in [rects.pin, rects.external, rects.close] {
-            assert_eq!(button.right - button.left, CHROME_BUTTON_W);
+            assert_eq!(button.right - button.left, chrome_button_w());
             assert_eq!(button.top, rc.top);
-            assert_eq!(button.bottom, rc.top + CHROME_HEIGHT);
+            assert_eq!(button.bottom, rc.top + chrome_height());
         }
         // 页码框比按钮窄一点、上下留 5 px，仍在同一横带里。
-        assert_eq!(rects.page.right - rects.page.left, PAGE_BOX_W);
+        assert_eq!(rects.page.right - rects.page.left, page_box_w());
         assert_eq!(rects.page.top, rc.top + 5);
     }
 

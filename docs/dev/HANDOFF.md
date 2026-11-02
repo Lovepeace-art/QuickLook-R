@@ -471,3 +471,27 @@ gh repo create QuickLook-R --public --source . --push --remote origin
 （`IMFMediaSession` + EVR 或 WASAPI）、GitHub Release 里挂 `scripts\pack.ps1` 打出来的 zip、
 CI 里加 `verify-*.ps1`（需要 Windows runner + Office）。
 
+
+
+## 1.8.3 接力说明（2026-11-02）
+
+- **分支**：`release/1.8.3`（5 个提交：基线脚本 → 图片 100%+迁移 → DIP 常量 → 字体/自然尺寸/预热 → 热键三卡）。
+- **回归命令**（顺序照抄）：
+  ```powershell
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test                      # 期望 264 passed / 3 ignored
+  cargo build --release
+  pwsh -File scripts\baseline-shot.ps1 -OutDir baseline\after
+  pwsh -File scripts\baseline-diff.ps1 -A baseline\before -B baseline\after   # 96 DPI 下必须 PASS
+  pwsh -File scripts\smoke.ps1    # 17 PASS / 1 SKIP（管理员会话 UIPI）
+  ```
+- **`baseline\before` 是 1.8.3 的视觉基准**（图片已按 100% 缩放截取）。改任何绘制/尺寸代码后
+  必须重跑 `baseline-diff`，否则"没改坏"无法证明。基准图不入库（`.gitignore` 里有 `/baseline/`）。
+- **待验证**：200% 真机视觉（用户手上那台 Win11 200%）。`scripts\collect-diag.ps1` 一键收集
+  日志 + DPI + 7 条口述答案。重点看 `passed_text_focus` 与 `text_focus_level` 两个统计：
+  前者 > 0 说明 T02 的判据真的生效了，后者 1/2 说明 Win11 走的是 caret 还是类名兜底。
+- **已知限制**：多屏且各屏缩放不同时，"开窗尺寸"用的是**系统 DPI**（窗口还没建，没有 hwnd 可查），
+  只有建出来之后的绘制才是逐窗口精确的。单屏不受影响。
+- **下一步（未开工）**：P0 度量（`bench.ps1` 补 PeakPrivate / GDI 对象 / 帧级 alloc + CI 门禁脚本），
+  然后才是 T05–T11 里真正剩下的项（PDF 每次预览开 3 次文档、`video_tick` 锁内解码、`PageKey` 无 mtime）。

@@ -293,7 +293,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qlr-app"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "qlr-core",
  "qlr-platform",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "qlr-core"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "libloading",
  "qlr-plugin-api",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "qlr-platform"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "qlr-core",
  "windows",
@@ -321,18 +321,18 @@ dependencies = [
 
 [[package]]
 name = "qlr-plugin-api"
-version = "1.8.2"
+version = "1.8.3"
 
 [[package]]
 name = "qlr-plugin-demo"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "qlr-plugin-api",
 ]
 
 [[package]]
 name = "qlr-plugin-office"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "image",
  "qlr-plugin-api",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "qlr-render"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "image",
  "jpeg-decoder",

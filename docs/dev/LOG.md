@@ -2581,3 +2581,40 @@ Excel/Word 的预览是 **OLE 就地激活**对象：容器窗口不激活、焦
 - README 把三张表（速度 / 我们更强 / 原版更强）合成**一张**：指标 | QLRust | 原版 | 差距，
   优劣同行对比（扩展名、字体、视频声音、生态标原版强；Office 三件、压缩包标我们强）。
 - docs/dev/COMPARE-live-1.8.2.md 追加「冷启动复测」小节；GitHub Release 说明同步换成同一批数字。
+
+
+## 2026-11-02 · 1.8.3：200% 缩放下的"界面小一半" + 空格偷按键
+
+### 做了什么
+
+**一、DPI（T01）**——17 个几何常量从"物理像素字面量"改成 `pub fn chrome_height() -> i32 { dpi::px(30) }`，
+全部引用点（实测 161 处）换成函数调用；`TextStyle::height()` 的字号表改成 DIP 再换算；
+`natural_rect_scaled` / `zoomed_rect` 的入参按"96 DPI 自然像素"处理（PDF 页 794×1123 = A4@96dpi）；
+`dpi.rs` 加 `enter/px/seed_thread/system_dpi`，`enter` **每次真查** `GetDpiForWindow` 不缓存 hwnd；
+补 `FontSet::clear()` + `Drop` + `fonts_invalidate()`，由 `dpi::set_change_hook` 挂在 DPI 变化上。
+
+**二、热键（T02/T04）**——`action_hits` 改成无条件查 ctrl/alt/shift 三个修饰键（此前
+"没声明的当 false"，导致 `Ctrl+Space`、`Alt+Space` 被吞）；给 `ZoomIn/ZoomOut` 加
+`Action::ignores_shift()` 保住 `Shift+=`。钩子里新增 `foreground_is_text_entry()`：
+`GetGUIThreadInfo(0)` 的 caret + 焦点窗口类名两级判据，前台在打字时不吞空格。
+
+**三、输入（T03）**——`hide_preview` 补上 `page_edit = None` 与 `set_capture_digits(false)`；
+删掉 `hook_proc` 里重复两遍的 `CAPTURE_DIGITS` 分支。
+
+**四、图片默认缩放 50% → 100%**（schema 1→2 迁移，只有值恰好是 50 才迁，用户自设的不动）；
+补上 `Config::migrate()`——此前它只写在文档里、函数根本不存在。
+
+### 为什么
+
+200% 缩放下窗口坐标是物理像素，而 30/24/15 这些常量是照 100% 写的 → 顶栏只有 15 DIP、
+正文 7.5 DIP，用户看到"顶栏和内容都小很多"。图片再叠上默认 50%，几乎只剩一小块。
+
+### 怎么验证的（数字）
+
+- `cargo test` **264 passed / 3 ignored**（251 基线 + 13 新增：dpi 换算 6、config 迁移 4、
+  keymap 匹配 2、开窗尺寸随 DPI 1）；`cargo fmt --check` / `clippy -D warnings` 零输出。
+- **新脚本 `scripts/baseline-shot.ps1` + `baseline-diff.ps1`**：`PrintWindow` 截 5 类界面，
+  逐像素对比。96 DPI 下三次改动的中间态**全部与改前逐字节一致**（`tolerance=0`）——
+  这是"只改了缩放、没改别的"的唯一硬证据。
+- `scripts/smoke.ps1`：17 PASS / 1 SKIP（管理员会话 UIPI，非回归）。
+- 200% 视觉验收待用户真机（`scripts/collect-diag.ps1` 收集日志 + DPI + 7 条口述答案）。

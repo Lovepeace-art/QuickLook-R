@@ -18,6 +18,8 @@ use qlr_core::config::{Config, Prewarm};
 use qlr_core::keymap::{Action, Binding, Category, Hotkeys};
 use qlr_core::{ipc, log_info, log_warn};
 use qlr_platform::window;
+// 1.8.3：设置窗也得进入自己的 DPI 上下文（否则 width()/行高会沿用"上一个窗口"的 DPI）。
+use qlr_platform::dpi;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT,
@@ -26,8 +28,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const SCOPE: &str = "settings";
 const CLASS: &str = "QLRust.SettingsWindow";
 const TITLE: &str = "QLRust 设置";
-/// 客户区宽度：左列名称 + 右列键值（值列 172 px）留够余量。
-const WIDTH: i32 = 620;
+/// 客户区宽度（DIP）：左列名称 + 右列键值（值列 172 DIP）留够余量。
+///
+/// 1.8.3 起是**设计值**，实际像素由 [`width()`] 按 DPI 换算——不换算的话 200% 缩放下
+/// 620 物理像素只有 310 DIP 宽，键值列会被挤成一条缝。
+const WIDTH_DIP: i32 = 620;
+
+/// 设置窗客户区宽度（物理像素，随 DPI）。
+fn width() -> i32 {
+    dpi::px(WIDTH_DIP)
+}
 
 const VK_BACK: u16 = 0x08;
 const VK_RETURN: u16 = 0x0D;
@@ -111,8 +121,8 @@ const EXTRA_ROWS: usize = 2;
 
 /// 设置窗客户区应有的高度。绘制与实际窗口都从这里取，避免两处各算一遍。
 fn client_height() -> i32 {
-    window::SETTINGS_PADDING_TOP * 2
-        + (layout().len() + EXTRA_ROWS) as i32 * window::SETTINGS_ROW_HEIGHT
+    window::settings_padding_top() * 2
+        + (layout().len() + EXTRA_ROWS) as i32 * window::settings_row_height()
 }
 
 struct Ui {
@@ -176,7 +186,7 @@ fn create(host: HWND, config: &Config, path: PathBuf) -> windows::core::Result<(
 
     let rows = layout();
     let height = client_height();
-    window::set_client_size(hwnd, WIDTH, height);
+    window::set_client_size(hwnd, width(), height);
     window::center_on_work_area(hwnd);
 
     UI.with(|cell| {
@@ -200,7 +210,7 @@ fn create(host: HWND, config: &Config, path: PathBuf) -> windows::core::Result<(
         "设置窗口已打开 {} 行（含底部 {} 行）client={}x{}",
         rows.len() + EXTRA_ROWS,
         EXTRA_ROWS,
-        WIDTH,
+        width(),
         height
     );
     Ok(())
@@ -208,6 +218,10 @@ fn create(host: HWND, config: &Config, path: PathBuf) -> windows::core::Result<(
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // 1.8.3：每条消息都对齐到本窗口的 DPI（`enter` 内部是 O(1) 的 GetDpiForWindow）。
+        // 设置窗是独立顶层窗口，可能被拖到另一块缩放的屏上——不重新对齐，字号和行高
+        // 会一直用"上一个窗口"的 DPI。
+        dpi::enter(hwnd);
         match msg {
             WM_PAINT => {
                 paint(hwnd);
@@ -357,7 +371,7 @@ fn value_text(ui: &Ui, target: Edit) -> String {
 fn on_click(hwnd: HWND, lparam: LPARAM) {
     // WM_LBUTTONDOWN 的 lparam：低 16 位 x、高 16 位 y，**都是有符号**的。
     let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-    let index = (y - window::SETTINGS_PADDING_TOP) / window::SETTINGS_ROW_HEIGHT;
+    let index = (y - window::settings_padding_top()) / window::settings_row_height();
     if index < 0 {
         return;
     }
@@ -639,8 +653,8 @@ mod tests {
         assert!(matches!(rows[2], Row::Item(Action::Toggle)));
         // 命中测试的换算：y = padding + index * row_height。
         let index = 2;
-        let y = window::SETTINGS_PADDING_TOP + index * window::SETTINGS_ROW_HEIGHT + 3;
-        let got = (y - window::SETTINGS_PADDING_TOP) / window::SETTINGS_ROW_HEIGHT;
+        let y = window::settings_padding_top() + index * window::settings_row_height() + 3;
+        let got = (y - window::settings_padding_top()) / window::settings_row_height();
         assert_eq!(got, index);
     }
 
@@ -658,7 +672,7 @@ mod tests {
         // 客户区能放下的行数（扣掉上下 padding）必须 ≥ 实际会画的行数，
         // 否则最后那行提示会被裁掉半截。
         let fits =
-            (client_height() - window::SETTINGS_PADDING_TOP * 2) / window::SETTINGS_ROW_HEIGHT;
+            (client_height() - window::settings_padding_top() * 2) / window::settings_row_height();
         let painted = (layout().len() + EXTRA_ROWS) as i32;
         assert!(
             fits >= painted,
