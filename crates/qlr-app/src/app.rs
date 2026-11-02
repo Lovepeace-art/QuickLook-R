@@ -23,7 +23,8 @@ use qlr_core::{
     Config, Level, format, log, log_debug, log_error, log_info, log_warn, paths, plugins, version,
 };
 use qlr_platform::{
-    crash, dpi, hotkey, instance, integrity, selection, shellpreview, tray, win11, window,
+    crash, dpi, hotkey, instance, integrity, selection, shellpreview, thumbnail, tray, win11,
+    window,
 };
 use qlr_render::Canvas;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1758,6 +1759,14 @@ fn on_render_done() {
                 remember_last_frame(key, canvas.clone());
             }
             set_content(Some(canvas));
+            // 两段式首帧收尾（1.8.3）：全清帧把占位帧原地替换掉，两个时间打一条日志。
+            if let Some((first_ms, shown_at)) = take_quick_shown() {
+                log_debug!(
+                    SCOPE,
+                    "QUICK gen={generation} 首帧 {first_ms}ms → 全清 {}ms（同尺寸替换）",
+                    first_ms + shown_at.elapsed().as_millis()
+                );
+            }
             // 内容不透明（1.5.0 起不再有亚克力材质），只保证 DWM backdrop 关掉。
             if is_bitmap || rendered_text {
                 win11::clear_backdrop(preview.raw());
@@ -1906,6 +1915,70 @@ fn trim_last_frames(frames: &mut LastFrames) {
             break;
         };
         total = total.saturating_sub(canvas_bytes(&evicted));
+    }
+}
+
+/// 只有超过这个像素数的图片才给"两段式首帧"（与 `source_cache::CACHE_MAX_PIXELS` 对齐）。
+///
+/// 阈值以下（4K = 8.3 MP）全量解码本来就在 60–80 ms 量级，再插一段占位只是多一次跳变。
+const QUICK_MIN_PIXELS: u64 = qlr_render::source_cache::CACHE_MAX_PIXELS;
+
+/// 两段式首帧是否启用（默认关，见 `show_preview` 里的注释与实测数字）。
+static QUICK_FRAME_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// 第一段已经上屏：`(第一段耗时 ms, 上屏时刻)`，等全清帧替换时打一条"两段式"日志。
+static QUICK_SHOWN: OnceLock<Mutex<Option<(u128, Instant)>>> = OnceLock::new();
+
+fn take_quick_shown() -> Option<(u128, Instant)> {
+    let slot = QUICK_SHOWN.get_or_init(|| Mutex::new(None));
+    slot.lock().ok().and_then(|mut guard| guard.take())
+}
+
+/// 两段式首帧的第一段（1.8.3）：给 >16 MP 的图片先塞一张"形状对、但模糊"的占位快照。
+///
+/// 只认**已经有缩略图缓存**的那一种（`SIIGBF_INCACHEONLY`）。实测（本机 48MP PNG，
+/// `cargo test -p qlr-platform shell_thumbnail -- --ignored --nocapture`）：
+/// - 让 Shell 现解：`THUMBNAILONLY` 171 ms、普通 `RESIZETOFIT` 108–149 ms —— 和我们
+///   自己的全量解码（197 ms）同一量级，插一段只会把"清晰帧"往后推，纯亏；
+/// - 读**已有缓存**：缓存命中时个位数毫秒；没有缓存时 **18 µs** 就失败返回，零成本。
+///
+/// 另一条常见设想"先解 1/4 再放大"在这里也不成立：PNG 是**单条 zlib 流**，
+/// 降采样照样要完整 inflate（DEFLATE 本身 ~89 ms），一分钱省不下来。
+///
+/// 硬约束：这一帧**绝不**写进 `pagecache` / 上一帧缓存——它只走 `set_content`，
+/// 全清帧到了原地上屏替换；重开文件命中的仍是全清帧，像素与"直接全量解码"完全一致。
+fn quick_first_frame(
+    kind: format::Kind,
+    natural: Option<(u32, u32)>,
+    path: Option<&Path>,
+    long_side: u32,
+) {
+    if kind != format::Kind::Image {
+        return;
+    }
+    let (Some((src_w, src_h)), Some(path)) = (natural, path) else {
+        return;
+    };
+    if u64::from(src_w) * u64::from(src_h) <= QUICK_MIN_PIXELS {
+        return;
+    }
+    let started = Instant::now();
+    let Some(thumb) = thumbnail::shell_thumbnail(path, long_side.max(1), true) else {
+        // 没有缩略图缓存：什么都不做，保持"一次到位"的老行为（不跳变、不变慢）。
+        return;
+    };
+    let elapsed = started.elapsed().as_millis();
+    let (w, h) = (thumb.width, thumb.height);
+    set_content(Some(Arc::new(Canvas::Bitmap(qlr_render::Bitmap::new(
+        w, h, thumb.bgra,
+    )))));
+    log_debug!(
+        SCOPE,
+        "QUICK 首帧 {w}x{h} elapsed={elapsed}ms（Shell 缩略图缓存，源 {src_w}x{src_h}）"
+    );
+    let slot = QUICK_SHOWN.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some((elapsed, Instant::now()));
     }
 }
 
@@ -4546,6 +4619,27 @@ fn show_preview(path: Option<PathBuf>) {
         drop_stale_shell_preview();
     }
     // 命中缓存/预渲染时内容已经是"不透明"的，后面就不能再开亚克力（否则整个窗口变半透明灰）。
+    // 1.8.3 两段式首帧的**第一段**：>16 MP 的图片、且没有缓存/预热可上屏时，
+    // 先给一张"形状对、但模糊"的占位快照（下一帧全清时原地替换）。
+    // 只在这里（UI 线程）做：COM 早就初始化好了，没有缓存时 18 µs 就返回，
+    // 有缓存时几毫秒——不会像"渲染线程临时起 COM"那样给进程多挂两条线程。
+    // 1.8.3 两段式首帧的**第一段**（>16 MP 的图片、且没有缓存/预热可上屏时）：
+    // 先给一张"形状对、但模糊"的占位快照，等全清帧到了原地替换。
+    //
+    // **默认关闭**，只认 `QLRUST_QUICK_FRAME=1`。为什么默认不开（本机实测，别凭直觉改）：
+    // - 本机能拿到的第一段只有"Shell 已有缩略图缓存"这一种（`INCACHEONLY`，没有缓存时
+    //   18 µs 失败返回）；而 Shell **现解** 48MP PNG 要 108–171 ms，和我们自己的全量解码
+    //   （195 ms）同一量级，插一段只会把清晰帧往后推到 360 ms；
+    // - 让 Shell 参与进来本身有代价：第一次探测会把 shell32/thumbcache 拉起来，
+    //   进程多 2 条线程、+25 个句柄（一次性，不是泄漏）——本任务的验收里"线程回到 7"
+    //   比"冷文件首帧 30 ms"更硬；
+    // - 中文注释一句话：没有缩略图缓存时，这条路上限就是"什么都不发生"，
+    //   开了也只是多花一次探测——所以默认关，留给"系统确实缓存过缩略图"的机器。
+    let quick_enabled = *QUICK_FRAME_ENABLED
+        .get_or_init(|| std::env::var("QLRUST_QUICK_FRAME").ok().as_deref() == Some("1"));
+    if quick_enabled && !shell_wanted && renderable && last.is_none() && prepared.is_none() {
+        quick_first_frame(kind, natural, target.as_deref(), render_w.max(render_h));
+    }
     let mut presented = false;
     if !shell_wanted
         && renderable

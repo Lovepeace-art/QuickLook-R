@@ -13,6 +13,7 @@ pub mod instance;
 pub mod integrity;
 pub mod selection;
 pub mod shellpreview;
+pub mod thumbnail;
 pub mod tray;
 pub mod wide;
 pub mod win11;

@@ -1437,6 +1437,33 @@ Excel 滚轮 / 横向滚动条拖动 / Shift+滚轮 全 True。
 `std::fs::canonicalize(&path).unwrap_or(path)` 再返回。
 教训：**任何传给 MCI 的路径都必须是解析好的绝对路径**；顺便，`canonicalize` 也能消掉 8.3 短名与符号链接的差异。
 
+## #152 拍视觉基线必须先把 exe 复制到"中性目录"，否则会拍到托盘失败的 toast
+
+症状：同一套 exe、同一份夹具，`scripts\baseline-shot.ps1` 在仓库目录
+（`<桌面>\DSH\quicklook-rs\target\release`）跑出来 **text 截图多一个顶栏气泡**
+（「托盘图标没加上：后台常驻，qlrust.exe --quit 可退出」），`baseline-diff` 报
+`text DIFF 7580 px 最大通道差 200`，看着像 1.8.3 的视觉回归；把 exe 复制到
+`<桌面>\qlr-ab\base` 再拍就 5/5 SAME。
+
+根因：仓库/工作目录里的可执行文件会被打上 **Low Mandatory Level** 标签，低完整性进程给 explorer
+加托盘图标会被 UIPI 拒成 `0x80070005`；1.8.3 起"托盘失败"改成**第一次显示窗口时弹一条顶栏 toast**
+（不再起线程弹模态框，见 `app.rs::notify_tray_failure_once`），而基线脚本第一张恰好是 text，于是
+toast 进了基准图。这是环境噪音，不是绘制差异。
+
+修法（脚本已内置，别绕开）：
+- `scripts\baseline-shot.ps1` 默认把 `qlrust.exe` + `pdfium.dll` + 插件复制到
+  `<桌面>\qlr-ab\base`（可用 `-NeutralDir` 改）再拍，并清掉该目录的 `UserData`；
+  想复现"低完整性 + toast"的样子才加 `-NoNeutral`。
+- 同时加了**尺寸稳定**判据：show 之后窗口还会被缩放/自然尺寸路径改一次大小，早 200 ms 截会拍到
+  "小一号的中间态"（实测同一套 exe 两次跑出 `814x488` 与 `1589x924`）。现在要求连续两次
+  `GetWindowRect` 一致才截；截完再比一次矩形，变了就丢掉重拍（最多 3 次），仍在变就直接报错——
+  宁可脚本失败，也不往基准目录写中间态。
+- 刷新基准的固定流程（1.8.3 起）：备份 `baseline\before` → 用脚本重拍 → 立刻再拍一次
+  `baseline\after-check` → `baseline-diff -A baseline\before -B baseline\after-check` 必须 5/5 SAME。
+
+教训：**跑任何"像素级"脚本之前先问一句"这个进程在当前目录里能不能加托盘"**；环境降级会通过
+1.8.3 新增的 toast 混进画面。
+
 ### #52 `dpi::enter` 不许缓存 hwnd：`if CURRENT == hwnd { return }` 会自锁
 
 症状：把一个窗口从 100% 屏拖到 150% 屏，字号/行高/顶栏高度全按旧 DPI 画，而且**永远**不恢复。
