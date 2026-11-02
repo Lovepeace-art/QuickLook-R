@@ -725,6 +725,24 @@ pub fn is_visible(hwnd: HWND) -> bool {
     unsafe { IsWindowVisible(hwnd).as_bool() }
 }
 
+/// 当前进程的 GDI / USER 对象数（诊断用）。
+///
+/// 为什么需要它：现场报障"每预览一个文件，GDI 对象就 +1 且收起不释放"。
+/// GDI 对象是进程级配额（默认 1 万），一天几百次预览就会累积到图形界面开始掉字。
+/// 这个函数只读计数，成本是一次系统调用，只在 `show`/`hide` 各打一行日志时用。
+/// 进程句柄失效等异常情况返回 `(0, 0)`——诊断信息不该影响主流程。
+pub fn gui_resources() -> (u32, u32) {
+    use windows::Win32::System::Threading::{
+        GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
+    };
+    unsafe {
+        (
+            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+            GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
+        )
+    }
+}
+
 pub fn client_rect(hwnd: HWND) -> RECT {
     let mut rc = RECT::default();
     unsafe {

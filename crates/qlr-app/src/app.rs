@@ -3887,6 +3887,9 @@ fn show_preview(path: Option<PathBuf>) {
         return;
     };
     let target = path.or(last);
+    // 与 hide_preview 的 GDI/USER 计数配对：两个数字一起看，才知道增长发生在 show 还是 hide。
+    let (gdi0, user0) = window::gui_resources();
+    log_debug!(SCOPE, "SHOW 起点 GDI={gdi0} USER={user0}");
 
     // 现场报障："md 有时候第一次点 × 没反应，第二次才关"。如果这次 SHOW 紧跟在一次
     // HIDE 之后，用户看到的就是"点了没反应"——不管是谁（渲染回调、跟随计时器、
@@ -4848,11 +4851,13 @@ fn hide_preview() {
     // 位置记忆（1.0.13）：收起之前先记一次——窗口一旦隐藏，`GetWindowRect` 还可能有效，
     // 但"visible"已经是 false，`remember_position` 会直接返回，所以必须抢在前面。
     remember_position();
-    let Some((preview, elapsed)) = with_state(|s| {
-        window::hide(s.preview.raw());
-        if let Some(shadow) = s.shadow {
-            window::hide_shadow(shadow.raw());
-        }
+    // 锁内**只改状态、只取句柄**，`window::hide` 放到锁外。
+    //
+    // 为什么必须这样（结构评审 #1，与历史 #128 死锁同型）：`window::hide` 内部是
+    // `ShowWindow(SW_HIDE)`，它会**同步**把 WM_WINDOWPOSCHANGED / WM_PAINT 派发回
+    // 我们自己的 wndproc，而 `repaint` 那条路要再拿一次 STATE 锁。此时本线程正持着
+    // 锁 → 重入等待，整窗假死（空格关不掉、托盘退出卡住）。
+    let Some((preview, shadow, elapsed)) = with_state(|s| {
         s.visible = false;
         // 收起之后不再跟着选中项跑（否则看不见的窗口还在后台不停重光栅化）。
         s.pinned = false;
@@ -4876,10 +4881,15 @@ fn hide_preview() {
         // 程序**里打不出数字（这个"谁吞了我的按键"极难自查）。`finish_page_edit(false)`
         // 会同时把 `page_edit` 清掉并 `set_capture_digits(false)`。
         s.page_edit = None;
-        (s.preview, s.request_started.elapsed().as_millis())
+        (s.preview, s.shadow, s.request_started.elapsed().as_millis())
     }) else {
         return;
     };
+    // 锁已经放掉了，这时候才真正隐藏窗口（见上面那段注释）。
+    window::hide(preview.raw());
+    if let Some(shadow) = shadow {
+        window::hide_shadow(shadow.raw());
+    }
     // 数字输入模式的开关是**全局**的，所以放在锁外关（与 capture 一起收拾临时状态）。
     // 记一行日志：smoke 脚本可以按稳定字符串断言"收起之后确实释放了"。
     if hotkey::capture_digits() {
@@ -4905,7 +4915,10 @@ fn hide_preview() {
     if let Some(preview) = with_state(|s| s.preview) {
         window::set_activatable(preview.raw(), false);
     }
-    log_info!(SCOPE, "HIDE elapsed={elapsed}ms");
+    // GDI/USER 计数：现场报障「每预览一个文件 GDI +1 且收起不释放」，这两行是二分的地基。
+    // 正常应该每次回到同一个值；连续 10 次稳定 +1 就是泄漏。
+    let (gdi, user) = window::gui_resources();
+    log_info!(SCOPE, "HIDE elapsed={elapsed}ms GDI={gdi} USER={user}");
     *last_hide_slot() = Some(Instant::now());
 }
 
