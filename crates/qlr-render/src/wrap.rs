@@ -95,28 +95,51 @@ pub fn push_wrapped(
 }
 
 /// 返回 `s` 里"按宽度能放下"的最长前缀（以字节长度表示），并尽量在空白/汉字边界断开。
+///
+/// **量宽次数是这里的成本命门**：旧实现从行首逐字符 `measure` 到超宽为止，
+/// 一段 340 字的段落要量 340 次 GDI；实测一屏 29 行 = 1359 次量宽 / 12 ms，
+/// 每滚一格都付一遍。宽度对前缀长度单调，所以改成**二分**（≈log₂n 次），
+/// 再在一次横扫里找最后一个可断点（纯字符扫描，不需要量宽）。
 fn fit_prefix(s: &str, width: u32, measure: &dyn Fn(&str) -> u32) -> usize {
     if measure(s) <= width {
         return s.len();
     }
-    let mut last_break = 0usize; // 上一个可断点的字节位置
-    let mut acc_end = 0usize;
-    for (idx, ch) in s.char_indices() {
-        acc_end = idx + ch.len_utf8();
-        if measure(&s[..acc_end]) > width {
+    // `lo`：已知能放下的最长字符边界（初始 0，即"一个都放不下"也合法）；
+    // `hi`：已知放不下的边界（初始整串，上面刚量过确实放不下）。
+    let mut lo = 0usize;
+    let mut hi = s.len();
+    while hi - lo > 1 {
+        let mut mid = lo + (hi - lo) / 2;
+        // 对齐到字符边界（往前退，保证 `s[..mid]` 合法）
+        while mid > lo && !s.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        if mid == lo {
             break;
         }
-        // 可断点：空白之后、或中日韩字符之后
+        if measure(&s[..mid]) <= width {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // 在放得下的前缀里找最后一个可断点（空白之后、或中日韩字符之后）
+    let mut last_break = 0usize;
+    for (idx, ch) in s[..lo].char_indices() {
         if ch == ' ' || ch == '\t' || is_wide(ch) {
-            last_break = acc_end;
+            last_break = idx + ch.len_utf8();
         }
     }
     if last_break > 0 {
-        last_break
-    } else {
-        // 一个可断点都没有（比如一长串 ASCII 无空格）：硬切，至少放一个字符
-        acc_end.max(char_len(s))
+        return last_break;
     }
+    if lo == 0 {
+        // 一个字符都放不下：硬切，至少放一个字符（否则调用方会原地打转）
+        return char_len(s);
+    }
+    // 一个可断点都没有（比如一长串 ASCII 无空格）：硬切，连那个超宽的字符一起交出，
+    // 与旧实现 `acc_end` 的口径一致（调用方会再 trim）。
+    lo + s[lo..].chars().next().map(char::len_utf8).unwrap_or(0)
 }
 
 fn char_len(s: &str) -> usize {
@@ -219,5 +242,75 @@ mod tests {
         let rows = wrap(&s, 8); // 每行 1 个字符
         assert_eq!(rows.len(), MAX_ROWS_PER_LINE);
         assert!(rows.last().unwrap().ends_with('…'));
+    }
+
+    /// 旧的"逐字符量宽"实现，留在测试里当基准：二分版必须与它切出完全相同的行。
+    fn fit_prefix_linear(s: &str, width: u32, measure: &dyn Fn(&str) -> u32) -> usize {
+        if measure(s) <= width {
+            return s.len();
+        }
+        let mut last_break = 0usize;
+        let mut acc_end = 0usize;
+        for (idx, ch) in s.char_indices() {
+            acc_end = idx + ch.len_utf8();
+            if measure(&s[..acc_end]) > width {
+                break;
+            }
+            if ch == ' ' || ch == '\t' || is_wide(ch) {
+                last_break = acc_end;
+            }
+        }
+        if last_break > 0 {
+            last_break
+        } else {
+            acc_end.max(char_len(s))
+        }
+    }
+
+    #[test]
+    fn fit_prefix_matches_the_linear_reference() {
+        // 二分是"宽度对前缀长度单调"的假设换来的，所以必须逐字节对齐旧实现。
+        let no_break = "no-break-汉字混在一起的一长串没有空格的文字".repeat(4);
+        let ascii_run = "x".repeat(300);
+        let cases = [
+            "aaaa bbbb cccc dddd eeee",
+            "中文折行测试一下中文折行测试一下",
+            "mixed 混排 text with 空格 and CJK 汉字 more words here",
+            ascii_run.as_str(),
+            no_break.as_str(),
+            "emoji 🚀 也算宽字符吗，试试看 🎉🎉 一二三四五六七八九十",
+        ];
+        for case in cases {
+            for width in [8u32, 40, 64, 120, 240, 756, 4000] {
+                let want = fit_prefix_linear(case, width, &mono);
+                let got = fit_prefix(case, width, &mono);
+                assert_eq!(
+                    got,
+                    want,
+                    "width={width} case={:?}（got={got} want={want}）",
+                    &case[..case.len().min(20)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_prefix_measures_logarithmically_not_per_char() {
+        // 340 字的段落：旧实现每行量 300+ 次，二分版应该只有几十次。
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let counting = |s: &str| {
+            calls.set(calls.get() + 1);
+            mono(s)
+        };
+        let line = "这是一段很长的段落文字，没有换行，用来逼折行算法真的去切分。".repeat(8);
+        let mut out = Vec::new();
+        push_wrapped(&line, 756, &counting, &mut out, 400);
+        assert!(out.len() >= 4, "应折成多行，实际 {}", out.len());
+        let per_row = calls.get() as f64 / out.len() as f64;
+        assert!(
+            per_row <= 24.0,
+            "每行量宽 {per_row:.1} 次太多（二分应 ≈ log₂ 字符数）"
+        );
     }
 }

@@ -306,6 +306,10 @@ pub(crate) struct State {
 
     /// 视频预览的逐帧播放状态（1.7.9）：`Some` 就代表"当前预览是能放的视频"。
     pub(crate) video: Option<VideoPlay>,
+
+    /// 折行结果缓存（1.8.3-fix 批次四，结构评审 §6-6）：滚一格只有最后几行是新的，
+    /// 其余行的折行（= GDI 量宽）结果可以复用。见 `crate::wrapcache`。
+    pub(crate) wrap_cache: wrapcache::WrapCache,
 }
 
 /// 视频播放状态（1.7.9）。
@@ -522,6 +526,8 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.toc_active = None;
         // 1.8.3：目录的滚动位置也要跟着新文件归零（否则换文件后目录停在半截）。
         s.toc_scroll = 0;
+        // 折行缓存是按"行号"存的，换内容必须整本作废（否则会拿旧文件的折行结果画新文件）。
+        s.wrap_cache.clear();
     });
 }
 

@@ -11,6 +11,7 @@ mod cli;
 mod layout;
 mod pagecache;
 mod settings;
+mod wrapcache;
 
 // 帧级分配计数：只有 `--features alloc-stats` 时才编进来（默认零开销）。
 // 开了之后全局分配器换成记账版本，`RENDER` 旁边会多一行 `RENDERALLOC`。

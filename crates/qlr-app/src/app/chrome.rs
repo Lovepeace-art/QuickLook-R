@@ -609,6 +609,12 @@ pub(crate) fn repaint(hwnd: HWND) {
                 // 每行记 `(文本, 样式, 行号)`：折行产生的续行不带行号，只有源行首行带。
                 let mut body: Vec<(String, qlr_render::LineStyle, Option<u32>)> = Vec::new();
                 let mut consumed = 0usize;
+                // 折行阶段也要计时：`SLOWPAINT` 只覆盖真正的绘制，
+                // "滚一下卡"很可能是折行里的 GDI 量宽，而不是 DrawText。
+                let wrap_started = Instant::now();
+                let measured = std::cell::Cell::new(0usize);
+                // 换宽度（拖窗/缩放）会让所有折行结果失效，缓存自己会发现。
+                with_state(|s| s.wrap_cache.set_width(width));
                 if let Some(m) = &measurer {
                     // 逐原始行量、逐行记样式（Markdown 每行样式不同：标题字号更大、代码等宽）。
                     for (i, line) in t.lines.iter().enumerate().skip(scroll) {
@@ -620,15 +626,42 @@ pub(crate) fn repaint(hwnd: HWND) {
                             .as_ref()
                             .and_then(|all| all.get(i).copied())
                             .unwrap_or_default();
+                        let style_idx = style.as_index() as u8;
                         let budget = rows - body.len();
-                        let mut texts: Vec<String> = Vec::new();
-                        let measure = |s: &str| m.width_styled(to_text_style(style), s);
-                        qlr_render::wrap::push_wrapped(line, width, &measure, &mut texts, budget);
-                        if texts.is_empty() {
+                        // 先问折行缓存：滚一格只有最后几行是新的，前 20 多行完全一样。
+                        let cached = with_state(|s| s.wrap_cache.get(i, style_idx)).flatten();
+                        let mut fresh: Vec<String> = Vec::new();
+                        let wrapped: &[String] = match &cached {
+                            Some(rows) => rows.as_slice(),
+                            None => {
+                                let measure = |s: &str| {
+                                    measured.set(measured.get() + 1);
+                                    m.width_styled(to_text_style(style), s)
+                                };
+                                qlr_render::wrap::push_wrapped(
+                                    line,
+                                    width,
+                                    &measure,
+                                    &mut fresh,
+                                    qlr_render::wrap::MAX_ROWS_PER_LINE,
+                                );
+                                // 单行的也存：短行只要一次量宽，但滚一格会有 20 多行重复，
+                                // 存下来等于把那 20 多次量宽全省掉（日志/代码类文档都吃这个）。
+                                with_state(|s| s.wrap_cache.put(i, style_idx, fresh.clone()));
+                                fresh.as_slice()
+                            }
+                        };
+                        if wrapped.is_empty() {
                             continue;
                         }
                         consumed += 1;
-                        for (k, text) in texts.into_iter().enumerate() {
+                        let take = budget.min(wrapped.len());
+                        for k in 0..take {
+                            let mut text = wrapped[k].clone();
+                            // 没显示完（预算用完）：末尾补省略号，与旧的"边折边停"一个观感。
+                            if take < wrapped.len() && k + 1 == take {
+                                text.push('…');
+                            }
                             let number = if plain_doc {
                                 None
                             } else if k == 0 {
@@ -660,9 +693,12 @@ pub(crate) fn repaint(hwnd: HWND) {
                     consumed = end - scroll;
                 }
                 with_state(|s| s.wrapped_consumed = consumed);
+                let wrap_ms = wrap_started.elapsed();
+                let (hits, misses, entries, _) =
+                    with_state(|s| s.wrap_cache.stats()).unwrap_or((0, 0, 0, 0));
                 log_debug!(
                     SCOPE,
-                    "WRAP 原文 {} 行 从 {} 起，屏幕 {} 行，宽 {}px -> 折成 {} 行（吃掉 {} 原始行）{}",
+                    "WRAP 原文 {} 行 从 {} 起，屏幕 {} 行，宽 {}px -> 折成 {} 行（吃掉 {} 原始行）{} · 量宽 {} 次 / {:.1} ms · 缓存命中 {}/{}（存 {} 条）",
                     t.lines.len(),
                     scroll,
                     rows,
@@ -673,8 +709,25 @@ pub(crate) fn repaint(hwnd: HWND) {
                         "（带样式）"
                     } else {
                         ""
-                    }
+                    },
+                    measured.get(),
+                    wrap_ms.as_secs_f64() * 1000.0,
+                    hits,
+                    hits + misses,
+                    entries
                 );
+                // 折行超过 4 ms 会让滚动"发黏"，单独打一条 warn 方便现场日志直接指认。
+                if wrap_ms.as_millis() >= 4 {
+                    log_warn!(
+                        SCOPE,
+                        "SLOWWRAP text {}ms（量宽 {} 次，折出 {} 行 / 吃掉 {} 原始行，宽 {}px）",
+                        wrap_ms.as_millis(),
+                        measured.get(),
+                        body.len(),
+                        consumed,
+                        width
+                    );
+                }
                 let last = scroll + consumed;
                 let status = format!(
                     "── 第 {}–{} 行 / 共 {} 行{} ──",

@@ -352,6 +352,7 @@ pub fn run() -> ExitCode {
         audio: None,
         audio_ticking: false,
         video: None,
+        wrap_cache: wrapcache::WrapCache::default(),
     }));
     let _ = LINES.set(Mutex::new(vec!["QLRust".to_string()]));
     let _ = CONTENT.set(Mutex::new(None));

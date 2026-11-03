@@ -9,6 +9,7 @@ pub(crate) use crate::cli::{self, Command};
 pub(crate) use crate::layout;
 pub(crate) use crate::pagecache;
 pub(crate) use crate::settings;
+pub(crate) use crate::wrapcache;
 pub(crate) use qlr_core::ipc::{self, Action, Request};
 pub(crate) use qlr_core::{
     Config, Level, format, log, log_debug, log_error, log_info, log_warn, paths, plugins, version,
