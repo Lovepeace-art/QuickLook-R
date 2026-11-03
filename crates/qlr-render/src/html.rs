@@ -89,13 +89,11 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
 pub fn layout(src: &str) -> (Vec<String>, Vec<LineStyle>) {
     let stripped = strip_comments(&strip_hidden_all(src));
     let mut builder = Builder::default();
-    for token in tokenize(&stripped) {
-        match token {
-            Tok::Text(t) => builder.push_text(t),
-            Tok::Start(name, attrs) => builder.on_start(&name, attrs),
-            Tok::End(name) => builder.on_end(&name),
-        }
-    }
+    for_each_token(&stripped, |token| match token {
+        Tok::Text(t) => builder.push_text(t),
+        Tok::Start(name, attrs) => builder.on_start(name, attrs),
+        Tok::End(name) => builder.on_end(name),
+    });
     builder.flush();
     (builder.lines, builder.styles)
 }
@@ -228,22 +226,30 @@ fn find_ci(hay: &str, needle: &str) -> Option<usize> {
 enum Tok<'a> {
     Text(&'a str),
     /// 标签名（已小写）+ 属性正文
-    Start(String, &'a str),
-    End(String),
+    Start(&'a str, &'a str),
+    End(&'a str),
 }
 
-fn tokenize(src: &str) -> Vec<Tok<'_>> {
-    let mut out = Vec::new();
+/// 流式词法：边扫边把 token 交给 `f`，不再先攒一个 `Vec<Tok>`。
+///
+/// 为什么改成流式（#158）：8 MB 的 HTML 有 96 万个 token，攒成 `Vec` 光结构体就
+/// 23 MB，每个标签名还要各分配一个 `String`（近百万次小分配）。实测这段 38 ms、
+/// 峰值多占四五十 MB。现在标签名复用同一个 `String` 缓冲，一扫到底。
+fn for_each_token<F>(src: &str, mut f: F)
+where
+    F: for<'a> FnMut(Tok<'a>),
+{
+    let mut name = String::with_capacity(24);
     let mut rest = src;
     loop {
         let Some(lt) = rest.find('<') else {
             if !rest.is_empty() {
-                out.push(Tok::Text(rest));
+                f(Tok::Text(rest));
             }
-            return out;
+            return;
         };
         if lt > 0 {
-            out.push(Tok::Text(&rest[..lt]));
+            f(Tok::Text(&rest[..lt]));
         }
         let after = &rest[lt + 1..];
         // `<!DOCTYPE>` / `<![CDATA[` / `<?xml`：整段丢弃
@@ -253,13 +259,13 @@ fn tokenize(src: &str) -> Vec<Tok<'_>> {
                     rest = &after[end + 1..];
                     continue;
                 }
-                None => return out,
+                None => return,
             }
         }
         let Some(end) = tag_end(after) else {
             // 掐断的标签：把剩下的当正文，别丢字
-            out.push(Tok::Text(&rest[lt..]));
-            return out;
+            f(Tok::Text(&rest[lt..]));
+            return;
         };
         let body = &after[..end];
         rest = &after[end + 1..];
@@ -268,15 +274,24 @@ fn tokenize(src: &str) -> Vec<Tok<'_>> {
         let name_len = name_body
             .find(|c: char| c.is_whitespace() || c == '/')
             .unwrap_or(name_body.len());
-        let name = name_body[..name_len].to_ascii_lowercase();
-        if name.is_empty() {
+        let raw = &name_body[..name_len];
+        if raw.is_empty() {
             continue;
+        }
+        name.clear();
+        if raw.is_ascii() {
+            for &b in raw.as_bytes() {
+                name.push(b.to_ascii_lowercase() as char);
+            }
+        } else {
+            // 非 ASCII 标签名（现实中几乎不存在）：退回整串小写，别把 UTF-8 拆坏
+            name.push_str(&raw.to_ascii_lowercase());
         }
         let attrs = &name_body[name_len..];
         if closing {
-            out.push(Tok::End(name));
+            f(Tok::End(&name));
         } else {
-            out.push(Tok::Start(name, attrs));
+            f(Tok::Start(&name, attrs));
         }
     }
 }
@@ -561,17 +576,44 @@ impl Builder {
             }
             return;
         }
-        for c in s.chars() {
-            if c.is_whitespace() {
+        // 按"非空白段"整段拷进 `buf`，而不是逐字符 `push`：8 MB 正文光这一层就要
+        // 三四十毫秒，切成段 `push_str` 之后是 memcpy（#158）。
+        // ASCII 空白直接按字节判；非 ASCII 字节才解一个 `char` 问 `is_whitespace()`
+        // （U+3000 这类全角空格也算空白，不能只认 ASCII）。
+        let bytes = s.as_bytes();
+        let mut i = 0usize;
+        let mut run: Option<usize> = None;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            let (whitespace, step) = if byte < 0x80 {
+                (byte.is_ascii_whitespace(), 1)
+            } else {
+                // `i` 永远落在字符边界上，解一个 `char` 不会越界
+                let ch = s[i..].chars().next().unwrap_or(' ');
+                (ch.is_whitespace(), ch.len_utf8())
+            };
+            if whitespace {
+                if let Some(start) = run.take() {
+                    self.push_run(&s[start..i]);
+                }
                 self.space = true;
-                continue;
+            } else if run.is_none() {
+                run = Some(i);
             }
-            if self.space && !self.buf.is_empty() {
-                self.buf.push(' ');
-            }
-            self.space = false;
-            self.buf.push(c);
+            i += step;
         }
+        if let Some(start) = run {
+            self.push_run(&s[start..]);
+        }
+    }
+
+    /// 把一段不含空白的文字接进当前行：需要时先补那个被压缩掉的空格。
+    fn push_run(&mut self, text: &str) {
+        if self.space && !self.buf.is_empty() {
+            self.buf.push(' ');
+        }
+        self.space = false;
+        self.buf.push_str(text);
     }
 
     /// 起一个新块：先把上一块吐出去，再按需插一个空行（段落之间要留白）。
@@ -979,6 +1021,26 @@ mod tests {
     }
 
     #[test]
+    fn tag_names_are_matched_case_insensitively() {
+        // 流式词法复用同一个标签名缓冲：大小写归一，且后一个标签不会串上一个的名字。
+        let (lines, styles) =
+            layout("<DIV><H2>标题</H2><P>正文 <B>粗</B></P><UL><LI>A</LI></UL></DIV>");
+        assert_eq!(
+            lines,
+            vec![
+                "标题".to_string(),
+                String::new(),
+                "正文 粗".to_string(),
+                String::new(),
+                "• A".to_string(),
+            ]
+        );
+        assert_eq!(styles[0], LineStyle::Heading2);
+        assert_eq!(styles[2], LineStyle::Normal);
+        assert_eq!(styles[4], LineStyle::List);
+    }
+
+    #[test]
     fn image_alt_becomes_placeholder_text() {
         let (lines, _) = layout(r#"<p><img src="a.png" alt="示意图"> 说明</p>"#);
         assert!(lines[0].contains("[示意图]"), "{}", lines[0]);
@@ -1079,37 +1141,52 @@ mod tests {
         let (src, _encoding) = crate::text::decode(&bytes);
         println!("decode {:.1} ms", ms(t.elapsed()));
 
-        let t = Instant::now();
-        let pre = strip_comments(&strip_hidden_all(&src));
-        println!("预处理（head/script/style/注释）{:.1} ms", ms(t.elapsed()));
+        // 各阶段都跑 3 遍取最好成绩：单次测量在这台机器上抖动能到 ±6 ms。
+        let stripped = strip_comments(&strip_hidden_all(&src));
 
-        let t = Instant::now();
-        let tokens = tokenize(&pre);
-        println!(
-            "tokenize {} 个 token，{:.1} ms",
-            tokens.len(),
-            ms(t.elapsed())
-        );
+        let mut strip_best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let pre = strip_comments(&strip_hidden_all(&src));
+            std::hint::black_box(&pre);
+            strip_best = strip_best.min(ms(t.elapsed()));
+        }
+        println!("预处理（head/script/style/注释）{strip_best:.1} ms");
 
-        let t = Instant::now();
-        let (lines, _styles) = layout(&src);
-        println!(
-            "layout 全量 {:.1} ms → {} 显示行",
-            ms(t.elapsed()),
-            lines.len()
-        );
+        let mut tok_best = f64::MAX;
+        let mut tok_n = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let mut n = 0usize;
+            for_each_token(&stripped, |_tok| n += 1);
+            tok_best = tok_best.min(ms(t.elapsed()));
+            tok_n = n;
+        }
+        println!("词法（流式，不攒 Vec）{tok_n} 个 token，{tok_best:.1} ms");
+
+        let mut layout_best = f64::MAX;
+        let mut layout_lines = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let (l, _styles) = layout(&src);
+            layout_best = layout_best.min(ms(t.elapsed()));
+            layout_lines = l.len();
+        }
+        println!("layout 全量 {layout_best:.1} ms → {layout_lines} 显示行");
 
         for limit in [MAX_LINES, 400] {
-            let t = Instant::now();
-            let canvas = render_with(&path, true, READ_LIMIT, limit).expect("渲染");
-            let n = match canvas {
-                Canvas::Text(doc) => doc.lines.len(),
-                _ => 0,
-            };
-            println!(
-                "render_with(head=true, {limit} 行) {:.1} ms → {n} 行",
-                ms(t.elapsed())
-            );
+            let mut best = f64::MAX;
+            let mut n = 0usize;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let canvas = render_with(&path, true, READ_LIMIT, limit).expect("渲染");
+                best = best.min(ms(t.elapsed()));
+                n = match canvas {
+                    Canvas::Text(doc) => doc.lines.len(),
+                    _ => 0,
+                };
+            }
+            println!("render_with(head=true, {limit} 行) {best:.1} ms → {n} 行");
         }
     }
 }
