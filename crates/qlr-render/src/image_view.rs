@@ -6,9 +6,13 @@
 //! - 其余格式走 `image` 的朴素路径（整图解码后缩放），后续按同样思路逐个替换。
 //!
 //! 为什么 JPEG 先做：它是最高频、也最容易一次解出巨量内存的格式，且 DCT 缩放是标准能力。
+//!
+//! 1.8.3-fix 起两条路都带缓存：非 JPEG 走 `source_cache` 的原始分辨率缓存，JPEG 因为
+//! "只解到需要的档"而不能存原图，改成**按解码档位缓存**（见 `render_jpeg_scaled`）。
 
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 
 use image::imageops::FilterType;
 use qlr_core::{Error, Result};
@@ -131,10 +135,24 @@ fn render_jpeg_scaled(
     let (want_w, want_h) =
         fit_within_opt(src_w.max(1), src_h.max(1), max_width, max_height, upscale);
 
-    // `scale` 只会挑"不小于请求尺寸"的 1/2^n 档；解出来可能比目标略大，后面再补一次盒式缩放。
-    decoder
+    // `scale` 只会挑"不小于请求尺寸"的 1/2^n 档，并把**实际解出的尺寸**还给我们：
+    // 这个尺寸既是缓存的分档标签，也是下一步盒式缩放的源尺寸。
+    let (dw, dh) = decoder
         .scale(want_w as u16, want_h as u16)
         .map_err(|e| Error::Message(format!("设置 JPEG 缩放失败：{e}")))?;
+    let (dw, dh) = (u32::from(dw), u32::from(dh));
+
+    // 这一档已经解过：省掉整段"读熵编码 + IDCT + 转 RGBA"（4K 图 30–40 ms、48MP 66–69 ms）。
+    if let Some(src) = source_cache::lookup_tagged(path, (dw, dh)) {
+        qlr_core::log_debug!(
+            "render",
+            "JPEGCACHE 命中 {dw}x{dh} -> {want_w}x{want_h}（{}）",
+            crate::display_name(path)
+        );
+        return Ok(Canvas::Bitmap(finish_rgba(
+            &src.rgba, src.width, src.height, want_w, want_h,
+        )?));
+    }
 
     let pixels = decoder
         .decode()
@@ -143,42 +161,79 @@ fn render_jpeg_scaled(
         .info()
         .ok_or_else(|| Error::Message("解码后丢失尺寸信息".to_string()))?;
 
-    let (dw, dh) = (scaled_info.width as u32, scaled_info.height as u32);
-    let rgba = match scaled_info.pixel_format {
-        jpeg_decoder::PixelFormat::RGB24 => {
-            let mut out = Vec::with_capacity(pixels.len() / 3 * 4);
+    let (dw, dh) = (u32::from(scaled_info.width), u32::from(scaled_info.height));
+    let rgba = jpeg_pixels_to_rgba(pixels, dw, dh, scaled_info.pixel_format)?;
+
+    // 值得缓存的（这一档的像素数在上限内）：先按档位存一份，再用**同一个函数**出帧。
+    // 48MP 原图存不下，但它 1/4、1/8 档的解码结果只有 12 MB / 3 MB——正是"每档重解码
+    // 66–69 ms"最疼的那几档。
+    if source_cache::cacheable(u64::from(dw) * u64::from(dh)) {
+        let src = Arc::new(source_cache::SourceImage {
+            width: dw,
+            height: dh,
+            rgba,
+        });
+        let bitmap = finish_rgba(&src.rgba, dw, dh, want_w, want_h)?;
+        source_cache::store_tagged(path, (dw, dh), Arc::clone(&src));
+        return Ok(Canvas::Bitmap(bitmap));
+    }
+    Ok(Canvas::Bitmap(finish_rgba(&rgba, dw, dh, want_w, want_h)?))
+}
+
+/// JPEG 解码器的输出 → RGBA8（预览一律按 RGBA 存，出帧时再转 BGRA）。
+///
+/// 缩放路径不支持 CMYK/4 通道（`jpeg-decoder` 会给 `Cmyk32`），这时返回 Err，
+/// 由 `render_scaled` 回退到 `image` 那条朴素路径，功能不能因为优化而少。
+fn jpeg_pixels_to_rgba(
+    pixels: Vec<u8>,
+    dw: u32,
+    dh: u32,
+    format: jpeg_decoder::PixelFormat,
+) -> Result<Vec<u8>> {
+    let n = (dw as usize) * (dh as usize);
+    let rgba = match format {
+        jpeg_decoder::PixelFormat::RGB24 if pixels.len() == n * 3 => {
+            let mut out = Vec::with_capacity(n * 4);
             for px in pixels.chunks_exact(3) {
                 out.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
-            image::RgbaImage::from_raw(dw, dh, out)
+            out
         }
-        jpeg_decoder::PixelFormat::L8 => {
-            let mut out = Vec::with_capacity(pixels.len() * 4);
+        jpeg_decoder::PixelFormat::L8 if pixels.len() == n => {
+            let mut out = Vec::with_capacity(n * 4);
             for &g in &pixels {
                 out.extend_from_slice(&[g, g, g, 255]);
             }
-            image::RgbaImage::from_raw(dw, dh, out)
+            out
         }
         other => {
             return Err(Error::Message(format!(
                 "缩放路径不支持该 JPEG 像素格式：{other:?}"
             )));
         }
-    }
-    .ok_or_else(|| Error::Message("解码缓冲与尺寸不匹配".to_string()))?;
-
-    let final_img = if (dw, dh) == (want_w, want_h) {
-        rgba
-    } else {
-        image::imageops::thumbnail(&rgba, want_w, want_h)
     };
+    Ok(rgba)
+}
 
-    let (w, h) = (final_img.width(), final_img.height());
-    Ok(Canvas::Bitmap(Bitmap::from_rgba(
-        w,
-        h,
-        final_img.into_raw(),
-    )))
+/// 把某一档解码结果缩到出帧尺寸。
+///
+/// 缩小走 `scale::downscale_exact`——它与 `image::imageops::thumbnail` **逐字节一致**
+/// （`scale.rs` 的 `downscale_matches_image_crate` 钉着，1920→1920 的恒等档也在里面）。
+/// **两条路径（刚解码 / 命中缓存）必须调用同一个函数**，否则同一张图"第一次"和
+/// "第二次"会差一级色，用户来回滚一眼就能看出来。
+/// 唯一退路是"一维放一维缩"的极端长条：那时 `scale_rgba_to_bgra` 返回 `None`，退回 `thumbnail`。
+fn finish_rgba(rgba: &[u8], dw: u32, dh: u32, want_w: u32, want_h: u32) -> Result<Bitmap> {
+    if let Some(bitmap) = crate::scale::scale_rgba_to_bgra(rgba, dw, dh, want_w, want_h) {
+        return Ok(bitmap);
+    }
+    let img = image::RgbaImage::from_raw(dw, dh, rgba.to_vec())
+        .ok_or_else(|| Error::Message("解码缓冲与尺寸不匹配".to_string()))?;
+    let scaled = image::imageops::thumbnail(&img, want_w, want_h);
+    Ok(Bitmap::from_rgba(
+        scaled.width(),
+        scaled.height(),
+        scaled.into_raw(),
+    ))
 }
 
 /// 只读文件头拿图片原始像素尺寸（**不解码像素**）。
@@ -407,6 +462,132 @@ mod tests {
             assert_eq!(cold.bgra, warm.bgra, "{w}x{h} 命中缓存后像素变了");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn expect_bitmap(canvas: Canvas) -> Bitmap {
+        match canvas {
+            Canvas::Bitmap(b) => b,
+            other => panic!("期望 Bitmap，得到 {}", other.kind_name()),
+        }
+    }
+
+    /// 造一张 640×480 的有纹理 JPEG（纯色会掩盖取样/换算错误），返回路径。
+    fn textured_jpeg(name: &str) -> std::path::PathBuf {
+        let path = crate::testutil::dir("image").join(name);
+        let mut img = image::RgbImage::new(640, 480);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8]);
+        }
+        img.save(&path).expect("写 JPEG 夹具");
+        path
+    }
+
+    /// JPEG 走"按解码档位缓存"之后，同一档的第二次出帧必须与第一次**逐字节相同**。
+    ///
+    /// 这是 1.8.3-fix 引入缓存时唯一的硬约束：命中路径（纯缩放）与未命中路径
+    /// （解码 + 缩放）必须收敛到同一个结果，否则用户滚回去看一眼就能发现画面抖了。
+    /// 第二遍、第三遍（倒序）都要过一遍，后者专门验证"两个档位同时在缓存里"不互相污染。
+    #[test]
+    fn jpeg_cache_hit_produces_identical_bitmaps() {
+        let path = textured_jpeg("jpeg-cache-1.8.3f.jpg");
+        let boxes = [(320u32, 240u32), (900, 675), (640, 480), (160, 120)];
+
+        let mut first = Vec::new();
+        for &(w, h) in &boxes {
+            let b = expect_bitmap(render(&path, w, h).expect("冷渲染"));
+            first.push((b.width, b.height, b.bgra));
+        }
+
+        for (i, &(w, h)) in boxes.iter().enumerate() {
+            let b = expect_bitmap(render(&path, w, h).expect("热渲染"));
+            assert_eq!(
+                (b.width, b.height),
+                (first[i].0, first[i].1),
+                "第 {i} 档尺寸变了"
+            );
+            assert_eq!(b.bgra, first[i].2, "第 {i} 档 {w}x{h} 命中缓存后像素变了");
+        }
+        // 倒着再来一遍：档位切换顺序变了，结果不许变。
+        for (i, &(w, h)) in boxes.iter().enumerate().rev() {
+            let b = expect_bitmap(render(&path, w, h).expect("倒序热渲染"));
+            assert_eq!(b.bgra, first[i].2, "倒序第 {i} 档 {w}x{h} 像素变了");
+        }
+
+        let tags = crate::source_cache::tags_for(&path);
+        assert!(
+            tags.len() >= 2,
+            "不同缩放档应分别入缓存（实际标签 {tags:?}）"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 不缩放的请求（窗口比图大）也要能缓存：这时档位是 1/1，缓存里就是整张图。
+    #[test]
+    fn jpeg_full_size_level_is_cached() {
+        let path = textured_jpeg("jpeg-cache-full-1.8.3f.jpg");
+        let b1 = expect_bitmap(render(&path, 4000, 4000).expect("冷渲染"));
+        assert_eq!((b1.width, b1.height), (640, 480), "默认不放大");
+        let b2 = expect_bitmap(render(&path, 4000, 4000).expect("热渲染"));
+        assert_eq!(b1.bgra, b2.bgra, "1/1 档命中缓存后像素变了");
+        assert_eq!(crate::source_cache::tags_for(&path), vec![(640, 480)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 手测用（CI 不跑）：`cargo test -p qlr-render --lib bench_jpeg_zoom_steps -- --ignored --nocapture`
+    ///
+    /// 打印"每个缩放档第一次（= 1.8.3 老路径的代价）与第二次（= 命中档位缓存）"的毫秒数。
+    /// 数字要写进 `docs/dev/LOG.md`，所以留在仓库里可复现，而不是跑完就扔。
+    #[test]
+    #[ignore]
+    fn bench_jpeg_zoom_steps() {
+        use std::time::Instant;
+        for (w, h, name) in [(3840u32, 2160u32, "4k"), (8000, 6000, "48mp")] {
+            let path = crate::testutil::dir("image").join(format!("bench-zoom-{name}.jpg"));
+            let mut img = image::RgbImage::new(w, h);
+            for (x, y, px) in img.enumerate_pixels_mut() {
+                *px = image::Rgb([
+                    (x % 251) as u8,
+                    (y % 241) as u8,
+                    ((x / 7 + y / 5) % 233) as u8,
+                ]);
+            }
+            img.save(&path).expect("写 JPEG 夹具");
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            println!("--- {name}: {w}x{h}, {} KB ---", bytes / 1024);
+
+            // 模拟"适应窗口 → 1.25 倍 → 2 倍 → 回适应窗口"：滚一格再滚回去。
+            let boxes = [
+                (1589u32, 894u32),
+                (1986, 1118),
+                (3178, 1788),
+                (1589, 894),
+            ];
+            let mut cold_ms = Vec::new();
+            let mut hot_ms = Vec::new();
+            for &(bw, bh) in &boxes {
+                let t0 = Instant::now();
+                let a = expect_bitmap(render(&path, bw, bh).expect("冷渲染"));
+                let cold = t0.elapsed().as_secs_f64() * 1000.0;
+                let t1 = Instant::now();
+                let b = expect_bitmap(render(&path, bw, bh).expect("热渲染"));
+                let hot = t1.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(a.bgra, b.bgra, "命中缓存不许改变像素");
+                println!(
+                    "窗口 {bw}x{bh} -> {}x{}：第一次 {cold:.1} ms，第二次 {hot:.1} ms",
+                    a.width, a.height
+                );
+                cold_ms.push(cold);
+                hot_ms.push(hot);
+            }
+            let sum = |v: &[f64]| v.iter().sum::<f64>();
+            println!(
+                "四档合计：第一次 {:.1} ms，第二次 {:.1} ms（省 {:.0}%）",
+                sum(&cold_ms),
+                sum(&hot_ms),
+                (1.0 - sum(&hot_ms) / sum(&cold_ms)) * 100.0
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// 出帧尺寸必须与 `image` 自己挑的尺寸一致（它是历史像素口径）。

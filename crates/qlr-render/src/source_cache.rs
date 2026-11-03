@@ -24,6 +24,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
+/// 条目的"档位"标签。
+///
+/// 图片的通用路径存的是**原始分辨率**，用 [`TAG_FULL`]；JPEG 的 DCT 缩放路径
+/// （`image_view::render_jpeg_scaled`）存的是**某一档解码结果**，同一条路径的不同档
+/// 必须分行存放——否则"1/2 档解出的 1920×1080"会被下一个人当成原图 3840×2160
+/// 拿去放大，画面直接糊掉。标签取解码尺寸本身（`(宽, 高)`），不需要另外发明编号。
+pub type Tag = (u32, u32);
+
+/// 原始分辨率条目的标签（PNG/GIF/BMP… 那条通用路径）。
+pub const TAG_FULL: Tag = (0, 0);
+
 /// 缓存总预算：64 MB。
 ///
 /// 取这个数的理由：一张 4K 截图（3840×2160 RGBA）是 33 MB，装得下；
@@ -55,6 +66,7 @@ struct Entry {
     path: PathBuf,
     mtime: SystemTime,
     len: u64,
+    tag: Tag,
     img: Arc<SourceImage>,
     /// 最近一次使用时的全局计数（越小越旧）。
     used: u64,
@@ -89,8 +101,15 @@ pub fn cacheable(px: u64) -> bool {
     px > 0 && px <= CACHE_MAX_PIXELS
 }
 
-/// 查缓存：命中返回 `Arc`（渲染期间即使被淘汰，手头这份也还有效）。
+/// 查原始分辨率缓存（PNG/GIF/BMP… 那条通用路径）。
 pub fn lookup(path: &Path) -> Option<Arc<SourceImage>> {
+    lookup_tagged(path, TAG_FULL)
+}
+
+/// 查指定档位（JPEG 的 DCT 缩放路径用解码尺寸当标签）。
+///
+/// 命中返回 `Arc`（渲染期间即使被淘汰，手头这份也还有效）。
+pub fn lookup_tagged(path: &Path, tag: Tag) -> Option<Arc<SourceImage>> {
     let (mtime, len) = identity(path)?;
     let mut c = cache().lock().ok()?;
     c.tick += 1;
@@ -98,13 +117,18 @@ pub fn lookup(path: &Path) -> Option<Arc<SourceImage>> {
     let hit = c
         .entries
         .iter_mut()
-        .find(|e| e.path == path && e.mtime == mtime && e.len == len)?;
+        .find(|e| e.path == path && e.mtime == mtime && e.len == len && e.tag == tag)?;
     hit.used = tick;
     Some(Arc::clone(&hit.img))
 }
 
-/// 存一张源图；超预算按 LRU 淘汰，单张超预算直接不存。
+/// 存一张原始分辨率的源图。
 pub fn store(path: &Path, img: Arc<SourceImage>) {
+    store_tagged(path, TAG_FULL, img)
+}
+
+/// 存一张指定档位的源图；超预算按 LRU 淘汰，单张超预算直接不存。
+pub fn store_tagged(path: &Path, tag: Tag, img: Arc<SourceImage>) {
     let Some((mtime, len)) = identity(path) else {
         return;
     };
@@ -117,11 +141,11 @@ pub fn store(path: &Path, img: Arc<SourceImage>) {
     };
     c.tick += 1;
     let tick = c.tick;
-    // 同一路径的旧版本（文件改过了）先丢掉，避免同一张图留两份。
+    // 同一路径 + 同一档的旧版本（文件改过了）先丢掉，避免同一张图留两份。
     if let Some(pos) = c
         .entries
         .iter()
-        .position(|e| e.path == path && e.mtime == mtime && e.len == len)
+        .position(|e| e.path == path && e.mtime == mtime && e.len == len && e.tag == tag)
     {
         let old = c.entries.remove(pos);
         c.bytes -= old.img.rgba.len();
@@ -142,9 +166,22 @@ pub fn store(path: &Path, img: Arc<SourceImage>) {
         path: path.to_path_buf(),
         mtime,
         len,
+        tag,
         img,
         used: tick,
     });
+}
+
+#[cfg(test)]
+pub fn tags_for(path: &Path) -> Vec<Tag> {
+    let Ok(c) = cache().lock() else {
+        return Vec::new();
+    };
+    c.entries
+        .iter()
+        .filter(|e| e.path == path)
+        .map(|e| e.tag)
+        .collect()
 }
 
 #[cfg(test)]
@@ -187,6 +224,19 @@ mod tests {
         assert!(lookup(&path).is_none());
         assert!(cacheable(CACHE_MAX_PIXELS));
         assert!(!cacheable(CACHE_MAX_PIXELS + 1));
+    }
+
+    /// 同一条路径的不同档必须分行存放、互不遮蔽：JPEG 从"适应窗口"放大一档时，
+    /// 1/2 档与 1/1 档会同时在缓存里；若共用一个槽，来回滚就会无限重解码。
+    #[test]
+    fn tags_of_one_file_do_not_shadow_each_other() {
+        let path = tmp("levels.jpg", b"same file");
+        store_tagged(&path, (4, 4), source(4, 4));
+        store_tagged(&path, (2, 2), source(2, 2));
+        assert_eq!(lookup_tagged(&path, (4, 4)).expect("1/1 档").width, 4);
+        assert_eq!(lookup_tagged(&path, (2, 2)).expect("1/2 档").width, 2);
+        // 通用路径的标签是 TAG_FULL，不该误命中某个档位条目。
+        assert!(lookup(&path).is_none(), "TAG_FULL 不该命中档位条目");
     }
 
     #[test]
