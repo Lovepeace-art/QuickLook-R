@@ -516,7 +516,8 @@ impl Builder {
         if self.in_table {
             match name {
                 "td" | "th" => {
-                    let cell = self.take_buf().trim().to_string();
+                    let cell = self.buf.trim().to_string();
+                    self.buf.clear();
                     self.row.push(cell);
                 }
                 "tr" => {
@@ -634,42 +635,41 @@ impl Builder {
 
     /// 落一行（`raw` = true 表示代码块：保留前后空格）。
     fn emit_line(&mut self, style: LineStyle, prefix: String, raw: bool) {
-        let body = self.take_buf();
-        let text = if raw { body } else { body.trim().to_string() };
+        // 原来这一行要分配三次：`to_string()` 拷一份 body、`format!` 拼前缀、`clip` 再拷一份。
+        // 现在只拼一次（`clip_line` 内部按预算边拼边数），`buf` 用 `clear` 复用容量。
+        let text: &str = if raw { &self.buf } else { self.buf.trim() };
         let line = if text.is_empty() {
             String::new()
         } else {
-            format!("{prefix}{text}")
+            clip_line(&prefix, text)
         };
         if line.is_empty() && style != LineStyle::Code {
+            self.buf.clear();
             return;
         }
-        self.lines.push(clip(&line));
+        self.lines.push(line);
         self.styles.push(style);
         self.space = false;
+        self.buf.clear();
     }
 
     fn flush(&mut self) {
         let Some((style, prefix)) = self.block.take() else {
             return;
         };
-        let body = self.take_buf();
         // 代码块（`<pre>`）只去尾部空白：行首缩进是内容的一部分（Python 缩进、`&lt;!--` 的
         // 缩进都靠它），trim() 会把 `\t`/空格一起吃掉，读起来就像代码被"左对齐"了。
-        let text = if style == LineStyle::Code {
-            body.trim_end()
+        let text: &str = if style == LineStyle::Code {
+            self.buf.trim_end()
         } else {
-            body.trim()
+            self.buf.trim()
         };
         if !text.is_empty() {
-            self.lines.push(clip(&format!("{prefix}{text}")));
+            self.lines.push(clip_line(&prefix, text));
             self.styles.push(style);
         }
         self.space = false;
-    }
-
-    fn take_buf(&mut self) -> String {
-        std::mem::take(&mut self.buf)
+        self.buf.clear();
     }
 
     /// 需要时补一个空行，让"块"之间有呼吸感（列表项之间不补，否则一份 50 项清单会翻倍）。
@@ -695,12 +695,14 @@ impl Builder {
         if self.row.is_empty() {
             return;
         }
-        let joined = self
-            .row
-            .iter()
-            .map(|c| c.trim())
-            .collect::<Vec<_>>()
-            .join(" │ ");
+        // 一次分配拼出整行（原来 `collect::<Vec<_>>().join()` 再 `clip` 又拷两遍）。
+        let mut joined = String::with_capacity(64);
+        for (i, cell) in self.row.iter().enumerate() {
+            if i > 0 {
+                joined.push_str(" │ ");
+            }
+            joined.push_str(cell.trim());
+        }
         self.row.clear();
         let header = self.header_row;
         self.header_row = false;
@@ -708,7 +710,8 @@ impl Builder {
             return;
         }
         self.separate(LineStyle::Table);
-        self.lines.push(clip(&joined));
+        let line = clip_line("", &joined);
+        self.lines.push(line);
         self.styles.push(LineStyle::Table);
         if header {
             self.lines.push("─".repeat(RULE_CHARS));
@@ -717,9 +720,32 @@ impl Builder {
     }
 }
 
-/// 单行长度上限（与 Markdown 一致，防止一行几万字把 GDI 撑爆）。
-fn clip(s: &str) -> String {
-    text::truncate_chars(s, text::MAX_LINE_CHARS)
+/// 拼一行：`prefix` + `text`，按 `MAX_LINE_CHARS` 截断（超了补省略号）。
+///
+/// 为什么不用 `format!` + `text::truncate_chars`：那是**三次分配**（每行一次 body 拷贝、
+/// 一次拼接、一次截断拷贝）。8 MB 文档 23 万行时，这点开销就是几十毫秒——见 #159。
+fn clip_line(prefix: &str, text: &str) -> String {
+    let limit = text::MAX_LINE_CHARS;
+    let prefix_chars = prefix.chars().count();
+    if prefix_chars >= limit {
+        // 前缀自己就吃满了预算（理论上只有超长列表前缀会这样）：截前缀。
+        let mut out = String::with_capacity(limit * 4);
+        out.extend(prefix.chars().take(limit));
+        out.push('…');
+        return out;
+    }
+    let budget = limit - prefix_chars;
+    let cut = text.char_indices().nth(budget).map(|(i, _)| i);
+    let mut out = String::with_capacity(prefix.len() + cut.unwrap_or(text.len()));
+    out.push_str(prefix);
+    match cut {
+        Some(i) => {
+            out.push_str(&text[..i]);
+            out.push('…');
+        }
+        None => out.push_str(text),
+    }
+    out
 }
 
 /// 还原 HTML 字符实体：数字（`&#20013;` / `&#x6587;`）与常见命名实体。
@@ -1018,6 +1044,25 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("后面还有正文"))
         );
+    }
+
+    #[test]
+    fn clip_line_matches_truncate_chars() {
+        // 单次分配版本必须与旧的 `format!` + `truncate_chars` 逐字符等价（含省略号位置）。
+        let max = crate::text::MAX_LINE_CHARS;
+        let long = "长".repeat(max + 5);
+        let exact = "x".repeat(max);
+        let cases: [(&str, &str); 5] = [
+            ("", "短行"),
+            ("• ", "中等长度的一行内容"),
+            ("", &long),
+            ("", &exact),
+            ("• ", &long),
+        ];
+        for (prefix, body) in cases {
+            let expected = crate::text::truncate_chars(&format!("{prefix}{body}"), max);
+            assert_eq!(clip_line(prefix, body), expected, "prefix={prefix:?}");
+        }
     }
 
     #[test]

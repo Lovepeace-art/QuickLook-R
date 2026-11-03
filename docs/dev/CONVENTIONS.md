@@ -1603,3 +1603,37 @@ toast 进了基准图。这是环境噪音，不是绘制差异。
 所以：① 基准里每个阶段跑 3 遍取最好；② 只在"两项合起来"这一级下结论
 （`layout 122.7 → 74.8 ms`、`render_with(head,400) 120.7 → 87.1 ms`）；
 ③ 别把一次跑出来的小差异写进提交说明（对照 #154 / #157）。
+
+## #159 一行文字拼三次 = 每行三次分配；把它压成一次，8 MB 文档省 24%
+
+**症状**：HTML 8 MB（23 万显示行）排版 `head` 400 行要 87 ms，其中"落行"这一段占了 56 ms，
+比词法（10 ms）和预处理（9 ms）加起来还多五倍。
+
+**根因**：`emit_line`/`flush` 每落一行做了三次分配 + 三次拷贝：
+
+```rust
+let body = std::mem::take(&mut self.buf);        // ① 把缓冲搬走，下一行要重新扩容
+let text = body.trim().to_string();             // ② 再拷一份（只为去掉首尾空白）
+let line = format!("{prefix}{text}");            // ③ 拼前缀，又一次拷贝
+self.lines.push(clip(&line));                    // ④ truncate_chars 里 s.to_string() 再拷一次
+```
+
+23 万行 × 3～4 次分配 = 近 80 万次小分配，全在排版热路径上。
+
+**改法**：
+
+1. `trim()` 只借不拷——`let text: &str = self.buf.trim();`，靠字段级借用分离（`self.buf`
+   不可变借、`self.lines` 可变借，编译器允许），落完行再 `self.buf.clear()` 复用容量，
+   不要 `mem::take`（那会把容量丢掉，下一行又得扩容）。
+2. 拼行只做一次分配：`clip_line(prefix, text)` 先用 `char_indices().nth(预算)` 算出截断点，
+   `String::with_capacity(prefix.len() + cut)` 一次建成，超预算才补 `…`。
+   **截断语义必须与 `text::truncate_chars` 逐字符一致**，为此留了 `clip_line_matches_truncate_chars`
+   做等价性断言（含 `prefix` 自己就超长的边界）。
+3. 表格行同理：`collect::<Vec<_>>().join()` 改成循环 `push_str`。
+
+**实测**（release，8 MB 夹具）：layout 全量 74.8 → 51.2 ms，`render_with(head, 400)` 87.1 → 62.9 ms；
+叠加 #158 的流式词法，这条路径从最初的 120.7 ms 降到 62.9 ms（−48%）。
+
+**推广**：凡是"容器里存一堆 String、每行现拼"的地方（Markdown 的 `layout`、代码高亮的断行结果），
+都按这个顺序检查：能不能借（trim/切片）→ 能不能复用缓冲（`clear()` 而非 `take()`）→
+最后才是一次性 `with_capacity` 拼装。`Vec<String>` 的 `push` 本身不贵，贵的是每行那几次小分配。
