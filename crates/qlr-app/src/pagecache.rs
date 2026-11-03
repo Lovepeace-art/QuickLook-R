@@ -5,7 +5,9 @@
 //! 用户翻页最常见的动作是"翻过去看一眼、又翻回来"，这一来一回没必要重算。
 //!
 //! 三个约束：
-//! 1. **按 (路径, 页号, 宽, 高) 精确匹配**——尺寸不同就是不同的位图，不能拿来凑。
+//! 1. **按 (路径, 页号, 宽, 高, 文件戳) 精确匹配**——尺寸不同就是不同的位图，不能拿来凑；
+//!    文件戳（mtime + 字节数）防"同路径文件被覆盖后翻页命中陈旧像素"
+//!    （与 CONVENTIONS #112 的 FrameKey 同一个坑）。
 //! 2. **LRU + 字节上限**：一页 631×893 是 2.25 MB，64 MB 上限约 28 页；
 //!    超了就从最久没用的开始丢（宁可重算一次，也不要悄悄吃满内存）。
 //! 3. 只缓存 **PDF**：图片/文本的渲染本来就便宜，缓存它们只会让内存变脏。
@@ -19,22 +21,27 @@ use qlr_render::Canvas;
 /// 缓存上限：64 MB。一页 631×893 约 2.25 MB，够放 ~28 页。
 pub const CACHE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// 一次命中的 key：路径 + 页号 + 目标尺寸。
+/// 一次命中的 key：路径 + 页号 + 目标尺寸 + 文件戳。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageKey {
     pub path: PathBuf,
     pub page: usize,
     pub width: u32,
     pub height: u32,
+    /// mtime（秒）+ 字节数；拿不到就是 (0, 0)，此时按"永不过期"处理。
+    pub mtime: u64,
+    pub len: u64,
 }
 
 impl PageKey {
-    pub fn new(path: &Path, page: usize, width: u32, height: u32) -> Self {
+    pub fn new(path: &Path, page: usize, width: u32, height: u32, stamp: (u64, u64)) -> Self {
         Self {
             path: path.to_path_buf(),
             page,
             width,
             height,
+            mtime: stamp.0,
+            len: stamp.1,
         }
     }
 }
@@ -172,24 +179,51 @@ mod tests {
     #[test]
     fn hits_only_on_exact_key() {
         let mut cache = PageCache::new(16 * 1024 * 1024);
-        let key = PageKey::new(Path::new("a.pdf"), 0, 100, 100);
+        let key = PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234));
         cache.put(key.clone(), fake_bitmap(100, 100));
         assert!(cache.get(&key).is_some());
         // 页号不同、尺寸不同都不算命中（宁可重算也不要拿错位图）。
         assert!(
             cache
-                .get(&PageKey::new(Path::new("a.pdf"), 1, 100, 100))
+                .get(&PageKey::new(Path::new("a.pdf"), 1, 100, 100, (7, 1234)))
                 .is_none()
         );
         assert!(
             cache
-                .get(&PageKey::new(Path::new("a.pdf"), 0, 101, 100))
+                .get(&PageKey::new(Path::new("a.pdf"), 0, 101, 100, (7, 1234)))
                 .is_none()
         );
         assert!(
             cache
-                .get(&PageKey::new(Path::new("b.pdf"), 0, 100, 100))
+                .get(&PageKey::new(Path::new("b.pdf"), 0, 100, 100, (7, 1234)))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_stamp_does_not_hit() {
+        // 同路径同页同尺寸，但文件被覆盖（mtime/len 变了）——必须判未命中，
+        // 否则翻页会拿到旧像素（与 FrameKey 的 #112 同一个坑）。
+        let mut cache = PageCache::new(16 * 1024 * 1024);
+        cache.put(
+            PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234)),
+            fake_bitmap(100, 100),
+        );
+        assert!(
+            cache
+                .get(&PageKey::new(Path::new("a.pdf"), 0, 100, 100, (8, 1234)))
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 9999)))
+                .is_none()
+        );
+        // 完全相同的文件戳仍然命中。
+        assert!(
+            cache
+                .get(&PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234)))
+                .is_some()
         );
     }
 
@@ -199,7 +233,7 @@ mod tests {
         let mut cache = PageCache::new(100 * 1024);
         for page in 0..3 {
             cache.put(
-                PageKey::new(Path::new("a.pdf"), page, 100, 100),
+                PageKey::new(Path::new("a.pdf"), page, 100, 100, (7, 1234)),
                 fake_bitmap(100, 100),
             );
         }
@@ -207,12 +241,12 @@ mod tests {
         // 最早那页被挤掉。
         assert!(
             cache
-                .get(&PageKey::new(Path::new("a.pdf"), 0, 100, 100))
+                .get(&PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234)))
                 .is_none()
         );
         assert!(
             cache
-                .get(&PageKey::new(Path::new("a.pdf"), 2, 100, 100))
+                .get(&PageKey::new(Path::new("a.pdf"), 2, 100, 100, (7, 1234)))
                 .is_some()
         );
     }
@@ -220,9 +254,9 @@ mod tests {
     #[test]
     fn get_refreshes_recency() {
         let mut cache = PageCache::new(100 * 1024);
-        let a = PageKey::new(Path::new("a.pdf"), 0, 100, 100);
-        let b = PageKey::new(Path::new("a.pdf"), 1, 100, 100);
-        let c = PageKey::new(Path::new("a.pdf"), 2, 100, 100);
+        let a = PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234));
+        let b = PageKey::new(Path::new("a.pdf"), 1, 100, 100, (7, 1234));
+        let c = PageKey::new(Path::new("a.pdf"), 2, 100, 100, (7, 1234));
         cache.put(a.clone(), fake_bitmap(100, 100));
         cache.put(b.clone(), fake_bitmap(100, 100));
         // 摸一下 a，让它变成"最近使用"，再塞 c 时该挤掉 b。
@@ -236,7 +270,7 @@ mod tests {
     #[test]
     fn oversized_page_is_not_cached() {
         let mut cache = PageCache::new(10 * 1024);
-        let key = PageKey::new(Path::new("a.pdf"), 0, 200, 200); // 160 KB
+        let key = PageKey::new(Path::new("a.pdf"), 0, 200, 200, (7, 1234)); // 160 KB
         cache.put(key.clone(), fake_bitmap(200, 200));
         assert_eq!(cache.len(), 0, "单页超过上限就不该进缓存");
     }
@@ -245,7 +279,7 @@ mod tests {
     fn clear_empties_everything() {
         let mut cache = PageCache::new(16 * 1024 * 1024);
         cache.put(
-            PageKey::new(Path::new("a.pdf"), 0, 100, 100),
+            PageKey::new(Path::new("a.pdf"), 0, 100, 100, (7, 1234)),
             fake_bitmap(100, 100),
         );
         cache.clear();

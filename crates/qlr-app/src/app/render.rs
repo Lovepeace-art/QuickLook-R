@@ -473,7 +473,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
     // 1.3.0：PDF 页缓存。翻回去看一眼是 PDF 最常见的动作，命中就别再麻烦渲染线程。
     // 注意代际也要 +1：否则先前那一帧算完回来会把刚上屏的这一页顶掉。
     if is_pdf {
-        let key = pagecache::PageKey::new(path, page, max_w, max_h);
+        let key = pagecache::PageKey::new(path, page, max_w, max_h, file_stamp(path));
         if let Some(canvas) = pagecache::get(&key) {
             let generation = with_state(|s| {
                 s.render_gen = s.render_gen.wrapping_add(1);
@@ -522,7 +522,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         s.render_warned = false;
         // PDF 这一帧算完回来要进页缓存，先把 key 记下来（非 PDF 不记）。
         s.pending_key = if is_pdf {
-            Some(pagecache::PageKey::new(path, page, max_w, max_h))
+            Some(pagecache::PageKey::new(path, page, max_w, max_h, file_stamp(path)))
         } else {
             None
         };
@@ -1051,7 +1051,13 @@ pub(crate) fn warm_prepared(job: &RenderJob) {
 
 /// 相邻页预取（1.3.0）：只把结果写进页缓存，不上屏、不碰单槽。
 pub(crate) fn warm_page(job: &RenderJob) {
-    let key = pagecache::PageKey::new(&job.path, job.page, job.max_width, job.max_height);
+    let key = pagecache::PageKey::new(
+        &job.path,
+        job.page,
+        job.max_width,
+        job.max_height,
+        file_stamp(&job.path),
+    );
     if pagecache::has(&key) {
         return;
     }
@@ -1097,7 +1103,13 @@ pub(crate) fn prefetch_neighbor_pages(key: &pagecache::PageKey) {
         if target < 0 || target as usize >= total {
             continue;
         }
-        let neighbor = pagecache::PageKey::new(&key.path, target as usize, key.width, key.height);
+        let neighbor = pagecache::PageKey::new(
+            &key.path,
+            target as usize,
+            key.width,
+            key.height,
+            file_stamp(&key.path),
+        );
         if pagecache::has(&neighbor) {
             continue;
         }
