@@ -18,6 +18,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use libloading::Library;
 
@@ -182,42 +183,69 @@ fn pdf_error_message(code: u32) -> &'static str {
     }
 }
 
-/// 一次性句柄守卫：pdfium 的 document/page 都必须显式关闭。
-struct DocHandle<'a> {
-    api: &'a Api,
+/// 文档槽：同一时间只常驻**一份**已加载的 PDF。
+///
+/// 为什么要有它：预览一个 PDF 会连着走三步——`natural_size`（取第 1 页尺寸开窗）、
+/// `pdf_page_count`（顶栏"第 x / N 页"）、`render_page`（出图），翻页再各来一遍。
+/// 1.8.3 的每一步都是"把整个文件读进内存 + pdfium 解析一遍"，而三步用的是同一份文档。
+/// 缓存之后一次预览只读一次、只解析一次，翻页连磁盘都不碰。
+///
+/// 只留一份的理由：预览是一张一张看的，多槽位除了多占内存没有收益。文件变了
+/// （修改时间或长度变了）直接换掉，绝不拿旧文档糊弄用户；特大文档不常驻
+/// （见 [`DOC_SLOT_MAX_BYTES`]）。
+struct DocSlot {
+    path: PathBuf,
+    mtime: SystemTime,
+    len: u64,
     raw: *mut c_void,
     /// **必须持有**：FPDF_LoadMemDocument64 不拷贝字节，文档在生命周期内
     /// 一直引用调用方的缓冲区。丢了它 pdfium 会读到已释放内存 —— 表现是
     /// 「某些页偶发 LoadPage 返回 NULL」，极难查（2026-10-30 实际踩到）。
     _data: Vec<u8>,
+    /// 关闭函数跟着槽走：槽是静态的，`Drop` 里没有 `Api` 可用。
+    close: FnCloseDocument,
+    pages: usize,
 }
 
-impl Drop for DocHandle<'_> {
+impl Drop for DocSlot {
     fn drop(&mut self) {
-        unsafe { (self.api.close_document)(self.raw) }
+        unsafe { (self.close)(self.raw) }
     }
 }
 
-struct PageHandle<'a> {
-    api: &'a Api,
-    raw: *mut c_void,
+// SAFETY: 裸句柄只在这把锁里被摸，且取槽之前必须先拿 `api()` 的锁（见 `with_document`），
+// 所以任何时刻最多一个线程在引用这个 `FPDF_DOCUMENT`。
+unsafe impl Send for DocSlot {}
+
+/// 文档槽常驻上限：超过就不缓存，用完立刻关掉。
+///
+/// 取 256 MB：常见扫描件几十 MB、几百页的文字文档也就一两百 MB；再往上
+/// "钉住整份文件 + pdfium 的解析结构"比"多读一次磁盘"更伤内存。
+const DOC_SLOT_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// 文件身份；读不到就没有身份，也就不复用。
+fn identity(path: &Path) -> Option<(SystemTime, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.modified().ok()?, md.len()))
 }
 
-impl Drop for PageHandle<'_> {
-    fn drop(&mut self) {
-        unsafe { (self.api.close_page)(self.raw) }
-    }
+/// 文档槽的锁。**取它之前必须先持有 `api()` 的锁**（顺序固定：api → 槽），
+/// 否则两个线程会同时摸同一个 `FPDF_DOCUMENT`，而 pdfium 不是线程安全的。
+static SLOT: OnceLock<Mutex<Option<DocSlot>>> = OnceLock::new();
+
+fn slot() -> &'static Mutex<Option<DocSlot>> {
+    SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// 打开文档，返回 (句柄, 页数)。
-fn open_document<'a>(api: &'a Api, path: &Path) -> Result<(DocHandle<'a>, usize)> {
+/// 读字节 + `FPDF_LoadMemDocument64` + 数页。
+fn load_document(api: &Api, path: &Path, stamp: Option<(SystemTime, u64)>) -> Result<DocSlot> {
     // 自己读字节：路径里可以有中文，也不受 pdfium 的 ANSI 路径限制。
     let data = std::fs::read(path)
         .map_err(|e| Error::Message(format!("打不开 PDF {}：{e}", path.display())))?;
     if data.is_empty() {
         return Err(Error::Message(format!("PDF 是空文件：{}", path.display())));
     }
-    // SAFETY: data 由返回的 DocHandle 持有（见字段注释），生命周期覆盖整个文档。
+    // SAFETY: data 由返回的 DocSlot 持有（见字段注释），生命周期覆盖整个文档。
     let raw = unsafe {
         (api.load_mem)(
             data.as_ptr() as *const c_void,
@@ -233,20 +261,68 @@ fn open_document<'a>(api: &'a Api, path: &Path) -> Result<(DocHandle<'a>, usize)
             path.display()
         )));
     }
-    // 把读到的字节交给句柄持有：pdfium 之后还要反复引用这块内存。
-    let doc = DocHandle {
-        api,
+    let count = unsafe { (api.page_count)(raw) };
+    let (mtime, len) = stamp.unwrap_or((SystemTime::UNIX_EPOCH, data.len() as u64));
+    let doc = DocSlot {
+        path: path.to_path_buf(),
+        mtime,
+        len,
         raw,
         _data: data,
+        close: api.close_document,
+        pages: count.max(0) as usize,
     };
-    let count = unsafe { (api.page_count)(doc.raw) };
-    if count <= 0 {
+    // 没有可渲染页面：`doc` 在这里 drop，句柄随之关闭，不会漏。
+    if doc.pages == 0 {
         return Err(Error::Message(format!(
             "PDF 没有可渲染的页面：{}",
             path.display()
         )));
     }
-    Ok((doc, count as usize))
+    Ok(doc)
+}
+
+/// 复用（或加载）文档后执行 `f`：`f` 拿到文档句柄与页数。
+///
+/// 调用方必须已持有 `api()` 的锁；`f` 执行期间文档槽锁也在这条路径上，
+/// 所以句柄不会被别人抢先关掉。
+fn with_document<T>(
+    api: &Api,
+    path: &Path,
+    f: impl FnOnce(&Api, *mut c_void, usize) -> Result<T>,
+) -> Result<T> {
+    let mut held = slot()
+        .lock()
+        .map_err(|_| Error::Message("PDF 文档槽已中毒".into()))?;
+    let stamp = identity(path);
+    let reuse = match (&*held, stamp) {
+        (Some(s), Some((mtime, len))) => s.path == path && s.mtime == mtime && s.len == len,
+        _ => false,
+    };
+    if !reuse {
+        let fresh = load_document(api, path, stamp)?;
+        if fresh._data.len() > DOC_SLOT_MAX_BYTES {
+            // 特大文档不常驻：`fresh` 在 `f` 返回后 drop，句柄随之关闭。
+            return f(api, fresh.raw, fresh.pages);
+        }
+        *held = Some(fresh); // 同一时刻只留一份，旧文档在这里 drop → 关闭
+    }
+    let (raw, pages) = held
+        .as_ref()
+        .map(|s| (s.raw, s.pages))
+        .ok_or_else(|| Error::Message("PDF 文档槽意外为空".to_string()))?;
+    f(api, raw, pages)
+}
+
+struct PageHandle<'a> {
+    api: &'a Api,
+    raw: *mut c_void,
+}
+
+impl Drop for PageHandle<'_> {
+    fn drop(&mut self) {
+        unsafe { (self.api.close_page)(self.raw) }
+    }
 }
 
 /// 页数（用于状态行显示 "第 1 / N 页"）。
@@ -255,9 +331,8 @@ pub fn page_count(path: &Path) -> Result<usize> {
     let guard = api
         .lock()
         .map_err(|_| Error::Message("pdfium 状态锁已中毒".into()))?;
-    let (doc, count) = open_document(&guard, path)?;
-    drop(doc);
-    Ok(count.min(MAX_PAGES))
+    // 走文档槽：同一份 PDF 在被预览期间只读一次、只解析一次。
+    with_document(&guard, path, |_, _, pages| Ok(pages.min(MAX_PAGES)))
 }
 
 /// 指定页的物理尺寸，单位为 PDF point（1 pt = 1/72 英寸）。
@@ -268,35 +343,36 @@ pub fn page_size(path: &Path, page_index: usize) -> Result<(f64, f64)> {
     let guard = api
         .lock()
         .map_err(|_| Error::Message("pdfium 状态锁已中毒".into()))?;
-    let (doc, count) = open_document(&guard, path)?;
-    let index = page_index.min(count.saturating_sub(1));
-    let raw_page = unsafe { (guard.load_page)(doc.raw, index as c_int) };
-    if raw_page.is_null() {
-        let code = unsafe { (guard.last_error)() };
-        return Err(Error::Message(format!(
-            "第 {} 页打不开（{}）：{}",
-            index + 1,
-            pdf_error_message(code),
-            path.display()
-        )));
-    }
-    let page = PageHandle {
-        api: &guard,
-        raw: raw_page,
-    };
-    let (pw, ph) = unsafe {
-        (
-            (guard.page_width)(page.raw) as f64,
-            (guard.page_height)(page.raw) as f64,
-        )
-    };
-    if !(pw.is_finite() && ph.is_finite()) || pw <= 0.0 || ph <= 0.0 {
-        return Err(Error::Message(format!(
-            "PDF 页面尺寸异常（{pw}x{ph}）：{}",
-            path.display()
-        )));
-    }
-    Ok((pw, ph))
+    with_document(&guard, path, |guard, raw, pages| {
+        let index = page_index.min(pages.saturating_sub(1));
+        let raw_page = unsafe { (guard.load_page)(raw, index as c_int) };
+        if raw_page.is_null() {
+            let code = unsafe { (guard.last_error)() };
+            return Err(Error::Message(format!(
+                "第 {} 页打不开（{}）：{}",
+                index + 1,
+                pdf_error_message(code),
+                path.display()
+            )));
+        }
+        let page = PageHandle {
+            api: guard,
+            raw: raw_page,
+        };
+        let (pw, ph) = unsafe {
+            (
+                (guard.page_width)(page.raw) as f64,
+                (guard.page_height)(page.raw) as f64,
+            )
+        };
+        if !(pw.is_finite() && ph.is_finite()) || pw <= 0.0 || ph <= 0.0 {
+            return Err(Error::Message(format!(
+                "PDF 页面尺寸异常（{pw}x{ph}）：{}",
+                path.display()
+            )));
+        }
+        Ok((pw, ph))
+    })
 }
 
 /// 把指定页渲染成位图（等比缩放到 max_width × max_height 内）。
@@ -313,108 +389,109 @@ pub fn render_page(
     let guard = api
         .lock()
         .map_err(|_| Error::Message("pdfium 状态锁已中毒".into()))?;
-    let (doc, count) = open_document(&guard, path)?;
-    let index = page_index.min(count.saturating_sub(1));
+    with_document(&guard, path, |guard, raw, pages| {
+        let index = page_index.min(pages.saturating_sub(1));
 
-    let raw_page = unsafe { (guard.load_page)(doc.raw, index as c_int) };
-    if raw_page.is_null() {
-        let code = unsafe { (guard.last_error)() };
-        return Err(Error::Message(format!(
-            "第 {} 页打不开（{}）：{}",
-            index + 1,
-            pdf_error_message(code),
-            path.display()
-        )));
-    }
-    let page = PageHandle {
-        api: &guard,
-        raw: raw_page,
-    };
-
-    let (pw, ph) = unsafe {
-        (
-            (guard.page_width)(page.raw) as f64,
-            (guard.page_height)(page.raw) as f64,
-        )
-    };
-    if !(pw.is_finite() && ph.is_finite()) || pw <= 0.0 || ph <= 0.0 {
-        return Err(Error::Message(format!(
-            "PDF 页面尺寸异常（{}x{}）：{}",
-            pw,
-            ph,
-            path.display()
-        )));
-    }
-
-    // 打开文档 + 取页高这几步在大 PDF 上也要几十毫秒；画之前先问一句"还要不要"，
-    // 免得用户已经换页/换文件了还把整页光栅化做完（1.2.0）。
-    crate::cancel::checkpoint()?;
-    let (bw, bh) = fit_scaled(pw, ph, max_width.max(1) as f64, max_height.max(1) as f64);
-    // 缩小（目标像素小于"1:1 = 96 dpi"的页面尺寸）时**超采样 2 倍再盒式缩小**（1.0.8）。
-    //
-    // 为什么：pdfium 直接往小画布上画矢量文字，笔画只有 1 px 宽还要抗锯齿，
-    // 屏幕上就是"糊"。多渲一倍像素再缩，等价于给文字做了一次 4×4 的盒式平均，
-    // 小字号反而更结实（这也是各家阅读器缩小时的常规做法）。放大方向不需要。
-    const SUPERSAMPLE: f64 = 2.0;
-    /// 超采样后的像素预算：一张 A4 缩到 470 px 宽也要 940×1330≈1.25 MP，够用；
-    /// 上限防止大页面（A0 图纸）把内存吃穿。
-    const SUPERSAMPLE_BUDGET: f64 = 24_000_000.0;
-    let natural = 96.0 / 72.0;
-    let target_scale = (bw as f64 / pw).min(bh as f64 / ph);
-    let mut scale_up = 1.0_f64;
-    if target_scale * SUPERSAMPLE < natural {
-        let pixels = (bw as f64 * SUPERSAMPLE) * (bh as f64 * SUPERSAMPLE);
-        if pixels <= SUPERSAMPLE_BUDGET {
-            scale_up = SUPERSAMPLE;
+        let raw_page = unsafe { (guard.load_page)(raw, index as c_int) };
+        if raw_page.is_null() {
+            let code = unsafe { (guard.last_error)() };
+            return Err(Error::Message(format!(
+                "第 {} 页打不开（{}）：{}",
+                index + 1,
+                pdf_error_message(code),
+                path.display()
+            )));
         }
-    }
-    let rw = ((bw as f64) * scale_up).round().max(1.0) as u32;
-    let rh = ((bh as f64) * scale_up).round().max(1.0) as u32;
-    // 多渲染 1 倍再缩到目标尺寸没必要（pdfium 自带抗锯齿），
-    // 但页面在屏幕上是"缩放后"呈现，所以直接按目标像素渲染即可。
-    let width = rw.max(1);
-    let height = rh.max(1);
-    let stride = width as usize * 4;
-    let mut buffer = vec![0u8; stride * height as usize];
+        let page = PageHandle {
+            api: guard,
+            raw: raw_page,
+        };
 
-    // SAFETY: buffer 的容量 = stride * height，正好是 pdfium 要写的范围；
-    // bitmap 在 page 关闭前销毁。
-    let bitmap = unsafe {
-        (guard.bitmap_create_ex)(
-            width as c_int,
-            height as c_int,
-            FPDF_BITMAP_BGRA,
-            buffer.as_mut_ptr() as *mut c_void,
-            stride as c_int,
-        )
-    };
-    if bitmap.is_null() {
-        return Err(Error::Message(format!(
-            "pdfium 分配位图失败（{width}x{height}）"
-        )));
-    }
-    // 白底：PDF 页面本身没有背景，不填会得到透明黑（看着像"黑屏"）。
-    unsafe {
-        (guard.bitmap_fill_rect)(bitmap, 0, 0, width as c_int, height as c_int, 0xFFFF_FFFF);
-        (guard.render_page)(
-            bitmap,
-            page.raw,
-            0,
-            0,
-            width as c_int,
-            height as c_int,
-            0,
-            RENDER_FLAGS,
-        );
-        (guard.bitmap_destroy)(bitmap);
-    }
+        let (pw, ph) = unsafe {
+            (
+                (guard.page_width)(page.raw) as f64,
+                (guard.page_height)(page.raw) as f64,
+            )
+        };
+        if !(pw.is_finite() && ph.is_finite()) || pw <= 0.0 || ph <= 0.0 {
+            return Err(Error::Message(format!(
+                "PDF 页面尺寸异常（{}x{}）：{}",
+                pw,
+                ph,
+                path.display()
+            )));
+        }
 
-    let canvas = if scale_up > 1.0 {
-        downscale_bgra(&buffer, width, height, bw.max(1), bh.max(1))
-    } else {
-        Bitmap::new(width, height, buffer)
-    };
-    Ok(Canvas::Bitmap(canvas))
+        // 打开文档 + 取页高这几步在大 PDF 上也要几十毫秒；画之前先问一句"还要不要"，
+        // 免得用户已经换页/换文件了还把整页光栅化做完（1.2.0）。
+        crate::cancel::checkpoint()?;
+        let (bw, bh) = fit_scaled(pw, ph, max_width.max(1) as f64, max_height.max(1) as f64);
+        // 缩小（目标像素小于"1:1 = 96 dpi"的页面尺寸）时**超采样 2 倍再盒式缩小**（1.0.8）。
+        //
+        // 为什么：pdfium 直接往小画布上画矢量文字，笔画只有 1 px 宽还要抗锯齿，
+        // 屏幕上就是"糊"。多渲一倍像素再缩，等价于给文字做了一次 4×4 的盒式平均，
+        // 小字号反而更结实（这也是各家阅读器缩小时的常规做法）。放大方向不需要。
+        const SUPERSAMPLE: f64 = 2.0;
+        /// 超采样后的像素预算：一张 A4 缩到 470 px 宽也要 940×1330≈1.25 MP，够用；
+        /// 上限防止大页面（A0 图纸）把内存吃穿。
+        const SUPERSAMPLE_BUDGET: f64 = 24_000_000.0;
+        let natural = 96.0 / 72.0;
+        let target_scale = (bw as f64 / pw).min(bh as f64 / ph);
+        let mut scale_up = 1.0_f64;
+        if target_scale * SUPERSAMPLE < natural {
+            let pixels = (bw as f64 * SUPERSAMPLE) * (bh as f64 * SUPERSAMPLE);
+            if pixels <= SUPERSAMPLE_BUDGET {
+                scale_up = SUPERSAMPLE;
+            }
+        }
+        let rw = ((bw as f64) * scale_up).round().max(1.0) as u32;
+        let rh = ((bh as f64) * scale_up).round().max(1.0) as u32;
+        // 多渲染 1 倍再缩到目标尺寸没必要（pdfium 自带抗锯齿），
+        // 但页面在屏幕上是"缩放后"呈现，所以直接按目标像素渲染即可。
+        let width = rw.max(1);
+        let height = rh.max(1);
+        let stride = width as usize * 4;
+        let mut buffer = vec![0u8; stride * height as usize];
+
+        // SAFETY: buffer 的容量 = stride * height，正好是 pdfium 要写的范围；
+        // bitmap 在 page 关闭前销毁。
+        let bitmap = unsafe {
+            (guard.bitmap_create_ex)(
+                width as c_int,
+                height as c_int,
+                FPDF_BITMAP_BGRA,
+                buffer.as_mut_ptr() as *mut c_void,
+                stride as c_int,
+            )
+        };
+        if bitmap.is_null() {
+            return Err(Error::Message(format!(
+                "pdfium 分配位图失败（{width}x{height}）"
+            )));
+        }
+        // 白底：PDF 页面本身没有背景，不填会得到透明黑（看着像"黑屏"）。
+        unsafe {
+            (guard.bitmap_fill_rect)(bitmap, 0, 0, width as c_int, height as c_int, 0xFFFF_FFFF);
+            (guard.render_page)(
+                bitmap,
+                page.raw,
+                0,
+                0,
+                width as c_int,
+                height as c_int,
+                0,
+                RENDER_FLAGS,
+            );
+            (guard.bitmap_destroy)(bitmap);
+        }
+
+        let canvas = if scale_up > 1.0 {
+            downscale_bgra(&buffer, width, height, bw.max(1), bh.max(1))
+        } else {
+            Bitmap::new(width, height, buffer)
+        };
+        Ok(Canvas::Bitmap(canvas))
+    })
 }
 
 /// 把 BGRA 位图盒式缩到 `dw × dh`（超采样收尾用）。
@@ -502,5 +579,69 @@ mod tests {
         assert_eq!(pdf_error_message(FPDF_ERR_SUCCESS), "成功");
         assert!(pdf_error_message(2).contains("密码"));
         assert!(!pdf_error_message(999).is_empty());
+    }
+
+    /// 手测用（CI 不跑，需要真 pdfium）：
+    ///
+    /// ```text
+    /// $env:QLRUST_PDFIUM="<repo>\target\release\pdfium.dll"
+    /// $env:QLR_BENCH_PDF="<repo>\target\real-samples\test-200page.pdf"
+    /// cargo test --release -p qlr-render --lib bench_pdf_costs -- --ignored --nocapture
+    /// ```
+    ///
+    /// 分开称"读文件 / 冷加载 / 热复用 / 整页渲染"四段，用来判断优化该往哪儿使劲
+    /// （2026-11-03 就是靠它确认：重读全文件只占零点几毫秒，真开销在光栅化）。
+    #[test]
+    #[ignore]
+    fn bench_pdf_costs() {
+        use std::time::Instant;
+        let Some(path) = std::env::var_os("QLR_BENCH_PDF").map(std::path::PathBuf::from) else {
+            println!("未设置 QLR_BENCH_PDF，跳过");
+            return;
+        };
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        println!("--- {}（{size} B）---", path.display());
+
+        let t = Instant::now();
+        for _ in 0..5 {
+            let mut data = std::fs::read(&path).expect("读文件");
+            std::hint::black_box(&mut data);
+        }
+        println!("fs::read 一次 {:.2} ms", ms_per(t, 5));
+
+        let api = api().expect("pdfium 不可用");
+        {
+            let guard = api.lock().expect("锁");
+            // 冷加载：直接调 load_document，绕过槽（等价于"文件第一次被预览"）。
+            let t = Instant::now();
+            for _ in 0..5 {
+                let doc = load_document(&guard, &path, identity(&path)).expect("打开文档");
+                std::hint::black_box((doc.raw, doc.pages));
+            }
+            println!(
+                "冷加载（读 + 解析 + 数页，未命中槽）一次 {:.2} ms",
+                ms_per(t, 5)
+            );
+        }
+
+        // 热复用：先灌一次槽，再量 page_count（锁 + identity 比对 + 复用）。
+        let _ = page_count(&path).expect("数页");
+        let t = Instant::now();
+        for _ in 0..5 {
+            std::hint::black_box(page_count(&path).expect("数页"));
+        }
+        println!("热复用（命中文档槽）一次 {:.2} ms", ms_per(t, 5));
+
+        // 整页渲染：第一次含冷加载，之后都命中槽 —— 就是用户"滚一格/翻一页"的路径。
+        let t = Instant::now();
+        for i in 0..5 {
+            let canvas = render_page(&path, i * 20, 1589, 894).expect("渲染");
+            std::hint::black_box(canvas);
+        }
+        println!("render_page（首个含冷加载）一次 {:.2} ms", ms_per(t, 5));
+    }
+
+    fn ms_per(t: std::time::Instant, times: u32) -> f64 {
+        t.elapsed().as_secs_f64() * 1000.0 / f64::from(times)
     }
 }

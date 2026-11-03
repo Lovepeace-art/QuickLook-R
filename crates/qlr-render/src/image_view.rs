@@ -556,12 +556,7 @@ mod tests {
             println!("--- {name}: {w}x{h}, {} KB ---", bytes / 1024);
 
             // 模拟"适应窗口 → 1.25 倍 → 2 倍 → 回适应窗口"：滚一格再滚回去。
-            let boxes = [
-                (1589u32, 894u32),
-                (1986, 1118),
-                (3178, 1788),
-                (1589, 894),
-            ];
+            let boxes = [(1589u32, 894u32), (1986, 1118), (3178, 1788), (1589, 894)];
             let mut cold_ms = Vec::new();
             let mut hot_ms = Vec::new();
             for &(bw, bh) in &boxes {
