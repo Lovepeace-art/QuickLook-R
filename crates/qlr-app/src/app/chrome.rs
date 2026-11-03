@@ -505,18 +505,19 @@ pub(crate) fn repaint(hwnd: HWND) {
                 if fit_bitmap {
                     // 视频（1.7.9）：播放时 `s.video` 里有"当前这一帧"，它比渲染出来的首帧新。
                     // 用帧画（而不是首帧位图），窗口改大小/被别的窗口盖住后重画才不会"倒带"。
-                    let painted_frame = with_state(|s| {
-                        s.video.as_ref().and_then(|v| {
-                            v.last.as_ref().map(|f| (f.width, f.height, f.bgra.clone()))
-                        })
-                    })
-                    .flatten();
+                    let painted_frame =
+                        with_state(|s| s.video.as_ref().and_then(|v| v.last.clone())).flatten();
                     // 视频底部有进度条：贴图时要把那条留出来，否则这一帧会把进度条盖掉。
                     let reserve_bar = current_kind() == Some(format::Kind::Video);
                     match painted_frame {
-                        Some((w, h, bgra)) => {
-                            window::paint_bitmap_fit(hwnd, w, h, &bgra, Some(&chrome), reserve_bar)
-                        }
+                        Some(frame) => window::paint_bitmap_fit(
+                            hwnd,
+                            frame.width,
+                            frame.height,
+                            &frame.bgra,
+                            Some(&chrome),
+                            reserve_bar,
+                        ),
                         None => window::paint_bitmap_fit(
                             hwnd,
                             b.width,

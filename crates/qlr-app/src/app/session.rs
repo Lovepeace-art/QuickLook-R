@@ -315,7 +315,12 @@ pub(crate) struct VideoPlay {
     /// 逐帧解码流（Media Foundation 的 `SourceReader`）。
     pub(crate) stream: qlr_render::media::FrameStream,
     /// 最新解出来的一帧（窗口重画/改大小时拿它重贴，不必再解码一次）。
-    pub(crate) last: Option<qlr_render::media::RawFrame>,
+    ///
+    /// 用 `Arc` 而不是裸 `RawFrame`（1.8.3-fix 批次三）：贴图要放在**锁外**做
+    /// （一帧 720p 是 3.6 MB，`StretchDIBits` 搬这段时间热键/渲染线程都在等锁，
+    /// 结构评审 §5.1-S5），而锁外贴图就得先把这个帧带出锁——`Arc` 克隆是加一次
+    /// 引用计数（~20 ns），裸 `RawFrame` 克隆是整帧拷贝（720p 约 0.4 ms）。
+    pub(crate) last: Option<Arc<qlr_render::media::RawFrame>>,
     /// 播放锚点：这一时刻对应的时间轴位置，以及当时的挂钟时间。
     pub(crate) anchor_pos_ms: u64,
     pub(crate) anchor_at: std::time::Instant,
@@ -456,9 +461,24 @@ pub(crate) struct RenderJob {
     pub(crate) upscale: bool,
 }
 
+/// 取 `STATE` 锁并跑闭包。
+///
+/// **中毒不再静默哑火**（结构评审 §5.1-S2 / §6-1）：解开后照常继续，并记一行 error。
+/// 以前这里是 `.lock().ok()?`——持锁 panic 一次，之后**所有** `with_state` 都返回 `None`，
+/// 表现为"空格没反应、界面停在上一帧、托盘退出也点不动"，日志里却一个字都没有；
+/// 同一个仓库里 `last_hide_slot()` 用的又是 `into_inner`，两套策略并存。
+///
+/// 为什么敢带着中毒的状态继续：release 是 `panic = "abort"`，中毒只可能来自
+/// dev/测试里的 unwind；那种时候"状态可能差半个字段"比"整个界面哑掉"轻得多。
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
-    let mutex: MutexGuard<'_, State> = STATE.get()?.lock().ok()?;
-    let mut guard = mutex;
+    let mutex = STATE.get()?;
+    let mut guard = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log_error!(SCOPE, "STATE 锁已中毒（持锁 panic 过），取回继续");
+            poisoned.into_inner()
+        }
+    };
     Some(f(&mut guard))
 }
 

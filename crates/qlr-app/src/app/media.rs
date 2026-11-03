@@ -166,7 +166,7 @@ pub(crate) fn start_video(path: &Path) {
     with_state(|s| {
         s.video = Some(VideoPlay {
             stream,
-            last: Some(first),
+            last: Some(Arc::new(first)),
             anchor_pos_ms: 0,
             anchor_at: std::time::Instant::now(),
             playing: true,
@@ -215,19 +215,20 @@ pub(crate) fn video_position_ms() -> Option<u64> {
 
 /// 把当前这一帧贴到内容区（等比居中）。
 ///
-/// 直接在锁内画：`paint_bitmap_fit_window` 只做 GDI（GetDC/FillRect/StretchDIBits），
-/// 不会回调进 state；反过来先把 720p 帧拷一份（3.6MB）每帧一次反而更贵。
+/// **锁内只取一份 `Arc`，贴图在锁外做**（结构评审 §5.1-S5 / §7-1）：
+/// `paint_bitmap_fit_window` 只做 GDI、不会回调进 state，所以以前为了省一次拷贝
+/// 直接在锁里贴——但那一帧 720p 是 3.6 MB，`StretchDIBits` 搬它的这 1–3 ms 里
+/// 热键线程、渲染 worker、`--hide` 全都在等这把锁（播放时每秒几十次）。
+/// 现在 `last` 是 `Arc<RawFrame>`，锁内克隆只加一次引用计数，锁外贴完就放手。
 pub(crate) fn video_paint(hwnd: HWND) {
     let content = window::chrome_rects(window::client_rect(hwnd)).content;
     // 只贴"画面区"：底部那条进度条不归帧管，否则每帧都会把它擦掉。
     let area = window::picture_area(content);
-    let _ = with_state(|s| {
-        if let Some(v) = s.video.as_ref()
-            && let Some(f) = v.last.as_ref()
-        {
-            window::paint_bitmap_fit_window(hwnd, area, f.width, f.height, &f.bgra);
-        }
-    });
+    let Some(frame) = with_state(|s| s.video.as_ref().and_then(|v| v.last.clone())).flatten()
+    else {
+        return;
+    };
+    window::paint_bitmap_fit_window(hwnd, area, frame.width, frame.height, &frame.bgra);
 }
 
 /// 取帧定时器：追上"此刻应该显示的那一帧"，落后就跳帧（宁可丢帧也不放慢）。
@@ -251,7 +252,7 @@ pub(crate) fn video_tick(hwnd: HWND) {
                 break;
             };
             let ts = frame.ts_ms;
-            v.last = Some(frame);
+            v.last = Some(Arc::new(frame));
             painted = true;
             // 解到的帧已经追上目标时刻就不再往下解（剩下的时间留给上屏）。
             if ts + VIDEO_TICK_MS as u64 >= target {
@@ -297,7 +298,7 @@ pub(crate) fn video_toggle() -> bool {
         if !now_playing && v.duration_ms > 0 && pos + 200 >= v.duration_ms {
             // 已经到末尾了：再按 P 就是"重放"。
             let _ = v.stream.seek(0);
-            v.last = v.stream.next_frame();
+            v.last = v.stream.next_frame().map(Arc::new);
             v.anchor_pos_ms = 0;
         } else {
             v.anchor_pos_ms = pos;
@@ -350,7 +351,7 @@ pub(crate) fn video_seek(delta_ms: i64) -> bool {
             return false;
         }
         // 跳完立刻解一帧：不然画面还停在原处，看起来像"没生效"。
-        v.last = v.stream.next_frame();
+        v.last = v.stream.next_frame().map(Arc::new);
         v.anchor_pos_ms = target;
         v.anchor_at = std::time::Instant::now();
         true

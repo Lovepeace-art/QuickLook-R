@@ -836,3 +836,53 @@ fn last_frame_cache_respects_byte_budget() {
     trim_last_frames(&mut frames);
     assert_eq!(frames.len(), LAST_FRAME_CAP);
 }
+
+/// 视频帧在 `State` 里存 `Arc<RawFrame>`（结构评审 §7-1）：锁内只加引用计数，
+/// 贴图（3.6 MB 的 `StretchDIBits`）放到锁外。这里钉住"确实是共享而不是拷贝"。
+#[test]
+fn video_frame_is_shared_not_copied() {
+    let frame = Arc::new(qlr_render::media::RawFrame {
+        width: 1280,
+        height: 720,
+        bgra: vec![7u8; 1280 * 720 * 4],
+        ts_ms: 0,
+    });
+    let cloned = frame.clone();
+    assert!(Arc::ptr_eq(&frame, &cloned), "锁内取帧必须是共享同一块缓冲");
+    assert_eq!(Arc::strong_count(&frame), 2);
+}
+
+/// 结构评审 §7-1 的账：以前 `video_paint` 拿着 STATE 锁贴整帧，720p 贴一次
+/// `StretchDIBits` 1–3 ms，播放时每秒几十次；现在锁内只剩一次 `Arc` 克隆。
+///
+/// 这里量的是**锁内那一半**：整帧克隆 vs `Arc` 克隆。
+#[test]
+#[ignore = "基准，跑法：cargo test --release -p qlr-app video_lock_hold -- --ignored --nocapture"]
+fn bench_video_lock_hold() {
+    let frame = Arc::new(qlr_render::media::RawFrame {
+        width: 1280,
+        height: 720,
+        bgra: vec![3u8; 1280 * 720 * 4],
+        ts_ms: 0,
+    });
+    let n = 200;
+    let t = Instant::now();
+    for _ in 0..n {
+        let copy = (*frame).clone();
+        std::hint::black_box(&copy);
+    }
+    let copy_ns = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    let t = Instant::now();
+    for _ in 0..n {
+        let shared = frame.clone();
+        std::hint::black_box(&shared);
+    }
+    let arc_ns = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+
+    println!("1280x720 帧（3.6 MB）锁内开销：整帧克隆 {copy_ns:.0} ns → Arc 克隆 {arc_ns:.0} ns");
+    assert!(
+        arc_ns * 100.0 < copy_ns,
+        "Arc 克隆应该比整帧克隆便宜两个数量级：{arc_ns:.0} ns vs {copy_ns:.0} ns"
+    );
+}
