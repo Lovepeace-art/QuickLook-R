@@ -1,18 +1,32 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-03 · **1.8.3-fix**（批次一，未发版）：评审报告 7 项里收 5 项 + 1 项自加——
-> **扩展名不认识时的嗅探改成有界读**（`kind_for_path` 原本 `fs::read` 整个文件、只取前 512 B，
-> GB 级 `.iso` 改名成 `.xyz` 就能把内存顶满）；**热键级 2 判据从死代码变成真生效**
-> （`GetFocus` 线程亲和、钩子线程恒 NULL，改用 `GetGUIThreadInfo` 的 `hwndFocus`，Win11 桌面
-> F2 就地改名不再吞空格），并补上钩子 stop 事件句柄的 `CloseHandle`；**压缩包目录前缀只在
-> 新值时 `Box::leak`**（原本无条件 leak，连看 N 个压缩包进程内存线性涨）；**`PageCache` key
+> 更新时间：2026-11-03 · **1.8.3-fix**（批次二，未发版）：把"每次重来"的开销收掉——
+> **JPEG 按解码档位缓存**（滚一格不再重解码整张图；48MP 四档 367.6 → 78.1 ms、4K 170.0 → 90.5 ms）；
+> **PDF 文档单槽缓存**（一次预览原本把文件读 3 遍 + pdfium 解析 3 遍，现在只读一次，
+> `render_page` 3.22 → 1.25 ms）；**Markdown 排版按预算早停**（8 MB 首屏 356 → 16 ms）；
+> **HTML 隐藏元素一次扫描剥离**（8 MB 预处理 145 → 8.8 ms；HTML 故意不早停，
+> 否则状态行的"全文共 N 行"就不准了）；**缩放内循环去掉逐字节边界检查**
+> （4K 一档 51.4 → 46.1 ms、48MP 100.6 → 71.2 ms，逐字节基线不变）；
+> **新增 `alloc-stats` 特性量帧级分配**（默认不编：冷帧 65.7 MB / 热帧 5.6 MB）；
+> **`bench.ps1` 补 PeakPrivate / GDI-USER / 帧级分配三列 + GDI 泄漏判据 + `-Passes` 浸泡**
+> （4K 6 次开合 GDI 稳定 20，无泄漏）。
+> 回归：`cargo test` **290 passed / 9 ignored**、fmt/clippy 零输出、`cargo build --release` 通过；
+> `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**、`verify-archive.ps1` **11 PASS · 0 FAIL**、
+> `verify-pdf.ps1` **PASS**。明细见 §46；**200% 缩放视觉验收仍待用户真机**。
+>
+> <details><summary>1.8.3-fix 批次一（评审 7 项：收 5 项 + 自加 1 项，撤 1 项）</summary>
+>
+> **1.8.3-fix 批次一**：**扩展名不认识时的嗅探改成有界读**（`kind_for_path` 原本 `fs::read`
+> 整个文件、只取前 512 B，GB 级 `.iso` 改名成 `.xyz` 就能把内存顶满）；**热键级 2 判据从死代码
+> 变成真生效**（`GetFocus` 线程亲和、钩子线程恒 NULL，改用 `GetGUIThreadInfo` 的 `hwndFocus`，
+> Win11 桌面 F2 就地改名不再吞空格），并补上钩子 stop 事件句柄的 `CloseHandle`；**压缩包目录前缀
+> 只在新值时 `Box::leak`**（原本无条件 leak，连看 N 个压缩包进程内存线性涨）；**`PageCache` key
 > 补文件戳**（mtime+len，预览中文件被覆盖后不再显示旧页，对齐 CONVENTIONS #112）；
 > **`pack.ps1` 先生成 SHA256SUMS 再压缩**。评审建议的 `ShellPreview::close()` 的
 > `std::mem::forget` 方案**没有收**——那个方法零调用点，`forget` 反而会漏掉
-> `IPreviewHandler` 的 COM 引用。
-> 回归：`cargo test` **287 passed / 4 ignored**、fmt/clippy 零输出、`cargo build --release` 通过；
-> `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP = 管理员会话 UIPI 拒托盘图标，非回归）、
-> `verify-archive.ps1` **11 PASS · 0 FAIL**、`verify-pdf.ps1` **PASS**。明细见 §45。
+> `IPreviewHandler` 的 COM 引用。回归：`cargo test` **287 passed / 4 ignored**。
+>
+> </details>
 >
 > <details><summary>1.8.3 200% 缩放与空格偷按键</summary>
 >
@@ -1421,3 +1435,41 @@ Excel 预览的**滚轮**（钩子放行 / `WM_MOUSEWHEEL` / `WM_VSCROLL` / `VK_
 
 范围外（评审的批次二，未开工，也是真正影响体感的那部分）：JPEG 解码不进 `source_cache`、
 PDF 每次预览把全文件读 3 遍、md/html 全文排版、锁中毒三套策略。
+
+## §46 1.8.3-fix 批次二（把"每次重来"的开销收掉，7 个提交）
+
+评审报告 🔴 分组里**用户真能感觉到**的那部分。每项都先建 `#[ignore]` 基准、拿基线、再改。
+
+| # | 提交 | 改了什么 | 实测（release） |
+|---|------|----------|------------------|
+| 1 | `4352c0f` | JPEG 按**解码档位**缓存：`jpeg-decoder` 的 `scale()` 返回的实际解码尺寸当档位标签，`source_cache` 加 `Tag`；命中就只缩放不解码 | 4K 四档合计 170.0 → 90.5 ms（−47%）；48MP 367.6 → 78.1 ms（−79%） |
+| 2 | `a2a6439` | PDF **文档单槽缓存**：一次预览原本读盘 3 遍 + 解析 3 遍，现在只读一次（>256 MiB 不常驻） | `render_page` 3.22 → 1.25 ms；冷加载 0.54 ms / 命中槽 0.01 ms |
+| 3 | `d38506a` | Markdown **排版按预算早停**（`layout_capped`），`total_lines` 仍报源文件行数 | 8 MB / 29.7 万行，`head` 400 行 356.1 → 15.7 ms |
+| 4 | `c0af9f5` | HTML 隐藏元素**一次扫描剥离**（原来 13 个标签各扫全文件）+ `find_ci` 首字节粗筛 | 8 MB 预处理 145.0 → 8.8 ms；`head` 260.0 → 120.7 ms |
+| 5 | `f76e1ec` | 缩放内循环：整行切片 + `chunks_exact(4)` + 局部累加器（去掉逐字节边界检查） | 4K → 3178 51.4 → 46.1 ms；48MP → 3178 100.6 → 71.2 ms |
+| 6 | `58c53d2` | 新增 `alloc-stats` 特性：记账分配器 + `RENDERALLOC gen=N bytes=… live=…`（**默认不编**，不动 `RENDER` 行字段顺序） | 冷帧 65.7 MB / 热帧 5.6 MB（≈ 位图 5.4 MB）/ live 稳定 19.2 MB |
+| 7 | `57fdcb3` | `bench.ps1` 补 `PeakPrivateMB` / `GdiAfterHide` / `UserAfterHide` / `AllocKB` / `LiveKB`，加 GDI 泄漏判据与 `-Passes` 浸泡 | 4K 6 次开合 GDI 16 → 20 → 20…**无泄漏** |
+
+**故意没做的两件事**：
+
+- **HTML 不早停**：状态行的"全文共 N 行"是排版后的显示行数，排一半算不出准确值
+  （Markdown 报的是源文件行数，才不受影响）。几十毫秒不值得让界面开始撒谎。
+- **`RENDER` 行不加字段**：那行的字段顺序被 `bench.ps1` 的正则和现场 grep 依赖着，
+  帧级分配另起一行 `RENDERALLOC`。
+
+**留到下一批**：HTML 的 tokenize（还是整篇 33 ms，要流式词法）／帧缓存与内存预算闸门
+（STRUCTURE-REVIEW §6-7、§6-9）／持锁动窗口（§7-1）／几何单点化（§7-2）／PDF 页缩略图／
+文本 mmap／A1.6 第三四级兜底。
+
+验证：
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`：零输出
+  （`--features alloc-stats` 下 clippy 也零）。
+- `cargo test`：**290 passed / 9 ignored / 0 failed**（app 62、core 54、platform 33+3、
+  plugin-api 4、plugin-demo 7、plugin-office 11、render 109+6、fuzz 1、malformed 9）。
+  新增 5 个 `#[ignore]` 基准（`bench_jpeg_zoom_steps` / `bench_pdf_costs` / `bench_md_phases` /
+  `bench_html_phases` / `bench_downscale`）+ 1 个分配计数自测。
+- 端到端（release）：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**、`verify-archive.ps1` **11 PASS**、
+  `verify-pdf.ps1` **PASS**（SHOW 8ms / RENDER 2ms）。`verify-office.ps1` 未跑（本批不碰 Office）。
+- **必须人工确认**：200% 缩放下看 4K 图滚轮缩放、PDF 翻页、md/html 长文档首屏，
+  视觉与上一版一致（本批没动几何/DPI 逻辑，理论上不受影响，但没有真机视觉基线）。

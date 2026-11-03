@@ -2689,3 +2689,83 @@ Excel/Word 的预览是 **OLE 就地激活**对象：容器窗口不激活、焦
   翻页路径上；`SHOW 22ms` / `RENDER 5ms 619x876`、放大 0 残留）。
 - `verify-office.ps1` **未跑**：本批不碰 Office 路径，留到下次动 `IPreviewHandler` 时做防回归。
 
+
+## 2026-11-03 · 1.8.3-fix 批次二：把"每次重来"的开销收掉（7 个提交）
+
+### 做了什么
+
+评审报告的 🔴 分组里"真正影响体感"的那部分。每项都先量后改，数字都来自 release 构建。
+
+1. **JPEG 按解码档位缓存**（`4352c0f`）：`render_jpeg_scaled` 原本"窗口一变就重解码"——
+   JPEG 分支在 `render_via_image`（唯一带 `source_cache` 的路径）之前就 `return` 了。
+   现在用 `jpeg-decoder` 的 `scale()` 返回的**实际解码尺寸**当档位标签（`source_cache` 加
+   `Tag`，`lookup_tagged` / `store_tagged`；`lookup` / `store` 退化成 `TAG_FULL` 包装），
+   命中就只缩放、不碰解码器。是否可缓存按**解码后**像素数判定，所以 48MP 的 1/4、1/8 档也进得来。
+   命中与未命中走同一条 `finish_rgba` → 不会出现"缓存命中反而差一级色"。
+2. **PDF 文档单槽缓存**（`a2a6439`）：一次预览原来把整个文件读 3 遍、pdfium 解析 3 遍
+   （`natural_size` 取第 1 页尺寸开窗 + `page_count` 显示"第 x / N 页" + `render_page` 出图）。
+   现在只有一格文档槽，按路径 + mtime + 长度复用；文件变了整份换掉；>256 MiB 的特大文档不常驻
+   （用完即关，钉住整份文件比多读一次盘更伤内存）。
+3. **Markdown 排版按预算早停**（`d38506a`）：`head` 模式下原来排完全文再截到 `max_lines`。
+   现在 `layout_capped(lines, max_out)` 排满就停手（一行源文本最多产出 1 行显示文本，
+   所以"排到够"与"排完再截"结果完全一致）；`total_lines` 仍是源文件行数，状态行不受影响。
+4. **HTML 隐藏元素一次扫描剥离**（`c0af9f5`）：原来是 13 个标签各扫一遍全文件（`head` 单独一遍 +
+   script/style/noscript/… 各一遍），每次还复制一份 8 MB 新字符串。改成 `strip_hidden_all` 单遍：
+   遇 `<` 读标签名、命中就跳到闭标签之后（自闭合跳过、无闭标签时后面全算元素内部）。
+   顺带给 `find_ci` 加首字节粗筛——原来每个位置都调一次 `eq_ignore_ascii_case`。
+   **HTML 故意不早停**：状态行的"全文共 N 行"是排版后的显示行数，排一半就算不出准确值
+   （Markdown 报的是源文件行数，才不受影响）。
+5. **缩放内循环去掉逐字节边界检查**（`f76e1ec`）：JPEG 进缓存之后，剩余开销的大头变成缩放本身。
+   内层从"按下标逐通道取值"改成"整行切片 + `chunks_exact(4)` + 行内局部累加器"，
+   取整口径一个字没动（`downscale_matches_image_crate` 仍逐字节对拍 `image::imageops::thumbnail`）。
+6. **帧级分配计数**（`58c53d2`）：新增 `alloc-stats` 特性（默认不编、正式产物零开销），
+   开时换记账分配器并多打一行 `RENDERALLOC gen=N bytes=… live=…`。**不塞进 `RENDER` 行**——
+   那行的字段顺序被 `bench.ps1` 与现场 grep 依赖着。
+7. **`bench.ps1` 补三列 + GDI 泄漏判据 + `-Passes` 浸泡**（`57fdcb3`）：PeakPrivateMB、
+   GdiAfterHide/UserAfterHide（解析 app 的 `HIDE … GDI=n USER=n`）、AllocKB/LiveKB；
+   同一进程里连续开合，第 2 次起收起后对象数不得再涨（> 基线 + 2 判红）。
+
+### 为什么
+
+批次一收的是"平时看不见、踩到就难看"的坑；这一批才是用户能感觉到的：滚一格要重解码整张
+4K/48MP 图、翻一页 PDF 要重读整个文件、打开 8 MB 的 md/html 要排版全文。它们全在渲染热路径上，
+所以**每一项都先建 `#[ignore]` 基准、拿基线、再改**，改完再把新数字写进提交说明——
+不许拿评审报告的估算当实测。
+
+### 怎么验证的（数字）
+
+`cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出
+（`--features alloc-stats` 下 clippy 也是零）。`cargo test`：**290 passed / 9 ignored / 0 failed**
+（app 62、core 54、platform 33+3、plugin-api 4、plugin-demo 7、plugin-office 11、render 109+6、
+fuzz 1、malformed 9；新增 5 个 `#[ignore]` 基准与 1 个分配计数自测）。
+
+性能（release，每项都是同机同夹具的前后对比）：
+
+- **JPEG 缩放四档**（`bench_jpeg_zoom_steps`，1589 / 1986 / 3178 / 回到 1589）：
+  4K 3840x2160 合计 170.0 → 90.5 ms（−47%）；48MP 8000x6000 合计 367.6 → 78.1 ms（−79%）。
+  分档看，冷档 42–47 ms（4K）、147–197 ms（48MP）掉到 10–12 ms；几乎不缩的 3178 档仍有
+  46 ms（4K）——那部分是缩放本身，见下面的 `bench_downscale`。
+- **PDF 200 页合成夹具**（`bench_pdf_costs`）：`render_page` 3.22 → 1.25 ms（word 版 228 KB）、
+  2.77 → 1.38 ms（80 KB 版）；冷加载 0.54 ms、命中槽 0.01 ms。
+  合成夹具体量太小（最大的才 228 KB），真实几十 MB 扫描件的收益更大但仓库里没有这种夹具，未实测。
+- **Markdown 8 MB / 29.7 万行**（`bench_md_phases`）：`head` 400 行 356.1 → 15.7 ms（22.7×）、
+  `MAX_LINES` 353.1 → 240.2 ms；分阶段 fs::read 2.9 / decode 5.6 / split 5.7 / layout 全量 338 ms。
+- **HTML 8 MB / 23.4 万显示行**（`bench_html_phases`）：预处理 145.0 → 8.8 ms（16×）、
+  `layout` 全量 245.1 → 122.7 ms、`head` 400 行 260.0 → 120.7 ms；剩余开销是 tokenize 33 ms。
+- **缩放**（`bench_downscale`）：4K → 3178 51.4 → 46.1 ms、4K → 1986 28.3 → 21.6 ms、
+  1080p → 1589 12.7 → 11.5 ms、48MP → 3178 100.6 → 71.2 ms。
+- **帧级分配**（alloc-stats 构建，4K JPEG → 1986x1117 位图 5.4 MB）：冷帧分配 65.7 MB、
+  热帧 5.6 MB（≈ 位图本身），live 稳定 19.2 MB 不随帧数增长。
+- **GDI/USER 浸泡**（4K，6 次开合）：GDI 16 → 20 → 20 → 20 → 20 → 20，USER 15 → 16 → 16…
+  **没有 GDI 泄漏**——也反证批次一撤掉 `mem::forget` 是对的（那个泄漏本来只存在于死代码里）。
+
+端到端（release 构建，本机交互式会话）：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**
+（SKIP = 管理员会话 UIPI 拒托盘图标）、`verify-archive.ps1` **11 PASS · 0 FAIL**、
+`verify-pdf.ps1` **PASS**（SHOW 8ms / RENDER 2ms）。
+
+### 留给下一批
+
+- HTML 的 tokenize 仍是整篇 33 ms（要再快得改成流式词法）；
+- 帧缓存/内存预算闸门（STRUCTURE-REVIEW §6-7、§6-9）、持锁动窗口（§7-1）、几何单点化（§7-2）；
+- PDF 页缩略图、文本 mmap、A1.6 第三/四级兜底；
+- **200% 缩放的视觉验收仍待用户真机**（本批没动任何几何/DPI 逻辑，理论上不受影响）。

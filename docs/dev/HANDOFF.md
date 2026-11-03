@@ -520,8 +520,56 @@ CI 里加 `verify-*.ps1`（需要 Windows runner + Office）。
   1. 嗅探：把几 GB 的 `.iso`/`.vhdx` 改名成 `.xyz` 后按空格——应提示"不支持"，任务管理器内存不飙升。
   2. 热键（Win11）：桌面选中文件按 `F2` 进入就地重命名，再按空格——应能打出空格；
      看 `app.log` 里 `passed_text_focus=` 与 `text_focus_level=`（**小写**，2 = 走类名兜底那条新生效的判据）。
-- **下一步（评审的批次二，未开工）**：JPEG 解码入 `source_cache` + PDF/视频缩放统一 `downscale_exact`
+- **下一步（评审的批次二）**：JPEG 解码入 `source_cache` + PDF/视频缩放统一 `downscale_exact`
   （同一处代码，一个提交）→ PDF 文档单槽缓存 → md/html 排版早停。这几项才是用户体感的那部分
   （4K JPEG 每档重解码、30MB PDF 每页重读全文件），且都在渲染热路径上，**必须每步带基线**。
+  ——**已完成，见下一节「1.8.3-fix 批次二接力说明」。**
 - **文档口径提醒**：本文件上面 1.8.3 节里写的 "期望 264 passed" 是发布当时的数字，实测基线已是 286，
   以本节为准。
+
+
+## 1.8.3-fix 批次二接力说明（2026-11-03）
+
+- **分支**：还是 `fix/1.8.3-batch1`（批次一 + 批次二都在上面，共 15 个提交，`71999be` 快进）。
+  批次二 7 个提交：`4352c0f` JPEG 档位缓存 → `a2a6439` PDF 单槽缓存 → `d38506a` Markdown 早停 →
+  `c0af9f5` HTML 单遍剥离 → `f76e1ec` 缩放内循环 → `58c53d2` 帧级分配计数 → `57fdcb3` bench 度量。
+- **这批是什么**：评审报告 🔴 分组里"每次重来都付一遍"的开销。数字与口径见 `LOG.md` 2026-11-03
+  批次二条目、`STATUS.md` §46。**每项都是先加 `#[ignore]` 基准、拿到基线、再改、再量**，
+  没有一项是"看起来更快"。
+- **回归命令**（数字是批次二之后的口径）：
+  ```powershell
+  cargo fmt --all -- --check                  # 零输出
+  cargo clippy --all-targets -- -D warnings   # 零输出
+  cargo test                                  # 期望 290 passed / 9 ignored（9 = 5 个基准 + 原有）
+  cargo build --release
+  pwsh -File scripts\smoke.ps1                # 16 PASS / 1 SKIP（管理员会话 UIPI）
+  pwsh -File scripts\verify-archive.ps1       # 11 PASS · 0 FAIL
+  pwsh -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_8page.pdf   # PASS
+  pwsh -File scripts\bench.ps1 -Passes 2      # 需要交互式桌面；看 GdiAfterHide 有没有涨
+  ```
+  基准（都要夹具，`$env:QLRUST_FIXTURES` 指 `spike\fixtures`，`$env:QLR_BENCH_PDF` 指 PDF，
+  `$env:QLRUST_PDFIUM` 指 `target\release\pdfium.dll`）：
+  ```powershell
+  cargo test --release -p qlr-render --lib bench_jpeg_zoom_steps -- --ignored --nocapture
+  cargo test --release -p qlr-render --lib bench_downscale      -- --ignored --nocapture
+  cargo test --release -p qlr-render --lib bench_pdf_costs      -- --ignored --nocapture
+  cargo test --release -p qlr-render --lib bench_md_phases      -- --ignored --nocapture
+  cargo test --release -p qlr-render --lib bench_html_phases    -- --ignored --nocapture
+  ```
+- **`alloc-stats` 特性怎么用**（默认不编，不影响发版体积）：
+  `cargo build --release --features alloc-stats`，然后看 `app.log` 里的
+  `RENDERALLOC gen=N bytes=… live=…`（`bytes` = 这一帧总共分配，`live` = 当前存活）。
+  冷帧 65.7 MB / 热帧 5.6 MB / live 19.2 MB 是 4K 图的参考值。
+- **两个故意的取舍**（下次不要"顺手改回去"）：
+  1. HTML 不早停——状态行的"全文共 N 行"是排版后的显示行数，早停就算不出来。
+     想省这几十毫秒得先改成流式词法（tokenize 现在整篇 33 ms）。
+  2. `RENDER` 行不加字段——`bench.ps1` 正则在依赖它；帧级分配另起 `RENDERALLOC` 行。
+- **必须人工确认**（自动化测不出来）：200% 缩放下滚轮缩放 4K JPEG、来回翻 PDF 页、
+  打开 8 MB 的 md/html 看首屏——视觉应与上一版完全一致（本批没动几何/DPI）。
+- **下一步（建议顺序）**：
+  1. STRUCTURE-REVIEW §7-1「持锁动窗口」（`hide_preview`/`video_paint` 改成锁内取句柄→放锁→动窗口），
+     P0，和 `UISTALL 2721ms` 那条现场日志直接相关；
+  2. §6-9 内存总预算闸门（pagecache 64 MiB + 帧缓存 + 预热统一 Budget；现在全是加法，
+     最坏能到近 500 MB）；
+  3. HTML 流式词法（tokenize 33 ms 是 md/html 里最后一块大数）；
+  4. §6-10 `verify-layers.ps1` 分层断言（最便宜，能防 `qlr-render` 反向依赖 `qlr-app`）。
