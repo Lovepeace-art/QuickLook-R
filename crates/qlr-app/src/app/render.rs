@@ -313,6 +313,11 @@ pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64)
                 }
                 // 内置查看器优先；内置不接的格式才问插件（"插件只补空缺，不抢内置"）。
                 let kind = format::kind_for_path(&job.path);
+                // 帧级分配计数（只有 `--features alloc-stats` 才有这行代码）。
+                // `bytes=` 报的是位图大小，报不出这一帧总共分配了多少 —— 缩放中间缓冲、
+                // 文本布局字符串、Vec 扩容都在里面，量出来才知道"每帧重建"值不值得优化。
+                #[cfg(feature = "alloc-stats")]
+                let alloc_before = crate::alloc_stats::total_allocated();
                 let result = if qlr_render::viewer_for(kind).is_some() {
                     qlr_render::render_file_at_zoom(
                         &job.path,
@@ -325,6 +330,16 @@ pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64)
                     render_with_plugin(&job.path, kind, job.max_width, job.max_height)
                 };
                 let elapsed = started.elapsed().as_millis();
+                // 单独一行而不是塞进 RENDER：RENDER 的字段顺序被日志解析（bench.ps1、
+                // 现场 grep）依赖着，多插一个字段就会让老正则错位。
+                #[cfg(feature = "alloc-stats")]
+                log_info!(
+                    SCOPE,
+                    "RENDERALLOC gen={} bytes={} live={}",
+                    job.generation,
+                    crate::alloc_stats::total_allocated().saturating_sub(alloc_before),
+                    crate::alloc_stats::live_bytes()
+                );
                 match &result {
                     Ok(canvas) => log_info!(
                         SCOPE,

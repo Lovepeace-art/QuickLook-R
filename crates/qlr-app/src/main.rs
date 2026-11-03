@@ -12,6 +12,15 @@ mod layout;
 mod pagecache;
 mod settings;
 
+// 帧级分配计数：只有 `--features alloc-stats` 时才编进来（默认零开销）。
+// 开了之后全局分配器换成记账版本，`RENDER` 旁边会多一行 `RENDERALLOC`。
+#[cfg(feature = "alloc-stats")]
+mod alloc_stats;
+
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static ALLOC: alloc_stats::Counting = alloc_stats::Counting;
+
 fn main() -> std::process::ExitCode {
     app::run()
 }

@@ -10,6 +10,12 @@ description = "QLRust 可执行体：消息泵、托盘、预览窗口编排"
 name = "qlrust"
 path = "src/main.rs"
 
+[features]
+# 帧级分配计数（见 src/alloc_stats.rs）。默认关闭：正式产物不替换全局分配器，
+# 热路径不多一条指令。要看数字时单独构建一份：
+#   cargo build --release -p qlr-app --target-dir target\alloc-stats --features alloc-stats
+alloc-stats = []
+
 [dependencies]
 qlr-core.workspace = true
 qlr-platform.workspace = true
