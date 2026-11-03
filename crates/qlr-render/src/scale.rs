@@ -78,23 +78,29 @@ fn downscale_exact(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Bitmap {
         for y in lo as usize..hi as usize {
             let line = &src[y * sw * 4..(y + 1) * sw * 4];
             // 逐源像素累加到它所属的输出列：列区间是划分，所以每个源像素只加一次。
-            for (dx, &(cl, cr)) in cols.iter().enumerate() {
-                let mut r = 0u32;
-                let mut g = 0u32;
-                let mut b = 0u32;
-                let mut a = 0u32;
-                for x in cl as usize..cr as usize {
-                    let o = x * 4;
-                    r += line[o] as u32;
-                    g += line[o + 1] as u32;
-                    b += line[o + 2] as u32;
-                    a += line[o + 3] as u32;
+            //
+            // 累加写成"整行切片 + chunks_exact(4) + 行内局部累加器"而不是按下标取
+            // 4 个字节：下标版本每读一个通道都要过一次边界检查，8 MP 的图上就是
+            // 几千万次。实测（release）：
+            //   4K → 3178   51.4 → 46.1 ms      4K → 1986   28.3 → 21.6 ms
+            //   1080p → 1589 12.7 → 11.5 ms     48MP → 3178  100.6 → 71.2 ms
+            // 纯标量，没有手写 SIMD；取整口径没动，逐字节基线仍由
+            // `downscale_matches_image_crate` 钉住。
+            let mut out = sums.chunks_exact_mut(4);
+            for &(cl, cr) in &cols {
+                let band = &line[cl as usize * 4..cr as usize * 4];
+                let mut acc = [0u32; 4];
+                for px in band.chunks_exact(4) {
+                    acc[0] += px[0] as u32;
+                    acc[1] += px[1] as u32;
+                    acc[2] += px[2] as u32;
+                    acc[3] += px[3] as u32;
                 }
-                let s = dx * 4;
-                sums[s] += r;
-                sums[s + 1] += g;
-                sums[s + 2] += b;
-                sums[s + 3] += a;
+                let sum = out.next().expect("输出列数与 sums 等长");
+                sum[0] += acc[0];
+                sum[1] += acc[1];
+                sum[2] += acc[2];
+                sum[3] += acc[3];
             }
         }
         // 与 `thumbnail_sample_block` 同一套取整：n = 列数 × 行数，round = n/2。
@@ -258,5 +264,40 @@ mod tests {
         // 缓冲长度与尺寸对不上（解码器给了半张图）也不能读越界。
         assert!(scale_rgba_to_bgra(&src[..12], 100, 50, 10, 10).is_none());
         assert!(scale_rgba_to_bgra(&[], 0, 0, 10, 10).is_none());
+    }
+
+    /// 手测用（CI 不跑）：缩放本身的耗时——预览里"每滚一格"都要付这笔钱，
+    /// JPEG 解码进缓存之后它就是剩余开销的大头。
+    ///
+    /// ```text
+    /// cargo test --release -p qlr-render --lib bench_downscale -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_downscale() {
+        use std::time::Instant;
+        for (label, sw, sh, dw, dh) in [
+            (
+                "4K → 1.25 倍档（最坏情况，几乎不缩）",
+                3840u32,
+                2160u32,
+                3178u32,
+                1788u32,
+            ),
+            ("4K → 适应窗口", 3840, 2160, 1986, 1118),
+            ("1080p → 适应窗口", 1920, 1080, 1589, 894),
+            ("48MP → 1.25 倍档", 8000, 6000, 3178, 1788),
+        ] {
+            let src = sample(sw, sh);
+            // 跑两遍取第二遍：第一遍要把源缓冲读进缓存。
+            let mut best = f64::MAX;
+            for _ in 0..2 {
+                let t = Instant::now();
+                let out = scale_rgba_to_bgra(&src, sw, sh, dw, dh).expect("缩小路");
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(out);
+            }
+            println!("{label}: {sw}x{sh} → {dw}x{dh}  {best:.1} ms");
+        }
     }
 }
