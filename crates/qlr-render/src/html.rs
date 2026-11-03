@@ -57,6 +57,9 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
     let (src, encoding) = text::decode(&bytes);
 
     let (mut lines, mut styles) = layout(&src);
+    // 这里**不能**学 Markdown 那样"排到预算就停"：状态行要显示"全文共 N 行"，
+    // 而 HTML 的 N 是排版后的显示行数，早停就再也算不出准确值（Markdown 报的是
+    // 源文件行数，不受影响）。省下的那几十毫秒不值得在界面上撒谎。
     let total_lines = lines.len();
 
     // 截断策略与纯文本/Markdown 一致：超预算就砍，砍哪一头看 `head`。
@@ -84,7 +87,7 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
 
 /// HTML 源码 → 「(显示文本, 样式)」。纯函数，测试直接打这个。
 pub fn layout(src: &str) -> (Vec<String>, Vec<LineStyle>) {
-    let stripped = strip_comments(&strip_hidden(&strip_hidden(src, "head"), ""));
+    let stripped = strip_comments(&strip_hidden_all(src));
     let mut builder = Builder::default();
     for token in tokenize(&stripped) {
         match token {
@@ -110,63 +113,74 @@ pub fn plain_text(src: &str) -> String {
 ///
 /// `tag` 传空串时表示"把所有隐藏元素都剥一遍"。整段剥掉（而不是解析后挑着走）
 /// 是因为脚本/CSS 里天然带 `<`、`>`、`//`，让 tokenizer 去硬扛只会自找苦吃。
-fn strip_hidden(src: &str, only: &str) -> String {
-    let tags: &[&str] = if only.is_empty() {
-        &[
-            "script", "style", "noscript", "template", "iframe", "svg", "canvas", "object",
-            "embed", "video", "audio", "select",
-        ]
-    } else {
-        std::slice::from_ref(&only)
-    };
-    let mut out = src.to_string();
-    for tag in tags {
-        out = strip_element(&out, tag);
-    }
-    out
-}
+/// 内容不显示的这些元素（连内容一起丢），`head` 也在里面。
+const HIDDEN_TAGS: &[&str] = &[
+    "head", "script", "style", "noscript", "template", "iframe", "svg", "canvas", "object",
+    "embed", "video", "audio", "select",
+];
 
-fn strip_element(src: &str, tag: &str) -> String {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}");
+/// 一次扫描剥掉所有隐藏元素（含内容）。
+///
+/// 为什么是"一次"：1.8.3 是每个标签各扫一遍全文件 —— 13 个标签 × 8 MB 的
+/// 大小写不敏感查找，实测 8 MB 的 HTML 光这一步就要 145 ms，而屏幕上一屏
+/// 只显示开头几十行。现在只走一遍：遇 `<` 读标签名，命中 [`HIDDEN_TAGS`]
+/// 就整段跳到对应闭标签之后。
+///
+/// 语义与"逐标签剥"一致：先出现的外层元素先把整段吃掉，所以 `<svg>` 里的
+/// `<script>` 不必单独处理。只有开标签没有闭标签时，后面的内容全算该元素
+/// 内部（浏览器也是这个行为）。
+fn strip_hidden_all(src: &str) -> String {
+    let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(i) = find_ci(rest, &open) else {
-            out.push_str(rest);
-            return out;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let Some(off) = src[i..].find('<').map(|k| i + k) else {
+            break;
         };
-        // 标签名必须有边界：`<scriptx>` 不是 `<script>`
-        let boundary = rest
-            .as_bytes()
-            .get(i + open.len())
-            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
-        if !boundary {
-            out.push_str(&rest[..i + 1]);
-            rest = &rest[i + 1..];
-            continue;
+        // 读标签名（`<` 后面紧跟的字母数字），判断是不是隐藏元素。
+        let name_start = off + 1;
+        let mut j = name_start;
+        while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+            j += 1;
         }
-        out.push_str(&rest[..i]);
-        // 自闭合 `<script/>`：整段就是一个标签
-        let head_end = find_ci(&rest[i..], ">")
-            .map(|k| i + k + 1)
-            .unwrap_or(rest.len());
-        if rest[i..head_end].trim_end().ends_with("/>") {
-            rest = &rest[head_end..];
-            continue;
-        }
-        match find_ci(&rest[i..], &close) {
-            // 只有开标签没有闭标签：后续内容全部算作该元素内部（浏览器也是这个行为）
-            None => return out,
-            Some(j) => {
-                let after = &rest[i + j..];
-                let end = find_ci(after, ">")
-                    .map(|k| i + j + k + 1)
-                    .unwrap_or(rest.len());
-                rest = &rest[end..];
+        if j > name_start {
+            let name = &src[name_start..j];
+            if let Some(tag) = HIDDEN_TAGS.iter().find(|t| name.eq_ignore_ascii_case(t)) {
+                // 标签名必须有边界：`<scriptx>` 不是 `<script>`
+                let bounded = bytes
+                    .get(j)
+                    .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
+                if bounded {
+                    let open_end = find_ci(&src[j..], ">")
+                        .map(|k| j + k + 1)
+                        .unwrap_or(bytes.len());
+                    // 自闭合 `<script/>`：整段就是一个标签，内容本来就没有
+                    if !src[off..open_end].trim_end().ends_with("/>") {
+                        let close = format!("</{tag}");
+                        let Some(k) = find_ci(&src[open_end..], &close) else {
+                            // 没有闭标签：后面的内容都算元素内部
+                            out.push_str(&src[copied..off]);
+                            return out;
+                        };
+                        let close_at = open_end + k;
+                        let end = find_ci(&src[close_at..], ">")
+                            .map(|m| close_at + m + 1)
+                            .unwrap_or(bytes.len());
+                        out.push_str(&src[copied..off]);
+                        copied = end;
+                        i = end;
+                        continue;
+                    }
+                }
             }
         }
+        i = off + 1;
     }
+
+    out.push_str(&src[copied..]);
+    out
 }
 
 /// 去掉 `<!-- … -->`。
@@ -193,7 +207,18 @@ fn find_ci(hay: &str, needle: &str) -> Option<usize> {
     if n.is_empty() || h.len() < n.len() {
         return None;
     }
-    (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
+    // 先按首字节粗筛，再比对整串：8 MB 的文件里绝大多数位置第一个字节就对不上，
+    // 原来每个位置都调一次 eq_ignore_ascii_case，白花了十几倍的时间。
+    let first = n[0];
+    let first_upper = first.to_ascii_uppercase();
+    let last = h.len() - n.len();
+    for i in 0..=last {
+        let b = h[i];
+        if (b == first || b == first_upper) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,5 +1035,81 @@ mod tests {
         assert!(text.contains("QLRust 预览文档"));
         assert!(text.contains("• 第一项"));
         assert!(!text.contains("console"));
+    }
+
+    /// 手测用（CI 不跑）：8 MB 的 HTML 各阶段耗时，用来判断"排版早停"值不值得做。
+    ///
+    /// ```text
+    /// cargo test --release -p qlr-render --lib bench_html_phases -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_html_phases() {
+        use std::time::Instant;
+        // 不用 temp_dir()：本机 TEMP 在受限会话里可能不可写（实测拒绝访问）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("bench-text");
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let path = dir.join("big.html");
+        if !path.exists() {
+            let mut s = String::with_capacity(8 * 1024 * 1024 + 4096);
+            let mut n = 0usize;
+            while s.len() < 8 * 1024 * 1024 {
+                s.push_str(&format!(
+                    "<h2>第 {n} 节</h2>\n<p>普通段落，混一点中文与 English，长度接近真实文档的一行，带 <b>粗体</b> 与 <i>斜体</i> 与 <a href=\"https://example.com/{n}\">链接</a>。</p>\n<ul><li>列表项一</li><li>列表项二</li></ul>\n"
+                ));
+                n += 1;
+            }
+            std::fs::write(&path, &s).expect("写夹具");
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+        let t = Instant::now();
+        let bytes = std::fs::read(&path).expect("读夹具");
+        println!(
+            "文件 {} KB，fs::read {:.1} ms",
+            bytes.len() / 1024,
+            ms(t.elapsed())
+        );
+
+        let t = Instant::now();
+        let (src, _encoding) = crate::text::decode(&bytes);
+        println!("decode {:.1} ms", ms(t.elapsed()));
+
+        let t = Instant::now();
+        let pre = strip_comments(&strip_hidden_all(&src));
+        println!("预处理（head/script/style/注释）{:.1} ms", ms(t.elapsed()));
+
+        let t = Instant::now();
+        let tokens = tokenize(&pre);
+        println!(
+            "tokenize {} 个 token，{:.1} ms",
+            tokens.len(),
+            ms(t.elapsed())
+        );
+
+        let t = Instant::now();
+        let (lines, _styles) = layout(&src);
+        println!(
+            "layout 全量 {:.1} ms → {} 显示行",
+            ms(t.elapsed()),
+            lines.len()
+        );
+
+        for limit in [MAX_LINES, 400] {
+            let t = Instant::now();
+            let canvas = render_with(&path, true, READ_LIMIT, limit).expect("渲染");
+            let n = match canvas {
+                Canvas::Text(doc) => doc.lines.len(),
+                _ => 0,
+            };
+            println!(
+                "render_with(head=true, {limit} 行) {:.1} ms → {n} 行",
+                ms(t.elapsed())
+            );
+        }
     }
 }
