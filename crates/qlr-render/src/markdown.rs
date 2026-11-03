@@ -49,10 +49,17 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
     }
     let total_lines = raw.len();
 
-    let (mut lines, mut styles) = layout(&raw);
+    // `head` 模式排到 max_lines 就停手：后面的行本来也要被截掉。
+    // 尾对齐模式（`head == false`）没这个便宜可占 —— 要看结尾就得把全文排完。
+    let (mut lines, mut styles, capped) = if head {
+        layout_capped(&raw, max_lines)
+    } else {
+        let (lines, styles) = layout(&raw);
+        (lines, styles, false)
+    };
 
     // 截断策略与纯文本一致：超预算就砍，砍哪一头看 `head`。
-    let truncated_lines = lines.len() > max_lines;
+    let truncated_lines = capped || lines.len() > max_lines;
     if truncated_lines {
         if head {
             lines.truncate(max_lines);
@@ -115,11 +122,26 @@ pub fn outline(lines: &[String], styles: &[LineStyle]) -> Vec<TocEntry> {
 /// 代码块内部保留原样（`**` 在代码里就是字面上的两个星号）；
 /// 其余行都过一遍 `inline()`，去掉行内标记。
 pub fn layout(lines: &[&str]) -> (Vec<String>, Vec<LineStyle>) {
-    let mut out_text = Vec::with_capacity(lines.len());
-    let mut out_style = Vec::with_capacity(lines.len());
+    let (texts, styles, _capped) = layout_capped(lines, usize::MAX);
+    (texts, styles)
+}
+
+/// 排版，但产出满 `max_out` 行就停手。返回「(文本, 样式, 是否被截住)」。
+///
+/// 存在的理由：8 MB 的 Markdown 排完 29 万行要 338 ms，而屏幕上一屏几十行、
+/// `MAX_LINES` 也只要 20 万行——`head` 模式下后面的行反正要被 `truncate` 掉，
+/// 排它们纯属白干。一行源文本最多产出 1 行显示文本（围栏标记行产出 0 行），
+/// 所以在循环开头判断"已经够了"与"排完再截"结果完全一致。
+fn layout_capped(lines: &[&str], max_out: usize) -> (Vec<String>, Vec<LineStyle>, bool) {
+    let mut out_text = Vec::with_capacity(lines.len().min(max_out));
+    let mut out_style = Vec::with_capacity(lines.len().min(max_out));
     let mut in_fence = false;
 
     for raw in lines {
+        if out_text.len() >= max_out {
+            return (out_text, out_style, true);
+        }
+
         let line = raw.trim_end();
 
         if is_fence(line) {
@@ -156,7 +178,7 @@ pub fn layout(lines: &[&str]) -> (Vec<String>, Vec<LineStyle>) {
         out_style.push(style);
     }
 
-    (out_text, out_style)
+    (out_text, out_style, false)
 }
 
 /// 列表项里的任务框：`[ ] 待办` → `☐ 待办`、`[x] 已完成` → `☑ 已完成`。
@@ -643,6 +665,74 @@ mod tests {
                 assert_eq!(doc.total_lines, 7); // 统计的是源文件行数（尾换行不多算一行）
             }
             _ => panic!("markdown 应该产出 Text"),
+        }
+    }
+
+    /// 手测用（CI 不跑）：8 MB 的 Markdown 各阶段耗时，用来判断"排版早停"值不值得做。
+    ///
+    /// ```text
+    /// cargo test --release -p qlr-render --lib bench_md_phases -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_md_phases() {
+        use std::time::Instant;
+        // 不用 temp_dir()：本机 TEMP 在受限会话里可能不可写（实测拒绝访问）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("bench-text");
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("big.md");
+        if !path.exists() {
+            let mut s = String::with_capacity(8 * 1024 * 1024 + 4096);
+            let mut n = 0usize;
+            while s.len() < 8 * 1024 * 1024 {
+                s.push_str(&format!(
+                    "## 第 {n} 节\n\n- 列表项 **粗体** 与 *斜体* 与 `代码`\n- 另一项 [链接](https://example.com/{n})\n\n普通段落，混一点中文与 English，长度接近真实文档的一行。\n\n"
+                ));
+                n += 1;
+            }
+            std::fs::write(&path, &s).expect("写夹具");
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+        let t = Instant::now();
+        let bytes = std::fs::read(&path).expect("读夹具");
+        println!(
+            "文件 {} KB，fs::read {:.1} ms",
+            bytes.len() / 1024,
+            ms(t.elapsed())
+        );
+
+        let t = Instant::now();
+        let (src, _encoding) = crate::text::decode(&bytes);
+        println!("decode {:.1} ms", ms(t.elapsed()));
+
+        let t = Instant::now();
+        let raw: Vec<&str> = src.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+        println!("split {} 行 {:.1} ms", raw.len(), ms(t.elapsed()));
+
+        let t = Instant::now();
+        let (lines, _styles) = layout(&raw);
+        println!(
+            "layout 全量 {:.1} ms → {} 显示行",
+            ms(t.elapsed()),
+            lines.len()
+        );
+
+        for limit in [MAX_LINES, 400] {
+            let t = Instant::now();
+            let canvas = render_with(&path, true, READ_LIMIT, limit).expect("渲染");
+            let n = match canvas {
+                Canvas::Text(doc) => doc.lines.len(),
+                _ => 0,
+            };
+            println!(
+                "render_with(head=true, {limit} 行) {:.1} ms → {n} 行",
+                ms(t.elapsed())
+            );
         }
     }
 }
