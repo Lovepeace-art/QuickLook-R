@@ -27,13 +27,14 @@ use std::thread::JoinHandle;
 use qlr_core::keymap::{Action, Binding};
 use qlr_core::{log_debug, log_error, log_info, log_warn};
 use windows::Win32::Foundation::{
-    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
     VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
@@ -223,7 +224,9 @@ pub fn foreground_is_shell() -> bool {
 /// 两级判据，从便宜到贵：
 /// 1. `GetGUIThreadInfo(0, ...)`（0 = 前台线程）看 `hwndCaret` / `GUI_CARETBLINKING`；
 /// 2. Win11 桌面的就地重命名可能是 DirectUI 自绘、拿不到 `hwndCaret`，退一步看
-///    **焦点窗口类名**——但只认真正的编辑框类，绝不放 `DirectUIHWND`/`SysListView32`
+///    **焦点窗口类名**（`GetGUIThreadInfo` 的 `hwndFocus`，跨线程有效；不能用
+///    `GetFocus`——它是线程亲和的，钩子线程上恒返回 NULL，等于死代码）——但只认
+///    真正的编辑框类，绝不放 `DirectUIHWND`/`SysListView32`
 ///    （那两个在资源管理器里永远处于焦点，会把所有预览都禁掉）。
 ///
 /// 钩子里调用，必须快且**绝不阻塞**：`GetGUIThreadInfo` 读的是内核侧共享数据，
@@ -237,15 +240,17 @@ fn foreground_is_text_entry() -> bool {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
-        if GetGUIThreadInfo(0, &mut gti).is_ok() && !gti.hwndCaret.is_invalid() {
+        let gti_ok = GetGUIThreadInfo(0, &mut gti).is_ok();
+        if gti_ok && !gti.hwndCaret.is_invalid() {
             TEXT_FOCUS_LEVEL.store(1, Ordering::Relaxed);
             return true;
         }
-        // 级 2：焦点窗口类名（只认编辑框）。
-        let focus = GetFocus();
-        if !focus.is_invalid() {
+        // 级 2：焦点窗口类名（只认编辑框）。必须用 `gti.hwndFocus`：
+        // `GetFocus` 是线程亲和的（只返回挂在本线程消息队列上的焦点窗口），
+        // 钩子线程没有任何窗口，用它恒为 NULL——级 2 曾因此整体失效。
+        if gti_ok && !gti.hwndFocus.is_invalid() {
             let mut buf = [0u16; 64];
-            let n = GetClassNameW(focus, &mut buf);
+            let n = GetClassNameW(gti.hwndFocus, &mut buf);
             if n > 0 {
                 let name = String::from_utf16_lossy(&buf[..n as usize]);
                 if matches!(
@@ -314,6 +319,14 @@ impl HotkeyGuard {
             match thread.join() {
                 Ok(()) => log_info!(SCOPE, "钩子线程已退出"),
                 Err(_) => log_error!(SCOPE, "钩子线程 panic"),
+            }
+            // stop 事件句柄在 join 之后关（线程还等着它）；关一次就清零，
+            // 重复 stop（thread 已 None）不会再碰已关闭的句柄。
+            if self.stop != 0 {
+                unsafe {
+                    let _ = CloseHandle(HANDLE(self.stop as *mut core::ffi::c_void));
+                }
+                self.stop = 0;
             }
         }
     }
@@ -437,6 +450,10 @@ pub fn start(notify: HWND, notify_msg: u32) -> windows::core::Result<HotkeyGuard
         .spawn(move || hook_thread(HANDLE(stop_raw as *mut core::ffi::c_void), ready_tx))
         .map_err(|e| {
             log_error!(SCOPE, "创建钩子线程失败：{e}");
+            // spawn 失败时 stop 事件还没人引用，不关就是纯泄漏。
+            unsafe {
+                let _ = CloseHandle(stop);
+            }
             windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
         })?;
 
