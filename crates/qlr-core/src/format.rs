@@ -280,10 +280,14 @@ pub fn kind_for_path(path: &Path) -> Kind {
     }
     // 扩展名不认识：读个头看看。读不到就当不支持 —— "猜成文本"会造成
     // 把 exe 渲染成一屏乱码，比明确说不支持更糟。
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let head = &bytes[..bytes.len().min(SNIFF_LEN)];
-            sniff(head).unwrap_or(Kind::Unsupported)
+    // 有界读：`sniff` 只看头部，曾经 `fs::read` 全量读进内存却只用前 512 字节，
+    // 几 GB 的镜像/磁盘文件会把内存峰值顶到文件大小。
+    use std::io::Read as _;
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let mut buf = [0u8; SNIFF_LEN];
+            let n = file.read(&mut buf).unwrap_or(0);
+            sniff(&buf[..n]).unwrap_or(Kind::Unsupported)
         }
         Err(_) => Kind::Unsupported,
     }
