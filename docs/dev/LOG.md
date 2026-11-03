@@ -2898,3 +2898,57 @@ release，8 MB HTML → 233638 显示行，各阶段取 3 遍最好：
   233638 行 ≈ 56 ms）：要么改成"一个可复用缓冲拼好再 push"，要么让 `clip` 就地截断。
 - Markdown 侧同样有 `layout` 全量 240 ms 的余量（早停只解决首屏）。
 - §6-6 折行结果缓存、§6-7 `PaintBuffer` 复用（先各加一条基准再决定做不做）。
+
+## 2026-11-03 · 1.8.3-fix 批次四：滚一下卡在哪（折行量宽 + HTML 每行分配）
+
+### 做了什么
+
+两项（提交 `820994f`、`69b9d1a`）：
+
+- `crates/qlr-render/src/html.rs`：`emit_line`/`flush` 每行 3–4 次分配改成一次——字段级借用
+  分离替代 `mem::take` + `trim().to_string()`，新增 `clip_line(prefix, text)` 一次
+  `with_capacity` 拼装（截断语义与 `text::truncate_chars` 逐字符对齐，单测对拍），
+  `emit_row` 的 `join(" │ ")` 改成循环 `push_str`。
+- 折行两层：`crates/qlr-render/src/wrap.rs` 的 `fit_prefix` 从"逐字符累加宽度"改成**二分**；
+  新增 `crates/qlr-app/src/wrapcache.rs`（按 `(行号, 样式)` 缓存折行结果，512 条，
+  换宽度/换文件即清空），`chrome.rs` 绘制循环先查缓存再折。
+- `crates/qlr-app/src/app/chrome.rs`：绘制循环补折行计时与量宽计数，`WRAP` 行追加
+  `量宽 N 次 / x.x ms · 缓存命中 h/m（存 k 条）`，≥4 ms 额外打 `SLOWWRAP`。
+
+### 为什么
+
+上一批（#158/#159）把 HTML 首屏压到 87 ms 后，用户侧的"滚一下卡"却没有数字可查：
+`SLOWPAINT` 只覆盖真正的 GDI 绘制，不含折行。补上度量后立刻看到两处真问题：
+
+1. 量宽是逐字符累加的——宽度对前缀长度单调，本该二分。长段落文档每滚一格要量 1359 次
+   `GetTextExtentPoint32W`（单次约 21 µs），合计 12.1 ms。
+2. 滚一格时屏上 24/29 行没变，每帧却把它们重新量了一遍。
+
+### 怎么验证的（数字）
+
+release，真窗口（WMI 起进程 + `--scroll 5` ×6，读 `app.log` 的 `WRAP`/`SLOWWRAP` 行）：
+
+- 长段落文档（新夹具 `target/bench-text/longlines.txt`，25,240,000 B、6648 行 × 约 340 字）：
+  每滚一格 **1359 次量宽 / 12.1 ms → 243 次 / 5.1 ms**（−58%）。
+  该文档折行缓存命中率 **0/20**（一行折 7 行、一屏 4 个原始行、滚一格整屏换）→ 如实记，不吹。
+- 短行文档（`spike\fixtures\big_100mb.txt`，121,425 行）：**29 → 5 次量宽 / 0.2 → 0.1 ms**
+  （缓存命中 144/203）。
+- HTML（`crates/qlr-render` 的 `bench_html_phases`，8 MB）：`layout` 全量 74.8 → **51.2 ms**，
+  `render_with(head, 400)` 87.1 → **62.9 ms**。
+
+`cargo test` **306 passed / 10 ignored / 0 failed**（app 67+1、core 54、platform 33+3、plugin-api 4、
+plugin-demo 7、plugin-office 11、render 120+6、fuzz 1、malformed 9），fmt/clippy 零输出。
+
+### 走过的弯路
+
+缓存第一版只存"折成多行"的结果，短行文档一次都命中不了（`命中 0/203`、`存 0 条`）——
+因为单行的结果被 `if fresh.len() > 1` 挡在缓存外。改成单行也存才拿到 24/29 的复用，
+见 CONVENTIONS #161。
+
+### 下一步（未开工，都有数字依据）
+
+- `GetTextExtentExPointW` 一次拿到"给定宽度能放下几个字符"，可把长段落那 243 次量宽压到约 33 次
+  （5.1 ms → 约 0.7 ms）。要改 `wrap::push_wrapped` 的度量回调签名，且"能放下几个字符"与现在
+  "宽度严格小于"的口径可能差一个字符，需要另建对拍测试。
+- §6-4 裸 Win32 收口残量、§6-7 `PaintBuffer` 复用 + 每帧 GDI 计数：仍留到下一批。
+- Markdown 侧 `layout` 全量仍有 240 ms 余量（早停只解决首屏）。

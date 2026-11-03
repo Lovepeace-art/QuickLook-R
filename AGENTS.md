@@ -159,7 +159,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-**当前基线（1.8.2）**：`cargo test` → **251 passed / 3 ignored**（app 48、core 48、platform 25+2、plugin-api 4、plugin-demo 7、plugin-office 11、render 98+1、fuzz 1、malformed 9）；fmt / clippy 零输出。
+**当前基线（1.8.3-fix，2026-11-03）**：`cargo test` → **306 passed / 10 ignored**（app 67+1、core 54、platform 33+3、plugin-api 4、plugin-demo 7、plugin-office 11、render 120+6、fuzz 1、malformed 9）；fmt / clippy（含 `--features alloc-stats`）零输出。端到端：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话 UIPI 拒托盘 `0x80070005`）、`verify-archive.ps1` 11 PASS、`verify-layers.ps1` 11 PASS、`verify-media.ps1` 15 PASS、`verify-pdf.ps1` PASS。
 
 端到端脚本（都会自己造便携目录、WMI 启动真进程、PrintWindow 截图、打印 PASS/SKIP 汇总）：
 

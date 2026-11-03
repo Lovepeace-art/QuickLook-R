@@ -646,3 +646,51 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 
 **必须人工确认**（自动化测不出来）：200% 缩放下滚轮缩放 4K JPEG、来回翻 PDF 页、md/html 长文档首屏，
 视觉应与上一版完全一致；以及"预览器占内存"的实际体感（看 `MEM` 行是否稳定在 256 MB 以内）。
+
+## 1.8.3-fix 批次四接力说明（2026-11-03，滚一下卡在折行上）
+
+**这一批做了什么**：HTML 每行的三次分配压成一次（8 MB 首屏 87.1 → 62.9 ms）；
+折行量宽从逐字符累加改二分（长段落文档每滚一格 1359 次量宽 / 12.1 ms → 243 次 / 5.1 ms）；
+新增折行结果缓存 `crates/qlr-app/src/wrapcache.rs`（短行文档每帧量宽 29 → 5 次）；
+绘制循环补折行计时与 `SLOWWRAP` 日志。分支 `main`（已合并批次一～三，本地领先 origin 若干提交）。
+
+**新增/改动的文件**
+
+- `crates/qlr-app/src/wrapcache.rs`（新）：`WrapCache::{clear, set_width, get, put, stats}`，
+  `CAP = 512`，满了整本清空；`State.wrap_cache`，`set_content` 时清空。
+- `crates/qlr-render/src/wrap.rs`：`fit_prefix` 二分；单测
+  `fit_prefix_matches_the_linear_reference`（与旧线性算法逐字节对拍）、
+  `fit_prefix_measures_logarithmically_not_per_char`（单行 ≤24 次量宽）。
+- `crates/qlr-app/src/app/chrome.rs`：绘制循环里 `set_width` → 查缓存 → 未命中才折 →
+  `put`；`WRAP` 行带 `量宽 N 次 / x.x ms · 缓存命中 h/m（存 k 条）`。
+- `crates/qlr-render/src/html.rs`：`clip_line` + 字段级借用分离（`clip_line_matches_truncate_chars` 对拍）。
+
+**看到 `WRAP` 行怎么读**
+
+| 字段 | 说明 | 怎么用 |
+|---|---|---|
+| `量宽 N 次` | 本帧调用 `GetTextExtentPoint32W` 的次数 | 短行文档应在 5 上下（缓存生效）；几十次以上说明缓存没命中或行太长 |
+| `x.x ms` | 折行总耗时 | ≥4 ms 会额外打 `SLOWWRAP` |
+| `缓存命中 h/m（存 k 条）` | 累计命中/未命中/缓存条数 | **`存 0 条` = 没进缓存**（#161 那个坑）；`h` 不涨说明屏上全是新行 |
+| `吃掉 N 原始行` | 折出 29 显示行用掉了多少原始行 | 4 行 = 长段落；29 行 = 短行 |
+
+**下一步（有数字依据，别凭感觉选）**
+
+1. `GetTextExtentExPointW` 一次拿到"宽度内能放几个字符"，把长段落 243 次量宽压到约 33 次
+   （5.1 ms → 约 0.7 ms）。要改 `wrap::push_wrapped` 的度量回调签名；注意"能放下几个字符"与
+   现在"宽度严格小于"的口径可能差一个字符，需另建对拍测试。
+2. §6-4 裸 Win32 收口残量（`platform` 补 `stop_timer_by_ids`/`post_quit`/`terminate_self`/`now_ms`，
+   然后 `verify-layers.ps1` 加一条"app 不准直接调这几个"）。
+3. §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数（`bench.ps1` 已有 GDI 列与泄漏判据，app 侧还没有每帧数）。
+4. Markdown `layout` 全量仍有 240 ms 余量（早停只解决首屏）。
+5. **WebView2 已留档，别重做调研**：分支 `spike/webview2`（提交 `3f2a3e7`）里有完整的承载层
+   （`crates/qlr-platform/src/webview.rs`、`build.rs`、`third_party/webview2/`）与实测代价：
+   6 个 `msedgewebview2.exe`、工作集 287–294 MB、建 145–328 ms、导航 75–81 ms、空闲 CPU 1.5%、
+   数据目录 8.9 MB、关闭 1–2 s 全退、包体 +195 KB。用户决定**暂时不做**，重启这个话题前先看这份数字。
+
+**必须人工确认**（自动化测不出来）
+
+- 200% 缩放下滚轮缩放 4K JPEG、来回翻 PDF 页、md/html 长文档首屏：视觉应与上一版一致
+  （本批没动几何/DPI 与字体路径）。
+- 拿一份**长段落**文档（自己写一份每行 300 字以上的 txt/md 即可）滚轮滚动，
+  确认不再有"一格一顿"的顿感；再看 `app.log` 是否还有 `SLOWWRAP`。
