@@ -1527,3 +1527,58 @@ toast 进了基准图。这是环境噪音，不是绘制差异。
   跨行的 `sums` 是**一个输出像素覆盖的块内所有源像素**之和（≤ 块面积 × 255，块面积 =
   源像素数/输出像素数，真实图片只有个位到几百），`u32` 绰绰有余；末尾的 `.min(255)`
   是沿用原实现的防御性钳制，不是必需。
+
+## #155 每处缓存各自的上限是**加法**，不是上限；要有一本总账
+
+1.8.3 结束时进程里同时住着四笔内存，各自守着自己的常量、互不知情：
+
+| 谁 | 常量 | 位置 | 上限 |
+|---|---|---|---|
+| 源图档位缓存 | `CACHE_LIMIT_BYTES` | `crates/qlr-render/src/source_cache.rs` | 64 MB |
+| PDF 页缓存 | `CACHE_LIMIT_BYTES` | `crates/qlr-app/src/pagecache.rs` | 64 MB |
+| 上一帧位图 | `LAST_FRAME_MAX_BYTES` × `LAST_FRAME_CAP` | `crates/qlr-app/src/app/render.rs` | 24 MB |
+| PDF 文档槽 | `DOC_SLOT_MAX_BYTES` | `crates/qlr-render/src/pdf.rs` | 256 MB |
+
+加起来 ≈ 408 MB，再叠一帧 32 MP（`MAX_RENDER_PIXELS`，≈128 MB）就能摸到 500 MB——
+而每个常量单独看都很合理。**症状**：用户报"预览器占内存"，谁都觉得"我这项没超"。
+
+修法：`crates/qlr-render/src/budget.rs` —— 一本 256 MB 的账（`LIMIT_BYTES`），
+`try_reserve(n) -> Option<Permit>`，`Permit` drop 即归还（**不要 `mem::forget`**）。
+三处缓存的策略统一为：
+
+1. 先满足自己的上限（保证"只有这一项在用时"能吃饱）；
+2. 再向总账申请额度；
+3. 拿不到就继续淘汰自家条目；自家空了还不给 → **不缓存**（缓存只影响快慢，不影响对错）。
+
+细节：`pdf::with_document` 换文档时必须**先 `*held = None` 放掉旧文档再申请**，
+否则"旧文档还占着额度"会把同尺寸的新文档挡在门外（自己挡自己）。
+观测入口是日志每帧一行的 `MEM used=..MB cap=256MB`，别再加第二套计数。
+
+## #156 单测别碰全局账——把账做成可实例化的 `Budget`，靠生命周期还账
+
+`budget.rs` 第一版是 `static USED: AtomicUsize` + `reset_for_test()` + 一个测试互斥锁。
+结果：并行跑的 `source_cache` 用例会**莫名**拿不到额度（`cargo test` 默认多线程），
+报出来的原因看起来像"缓存逻辑坏了"。
+
+改成结构体就能同时满足两边：
+
+- `pub struct Budget { used: AtomicUsize, limit: usize }`；
+- `pub fn try_reserve(&self, n) -> Option<Permit<'_>>`，`Permit<'a> { budget: &'a Budget, bytes }`，
+  `Drop` 里 `fetch_sub` —— 归还靠**借用的生命周期**证明，不需要 `reset`；
+- 生产代码用 `static GLOBAL: Budget = Budget::new(LIMIT_BYTES)` + 模块级薄包装；
+- 单测各开一本 `Budget::new(小上限)`（如 `the_three_caches_fit_or_the_big_document_stays_out`
+  直接 `Budget::new(233 MB)`），彼此完全不共享。
+
+顺带一条：`checked_add` 写成 `let next = used.checked_add(bytes)?;` ——
+先写 `if let Some(..) = .. else { return None }` 会被 clippy 的 `question_mark` 拦下。
+
+## #157 先量再改：空闲 CPU 只有 0.05% 时，"降频优化"只是给自己加的风险
+
+结构评审把"空闲唤醒降频"（`FOLLOW` 400→1500 ms、`WATCHDOG` 250→1000 ms）列为 P2。
+实测量法：预览窗开着、什么都不做，30 s 后读进程 CPU 时间——**15.6 ms**（单核 0.05%），
+而且这还是 debug 日志开着（30 s 记了 331 条 `wm=0x0113`）时量的。
+
+结论：**不做**。省下的是零头，代价是"选中项跟随"变迟钝、挂死发现从 250 ms 拖到 1 s。
+留下判据：**给"定时器/轮询"类优化立项前，先量住空闲 CPU 或唤醒次数**；
+没有数字的"应该会更省"不算理由（对照 #154 的"先量再猜"）。
+量法：`Get-Process` 的 CPU 秒数差值，或 `_inbox\idle-cpu.ps1` 这类探针（**不进仓库**）。

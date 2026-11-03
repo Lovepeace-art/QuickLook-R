@@ -2769,3 +2769,88 @@ fuzz 1、malformed 9；新增 5 个 `#[ignore]` 基准与 1 个分配计数自�
 - 帧缓存/内存预算闸门（STRUCTURE-REVIEW §6-7、§6-9）、持锁动窗口（§7-1）、几何单点化（§7-2）；
 - PDF 页缩略图、文本 mmap、A1.6 第三/四级兜底；
 - **200% 缩放的视觉验收仍待用户真机**（本批没动任何几何/DPI 逻辑，理论上不受影响）。
+
+## 2026-11-03 · 1.8.3-fix 批次三：拿掉"持锁贴帧"、给分层与缓存总量装上断言
+
+> 承接批次二（见上一节）。批次三只做 `docs/dev/STRUCTURE-REVIEW-1.8.3.md` §6/§7 里
+> **先量过、确认还成立**的几项；量完发现不成立的，把结论写下来而不是硬改。
+
+### 做了什么
+
+**① 视频帧改 `Arc` 共享，贴图移出 `STATE` 锁；锁中毒不再静默哑火（`8dd38dc`）**
+
+- `VideoPlay::last` 从 `Option<RawFrame>` 改成 `Option<Arc<RawFrame>>`；`video_paint` / 顶栏
+  进度条都改成"锁内只克隆 `Arc`、锁外贴图"，锁的持有时间从"整帧拷贝 + blit"降到"指针 +1"。
+- `with_state` 原来 `STATE.get()?.lock().ok()?`——锁一旦中毒（持锁 panic 过），**之后每一次
+  `with_state` 都静默返回 `None`**，整个程序变成"窗口还在、什么都不响应"，日志里一个字都没有。
+  改成 match：`Err(poisoned)` 时打 `log_error!` 再 `into_inner()` 取回继续（与 #128 的范式一致）。
+  289 处调用点因此统一。
+
+**② 新增 `scripts/verify-layers.ps1`：把 ARCH 的分层描述变成可执行断言（`3a0d720`）**
+
+- 11 条断言：6 条依赖方向（core 无 `windows`、无上层；platform 不含 render/app 且必须有 `windows`；
+  render 不含 platform/app；app 三向齐全）+ core 源码零 `use windows::` + render/app 的 `use windows::`
+  白名单 + platform 不许 `use qlr_render::`/`qlr_app::` + `main.rs` 零 `use windows`。
+- `ARCH.md` 的分层表按代码事实重写：render **不是**"不依赖 windows"，只有 `media.rs`（Media Foundation）
+  与 `svg.rs`（D2D/D3D/DXGI）两处边界例外；app 的存量是 `layout.rs` 的 `RECT`、`settings.rs` 与
+  `app/mod.rs` 的 prelude，脚本用**计数棘轮**（`layout.rs` ≤1、`settings.rs` ≤2）保证只减不增。
+
+**③ 三处缓存共用 256 MB 总预算，上限从"加法"变成真上限（`915ef49`）**
+
+- 新模块 `crates/qlr-render/src/budget.rs`：一本全局账（`AtomicUsize` + CAS 循环），
+  `try_reserve(n) -> Option<Permit>`，`Permit` **drop 即归还**；没有中心调度器、没有回收回调——
+  拿不到额度的一方自己先淘汰自家旧条目，还不行就不缓存（缓存只影响快慢，不影响对错）。
+- 接入三处：`source_cache::store_tagged`、`pdf::with_document`、`pagecache::put`；
+  换文件时先放掉旧文档槽再申请额度（否则"换一份同样大的文档"会自己把自己挡在预算外）。
+- 渲染线程每帧多打一行 `MEM used=..MB cap=256MB`（单独一行，不动 `RENDER` 的字段顺序）。
+
+### 为什么
+
+- **持锁碰窗口/COM 是这个项目的历史主坑**（#128/#139/#145）。`hide_preview` 早就改成"锁内只改
+  状态、`window::hide` 放锁外"，但视频通道仍是"锁内贴整帧"：720p 一帧 3.6 MB，每帧在锁里多拷
+  一次就是几百微秒的窗口期，UI 线程一卡，钩子回调就可能超时（ADR-0005：超时 10 次钩子被 Windows 静默摘链）。
+- **锁中毒静默失败**比崩溃更难查：现场只会说"预览器不动了"，日志里没有一行错误。
+- **ARCH 的分层描述已经在撒谎**：写着"render 不依赖 windows"，实际 `Cargo.toml` 里就有。
+  文档骗人比没文档更糟——接手的人会照它做决策。断言脚本是唯一能防漂的东西。
+- **上限是加法不是上限**：源图 64 MB + 页缓存 64 MB + 上一帧 24 MB + 文档槽 256 MB ≈ 408 MB，
+  再加渲染中一帧 32 MP（128 MB）能摸到 500 MB。文档槽对大文件是真收益（100 MB 扫描件冷加载
+  264.63 ms、命中槽 0.02 ms），但不能靠"每处各自守上限"来控制总量。
+
+### 怎么验证的（数字）
+
+- `cargo test` **298 passed / 10 ignored**（app 63+1、core 54、platform 33+3、plugin-api 4、
+  plugin-demo 7、plugin-office 11、render 116+6、fuzz 1、malformed 9）。新增：`budget` 7 条单测
+  （其中 `the_three_caches_fit_or_the_big_document_stays_out` 把"233 MB 进得来 / 200 MB 文档 +
+  64 MB 缓存进不来"钉死）、`video_frame_is_shared_not_copied`（`Arc::ptr_eq` + `strong_count==2`）。
+- `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings`（含 `--features alloc-stats`）零输出。
+- `#[ignore] bench_video_lock_hold`（720p 3.6 MB）：整帧克隆 **579262 ns** vs `Arc` 克隆 **12 ns**。
+- 端到端：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话 UIPI 拒托盘 `0x80070005`）；
+  `verify-media.ps1 -Video <720p mp4>` **15 PASS · 0 FAIL · 0 SKIP**（视频自动播放、两帧不同、
+  进度条留白、播完收尾）；`verify-pdf.ps1` 用 100 MB 填充件 **PASS**；`verify-layers.ps1` **11 PASS**，
+  反向测试（塞一个 `use windows::` 进 render）→ **10 PASS · 1 FAIL**、退出码 1。
+- 预算实测（`app.log` 里的 `MEM` 行）：100 MB 填充 PDF → `MEM used=100MB cap=256MB`，
+  `SHOW ... elapsed=268ms`（=冷加载 264 ms + 开窗）、`RENDER gen=1 ... elapsed=0ms`（页码走已常驻
+  文档，不再读盘）；8 MP JPEG（1986 宽）→ `MEM used=39MB`（一个解码档位），小图档位 7 MB。
+
+### 顺手核掉的过期项（评审 §6 十项现况）
+
+| 评审项 | 现况 |
+|---|---|
+| §6-1 持锁动窗口 | **已过期**：`hide_preview` 早已"锁内改状态、`window::hide` 锁外"（`app/show.rs` 里有注释直引 #1/#128）；本批把视频通道也改掉了 |
+| §6-2 几何单点化 | **已过期**：`crates/qlr-app/src/layout.rs` 已有 `Layout`/`Opts`/`Bar` 与四个构造入口，模块头写明 1.8.3 前是四处各算一遍 |
+| §6-3 `app.rs` 拆分 | 已完成（`app/` 下 10 个文件，最大 `render.rs` 1315 行） |
+| §6-4 裸 Win32 收口 | 未做（`platform` 已过半，剩 `stop_timer_by_ids`/`post_quit`/`now_ms` 这类批量搬迁，纯重构、有回归风险） |
+| §6-5 渲染 worker 可重建 | **已过期**：`RENDER_EPOCH` 换代线程 + `QLRUST_RENDER_HANG_MS` 钩子 + `check_render_hang()`，1.8.3 已实现 |
+| §6-6 折行结果缓存 | 未做（大文件滚动时的下一个候选，需先量 `paint_code` 的 wrap 占比） |
+| §6-7 `PaintBuffer` 复用 / 每帧 GDI 计数 | 部分做了：`bench.ps1` 已有 `GdiAfterHide`/`UserAfterHide` + 泄漏判据；`PaintBuffer` 复用未动 |
+| §6-8 空闲唤醒降频 | **实测不值得做**：预览窗开着的 30 s 内 CPU 只有 **15.6 ms（单核 0.05%）**，且这还是在 debug 日志开着（30 s 记了 331 条 `wm=0x0113`）的情况下量的。把 `FOLLOW` 400→1500 ms、`WATCHDOG` 250→1000 ms 只能省下零头，却会增加"选中项跟随延迟"与"挂死发现延迟"，不做。 |
+| §6-9 内存总预算 | **本批已做**（`budget.rs`，256 MB） |
+| §6-10 文档-代码对齐 + 分层断言 | **本批已做**（`verify-layers.ps1` 11 PASS） |
+
+### 下一步（未开工）
+
+- §6-6 折行结果缓存：先给 `text`/`code` 的 wrap 阶段加一条 `#[ignore]` 基准（大文件逐行 wrap 的
+  占比），再决定要不要按 `(text_id, width, style_rev)` 缓存 break offsets。
+- HTML 流式词法（8 MB 预处理已降到 8.8 ms，但 tokenize 32.8 ms + layout 122.7 ms 还在）。
+- `AGENTS.md` §8 的"当前基线（1.8.2 / 251 passed）"早已过期，应与本节数字同步（本次未改，
+  因为基线还会随批次变化）。

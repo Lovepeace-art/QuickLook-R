@@ -1,18 +1,31 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-03 · **1.8.3-fix**（批次二，未发版）：把"每次重来"的开销收掉——
-> **JPEG 按解码档位缓存**（滚一格不再重解码整张图；48MP 四档 367.6 → 78.1 ms、4K 170.0 → 90.5 ms）；
-> **PDF 文档单槽缓存**（一次预览原本把文件读 3 遍 + pdfium 解析 3 遍，现在只读一次，
-> `render_page` 3.22 → 1.25 ms）；**Markdown 排版按预算早停**（8 MB 首屏 356 → 16 ms）；
-> **HTML 隐藏元素一次扫描剥离**（8 MB 预处理 145 → 8.8 ms；HTML 故意不早停，
-> 否则状态行的"全文共 N 行"就不准了）；**缩放内循环去掉逐字节边界检查**
-> （4K 一档 51.4 → 46.1 ms、48MP 100.6 → 71.2 ms，逐字节基线不变）；
-> **新增 `alloc-stats` 特性量帧级分配**（默认不编：冷帧 65.7 MB / 热帧 5.6 MB）；
-> **`bench.ps1` 补 PeakPrivate / GDI-USER / 帧级分配三列 + GDI 泄漏判据 + `-Passes` 浸泡**
-> （4K 6 次开合 GDI 稳定 20，无泄漏）。
-> 回归：`cargo test` **290 passed / 9 ignored**、fmt/clippy 零输出、`cargo build --release` 通过；
-> `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**、`verify-archive.ps1` **11 PASS · 0 FAIL**、
-> `verify-pdf.ps1` **PASS**。明细见 §46；**200% 缩放视觉验收仍待用户真机**。
+> 更新时间：2026-11-03 · **1.8.3-fix**（批次三，未发版）：把结构评审里"先量过、还成立"的三项收掉——
+> **视频帧改 `Arc` 共享、贴图移出 `STATE` 锁**（720p 一帧整帧克隆 579262 ns → Arc 克隆 12 ns），
+> `with_state` 锁中毒不再静默哑火（289 处调用点统一取回继续）；**新增 `scripts/verify-layers.ps1`**：
+> 11 条分层断言（`use windows::` 白名单 + 计数棘轮），`ARCH.md` 的分层描述按代码事实重写
+> （render 其实依赖 windows，例外是 `media.rs` / `svg.rs`）；**三处缓存共用 256 MB 总预算**
+> （源图档位 64 + PDF 页缓存 64 + 文档槽 256 原本是加法 ≈ 408 MB，现在一本账：
+> `MEM used=100MB cap=256MB`，拿不到额度就不常驻）。评审 §6 十项逐条核对：
+> §6-1/§6-2/§6-5 已过期、§6-8 实测不值得（空闲 30 s CPU 15.6 ms = 单核 0.05%）。
+> 回归：`cargo test` **298 passed / 10 ignored**、fmt/clippy（含 `alloc-stats`）零输出；
+> `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**、`verify-media.ps1` **15 PASS**、
+> `verify-layers.ps1` **11 PASS**、`verify-pdf.ps1`（100 MB 填充件）**PASS**。明细见 §47；
+> **200% 缩放视觉验收仍待用户真机**。
+>
+> <details><summary>1.8.3-fix 批次二（把"每次重来"的开销收掉，7 个提交）</summary>
+>
+> **1.8.3-fix 批次二**：JPEG 按解码档位缓存（滚一格不再重解码整张图；48MP 四档 367.6 → 78.1 ms、
+> 4K 170.0 → 90.5 ms）；PDF 文档单槽缓存（一次预览原本读 3 遍 + 解析 3 遍，现在只读一次，
+> `render_page` 3.22 → 1.25 ms）；Markdown 排版按预算早停（8 MB 首屏 356 → 16 ms）；
+> HTML 隐藏元素一次扫描剥离（8 MB 预处理 145 → 8.8 ms；HTML 故意不早停，否则"全文共 N 行"不准）；
+> 缩放内循环去掉逐字节边界检查（4K 一档 51.4 → 46.1 ms、48MP 100.6 → 71.2 ms）；
+> `alloc-stats` 特性量帧级分配（冷帧 65.7 MB / 热帧 5.6 MB）；`bench.ps1` 补
+> PeakPrivate / GDI-USER / 帧级分配三列 + GDI 泄漏判据 + `-Passes` 浸泡（4K 6 次开合 GDI 稳定 20）。
+> 回归：`cargo test` 290 passed / 9 ignored、`smoke.ps1` 16 PASS · 1 SKIP · 0 FAIL、
+> `verify-archive.ps1` 11 PASS、`verify-pdf.ps1` PASS。
+>
+> </details>
 >
 > <details><summary>1.8.3-fix 批次一（评审 7 项：收 5 项 + 自加 1 项，撤 1 项）</summary>
 >
@@ -1473,3 +1486,41 @@ PDF 每次预览把全文件读 3 遍、md/html 全文排版、锁中毒三套�
   `verify-pdf.ps1` **PASS**（SHOW 8ms / RENDER 2ms）。`verify-office.ps1` 未跑（本批不碰 Office）。
 - **必须人工确认**：200% 缩放下看 4K 图滚轮缩放、PDF 翻页、md/html 长文档首屏，
   视觉与上一版一致（本批没动几何/DPI 逻辑，理论上不受影响，但没有真机视觉基线）。
+
+## §47 1.8.3-fix 批次三（结构评审"还成立"的三项：持锁贴帧 / 分层断言 / 内存总账）
+
+| # | 提交 | 做了什么 | 关键数字 |
+|---|---|---|---|
+| 1 | `8dd38dc` | 视频帧 `Option<RawFrame>` → `Option<Arc<RawFrame>>`，`video_paint` 与顶栏进度条都改成"锁内克隆 `Arc`、锁外贴图"；`with_state` 锁中毒从静默 `None` 改成 `log_error!` + `into_inner()` 取回继续 | 720p 3.6 MB 整帧克隆 **579262 ns** → `Arc` 克隆 **12 ns**；`verify-media.ps1` **15 PASS · 0 FAIL · 0 SKIP** |
+| 2 | `3a0d720` | 新增 `scripts/verify-layers.ps1`（11 条断言）+ `ARCH.md` 按代码事实重写 render/app 的 windows 边界；`AGENTS.md` 脚本表加一行 | **11 PASS**；反向测试（往 render 塞一个 `use windows::`）→ **10 PASS · 1 FAIL**、退出码 1 |
+| 3 | `915ef49` | 新增 `crates/qlr-render/src/budget.rs`（`Budget`/`Permit`，drop 即归还），接入 `source_cache` / `pdf` 文档槽 / `pagecache`；渲染线程每帧多打一行 `MEM used=..MB cap=256MB` | 100 MB 填充 PDF → `MEM used=100MB cap=256MB`、`SHOW 268ms`、`RENDER ... elapsed=0ms`；8 MP JPEG → `MEM used=39MB` |
+
+**为什么只做这三项**：评审 §6 十项里，§6-1（持锁动窗口）、§6-2（几何单点化）、§6-5（渲染 worker
+可重建）**已经过期**——代码里早就做完了（`hide_preview` 的注释直引 #1/#128、`layout.rs` 的
+`Layout`/`Opts`/`Bar`、`RENDER_EPOCH` + `check_render_hang()`）。§6-3（`app.rs` 拆分）也已完成。
+§6-4（裸 Win32 收口）、§6-6（折行缓存）、§6-7（`PaintBuffer` 复用）留到下一批；
+§6-8（空闲唤醒降频）**实测不值得做**：预览窗开着的 30 s 内 CPU 只有 **15.6 ms（单核 0.05%）**，
+而且这还是 debug 日志开着（30 s 记了 331 条 `wm=0x0113`）时量的——把 `FOLLOW` 400→1500 ms、
+`WATCHDOG` 250→1000 ms 省不下什么，却会拖慢"选中项跟随"和"挂死发现"，不做。
+
+**预算这条线的取舍**：文档槽对大文件是真收益（100 MB 扫描件冷加载 264.63 ms、命中槽 0.02 ms），
+所以不能简单砍；但"每处各自守上限"加起来是 64+64+24+256 ≈ 408 MB，再叠一帧 32 MP（128 MB）
+能摸到 500 MB。现在是一本 256 MB 的账：**拿不到额度就不常驻**（缓存只影响快慢，不影响对错），
+单测 `the_three_caches_fit_or_the_big_document_stays_out` 把"233 MB 进得来 / 200 MB 文档 +
+64 MB 缓存进不来"钉死。
+
+**故意没做的**：没有中心调度器、没有回收回调、没有把"上一帧"（24 MB）和"渲染中那一帧"接进预算
+（后者是必要内存，拦它等于让预览失败）；`Permit` 带生命周期、单测用私账 `Budget::new(小上限)`，
+不碰全局账（否则并行跑的用例会莫名拿不到额度）。
+
+验证：
+
+- `cargo test`：**298 passed / 10 ignored / 0 failed**（app 63+1、core 54、platform 33+3、
+  plugin-api 4、plugin-demo 7、plugin-office 11、render 116+6、fuzz 1、malformed 9）。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`（含 `--features alloc-stats`）：零输出。
+- 端到端（release）：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话 UIPI 拒托盘
+  `0x80070005`）、`verify-media.ps1` **15 PASS · 0 FAIL · 0 SKIP**、`verify-layers.ps1` **11 PASS**、
+  `verify-pdf.ps1`（100 MB 填充件）**PASS**。
+- **必须人工确认**：200% 缩放下看 4K 图滚轮缩放、PDF 翻页、md/html 长文档首屏，
+  视觉与上一版一致（本批没动几何/DPI 逻辑）；以及"预览器占内存"的实际体感是否变好
+  （`app.log` 里搜 `MEM` 行即可看到当时的账）。

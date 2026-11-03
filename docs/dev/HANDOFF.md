@@ -573,3 +573,74 @@ CI 里加 `verify-*.ps1`（需要 Windows runner + Office）。
      最坏能到近 500 MB）；
   3. HTML 流式词法（tokenize 33 ms 是 md/html 里最后一块大数）；
   4. §6-10 `verify-layers.ps1` 分层断言（最便宜，能防 `qlr-render` 反向依赖 `qlr-app`）。
+
+## 1.8.3-fix 批次三接力说明（2026-11-03）
+
+**状态**：分支 `fix/1.8.3-batch1` 上共有 **19 个提交**（批次一 8 + 批次二 7 + 批次三 3 + 文档 1），
+`main` 仍是 `71999be`，未推送。批次三的三个提交：
+
+| 提交 | 内容 |
+|---|---|
+| `8dd38dc` | 视频帧改 `Arc` 共享、`video_paint` 贴图移出 `STATE` 锁；`with_state` 锁中毒不再静默哑火 |
+| `3a0d720` | 新增 `scripts/verify-layers.ps1`（11 条分层断言）+ `ARCH.md` 按代码事实重写 |
+| `915ef49` | 三处缓存共用 256 MB 总预算（`crates/qlr-render/src/budget.rs`），日志多一行 `MEM` |
+
+**回归结果（release，本机交互式会话）**：
+
+```
+cargo fmt --all -- --check                        # 零输出
+cargo clippy --all-targets -- -D warnings         # 零输出（--features alloc-stats 也零）
+cargo test                                        # 298 passed / 10 ignored / 0 failed
+pwsh -NoProfile -File scripts\smoke.ps1 -Exe target\release\qlrust.exe            # 16 PASS · 1 SKIP · 0 FAIL
+pwsh -NoProfile -File scripts\verify-layers.ps1                                   # 11 PASS · 0 FAIL
+pwsh -NoProfile -File scripts\verify-media.ps1 -Video <720p mp4>                  # 15 PASS · 0 FAIL · 0 SKIP
+pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_100mb.pdf -ExeDir target\release  # PASS
+```
+
+`smoke.ps1` 那条 SKIP 仍是管理员会话 UIPI 拒 `Shell_NotifyIconW`（`0x80070005`），不是缺陷。
+
+**新工具：`budget.rs`（进程级总账）**
+
+- `budget::try_reserve(n) -> Option<Permit>`，`Permit` drop 即归还；上限 `LIMIT_BYTES = 256 MB`。
+- 接入三处：`source_cache::store_tagged`、`pdf::with_document`、`pagecache::put`。三处策略一致：
+  **先满足自己的上限 → 再申请全局额度 → 拿不到就继续淘汰自家条目 → 自家空了还不给就不缓存**。
+- 排查内存就搜日志里的 `MEM used=..MB cap=256MB`（每帧一行，紧跟 `RENDER`）。
+  参考值：100 MB 填充 PDF → `used=100MB`；8 MP JPEG 1986 宽 → `used=39MB`；小图 → `7MB`。
+- 要调上限只改 `LIMIT_BYTES` 一处；**不要**再把"每处各自的上限"当总上限用
+  （64+64+24+256 是加法，不是上限）。
+
+**新工具：`verify-layers.ps1`（分层断言）**
+
+- 纯静态扫描，**不用起窗口、不需要 exe**，CI 里最便宜的一条。
+- 白名单是"计数棘轮"：`crates/qlr-app/src/layout.rs` 的 `use windows::` ≤1、`settings.rs` ≤2、
+  `app/mod.rs`（prelude）不限；`crates/qlr-render/src` 只允许 `media.rs` / `svg.rs`。
+  **想让白名单变大，得先改脚本**——这正是它的作用。
+- 反向验证方法（改架构时自查）：随便往 `crates/qlr-render/src` 塞一个 `use windows::…` 的文件，
+  脚本必须变成 `10 PASS · 1 FAIL` + 退出码 1。
+
+**评审 §6 十项现况（别照着旧评审重复劳动）**
+
+| 项 | 现况 |
+|---|---|
+| §6-1 持锁动窗口 | 已过期（`hide_preview` 早已锁外动窗口；本批把 `video_paint` 也改了） |
+| §6-2 几何单点化 | 已过期（`crates/qlr-app/src/layout.rs` 的 `Layout`/`Opts`/`Bar`） |
+| §6-3 `app.rs` 拆分 | 已完成（`app/` 下 10 个文件） |
+| §6-4 裸 Win32 收口 | 未做（纯重构、有回归风险，收益低） |
+| §6-5 渲染 worker 可重建 | 已过期（`RENDER_EPOCH` + `check_render_hang()`） |
+| §6-6 折行结果缓存 | 未做（下一个候选，先量 wrap 占比） |
+| §6-7 `PaintBuffer` 复用 / 每帧 GDI | 部分（`bench.ps1` 的 GDI 列与泄漏判据已有） |
+| §6-8 空闲唤醒降频 | **实测不值得做**：空闲 30 s CPU 15.6 ms（单核 0.05%） |
+| §6-9 内存总预算 | 本批已做（`budget.rs`） |
+| §6-10 分层断言 | 本批已做（`verify-layers.ps1`） |
+
+**下一步（建议顺序）**
+
+1. §6-6 折行结果缓存：先加一条 `#[ignore]` 基准量 `paint_code` 里 wrap 的占比，再决定做不做。
+2. HTML 流式词法（tokenize 32.8 ms + layout 122.7 ms 是 md/html 里最后两块大数）。
+3. 发布前：把 `AGENTS.md` §8 的"当前基线（1.8.2 / 251 passed）"和 §4 的矩阵按现状同步
+   （本批没改，因为基线每批都在动）。
+4. 推送/发版：`git checkout main; git merge --ff-only fix/1.8.3-batch1; git push origin main`，
+   然后 `pwsh -File scripts\pack.ps1`（批次一已把 `SHA256SUMS.txt` 改成先生成再压缩）。
+
+**必须人工确认**（自动化测不出来）：200% 缩放下滚轮缩放 4K JPEG、来回翻 PDF 页、md/html 长文档首屏，
+视觉应与上一版完全一致；以及"预览器占内存"的实际体感（看 `MEM` 行是否稳定在 256 MB 以内）。
