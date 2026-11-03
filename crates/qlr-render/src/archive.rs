@@ -112,7 +112,10 @@ pub fn open(path: &Path) -> Result<Archive, String> {
         let is_dir = name.ends_with('/');
         let clean = name.trim_end_matches('/').to_string();
         if is_dir {
-            dirs.insert(prefix_owned(&clean));
+            // 只有新前缀才 leak：先 insert 重复值会被集合丢弃，但 leak 已经发生。
+            if !dirs.contains(clean.as_str()) {
+                dirs.insert(prefix_owned(&clean));
+            }
         } else {
             archive.files += 1;
             archive.uncompressed += size;
@@ -124,7 +127,11 @@ pub fn open(path: &Path) -> Result<Archive, String> {
                     prefix.push('/');
                 }
                 prefix.push_str(part);
-                dirs.insert(prefix.clone().leak());
+                // 只有新前缀才 leak：5000 个文件挤在同几级目录下时，
+                // 无条件 leak 会让泄漏量随条目数线性涨（KB～MB 级）。
+                if !dirs.contains(prefix.as_str()) {
+                    dirs.insert(prefix.clone().leak());
+                }
             }
         }
         let depth = clean.matches('/').count();
@@ -143,8 +150,9 @@ pub fn open(path: &Path) -> Result<Archive, String> {
 
 /// 目录前缀进 `BTreeSet<&str>` 需要 `'static`；这里用 `Box::leak` 换生命周期。
 ///
-/// 量级可控：一个压缩包的目录数量级是几十到几千，进程退出才回收 —— 一次预览几百字节，
-/// 比为了它引入 `Arc<str>` 或用 `String` 存 set 更省事（后者每次插入都要分配）。
+/// 调用点必须先用 `contains` 去重再 leak：一个压缩包的目录数量级是几十到几千，
+/// 进程退出才回收 —— 只有真正的新前缀才允许 leak，否则常驻进程连看 N 个
+/// 压缩包会线性涨。
 fn prefix_owned(prefix: &str) -> &'static str {
     Box::leak(prefix.to_string().into_boxed_str())
 }
