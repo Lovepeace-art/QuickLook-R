@@ -34,9 +34,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
-    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+    SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjects;
 use windows::Win32::UI::WindowsAndMessaging::{

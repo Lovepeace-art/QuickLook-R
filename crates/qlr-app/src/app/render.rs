@@ -522,7 +522,13 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         s.render_warned = false;
         // PDF 这一帧算完回来要进页缓存，先把 key 记下来（非 PDF 不记）。
         s.pending_key = if is_pdf {
-            Some(pagecache::PageKey::new(path, page, max_w, max_h, file_stamp(path)))
+            Some(pagecache::PageKey::new(
+                path,
+                page,
+                max_w,
+                max_h,
+                file_stamp(path),
+            ))
         } else {
             None
         };
