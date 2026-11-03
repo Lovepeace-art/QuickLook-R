@@ -171,6 +171,7 @@ cargo test
 | `scripts/verify-media.ps1` | **15 PASS** | 音频/视频/SVG/HTML 四类预览 |
 | `scripts/verify-mediashape.ps1` | **13 PASS** | Excel 点选单元格、右缘无白边、图片/视频锁比例 |
 | `scripts/verify-pdf.ps1` | 全过 | PDF 渲染与翻页 |
+| `scripts/verify-layers.ps1` | **11 PASS** | 分层断言（**不用起窗口、不需要 exe**，纯静态扫描） |
 | `scripts/probe-selection.ps1` | 全过 | 选中项跟随（需要真实桌面会话） |
 | `scripts/bench.ps1` / `stress.ps1` | 预算内 | 性能与压力 |
 

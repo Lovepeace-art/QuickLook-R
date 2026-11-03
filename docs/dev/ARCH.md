@@ -18,15 +18,24 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
   `selection`（资源管理器选中项）· `shellpreview`（系统预览处理器宿主 `IPreviewHandler`）·
   `audio`（MCI 播放条）· `tray`（托盘图标与右键菜单）· `instance`（单实例互斥体 + `WM_COPYDATA` 转发）·
   `win11`（圆角 + 系统 backdrop）· `dpi` · `integrity`（进程令牌完整性）· `crash`（崩溃报告）· `wide`（字符串转换）。
-- `qlr-render`：**不依赖 `windows` crate**，纯 CPU 渲染，可跨平台单测。
+- `qlr-render`：纯 CPU 渲染，**不碰 UI 线程**；`windows` crate 只在 `[target.'cfg(windows)'.dependencies]`
+  下引入，且**只出现在两个文件**里，其余模块可跨平台单测。
   `canvas`（`Bitmap`/`TextDoc`/`Canvas`）· `image_view`（解码+缩放+BGRA）· `pdf`（PDFium 动态绑定）·
   `text`（编码探测+行切分+上限）· `code`（源码着色）· `markdown` · `html`（自写极简解析器）·
   `svg`（Direct2D `CreateSvgDocument` + 降级光栅化器）· `archive`（zip 目录树解析）· `wrap`（折行·测量）·
-  `downscale`（大图预算）· `cancel`（渲染取消）· `lib`（`Viewer` trait + 按格式路由）。
-  唯一边界例外：`media`（Media Foundation 探针 + 视频首帧），见该文件顶部说明。
+  `downscale`（大图预算）· `source_cache`（解码结果缓存，带 mtime+len+档位）· `scale`（整数面积平均缩放）·
+  `cancel`（渲染取消）· `lib`（`Viewer` trait + 按格式路由）。
+  **两处平台边界例外**（各文件顶部有说明）：`svg`（Direct2D 1.3，只有它能栅格化 SVG）与
+  `media`（Media Foundation 探针 + 视频首帧）。
 - `qlr-app`：宿主进程。`app`（状态机 + `wndproc` + 渲染线程调度 + 压缩包列表 + PPT 翻页接管）· `cli`（参数解析）· `main`。
+  存量例外（§6-4「裸 Win32 收口」未做）：`layout.rs:35` 的 `RECT`、`settings.rs:23-24` 的
+  `HWND/LPARAM/LRESULT/WPARAM` 直接 `use windows::`；`app/mod.rs` 是给整个 `app` 模块用的 prelude 再导出。
 
 规则：**业务判断不许下沉到 platform，FFI 细节不许上浮到 app**。
+
+上面这些不是口头约定——`scripts/verify-layers.ps1` 逐条断言（依赖方向、`use windows::` 的文件白名单、
+app 侧的**计数棘轮**：现存例外只许减少不许增加）。`pwsh -NoProfile -File scripts/verify-layers.ps1`
+应输出 `11 PASS · 0 FAIL`。**改架构时必须同步改这个脚本**，否则断言会把新结构判成违规。
 
 ## 2. 进程与线程模型
 
