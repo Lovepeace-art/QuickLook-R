@@ -2854,3 +2854,47 @@ fuzz 1、malformed 9；新增 5 个 `#[ignore]` 基准与 1 个分配计数自�
 - HTML 流式词法（8 MB 预处理已降到 8.8 ms，但 tokenize 32.8 ms + layout 122.7 ms 还在）。
 - `AGENTS.md` §8 的"当前基线（1.8.2 / 251 passed）"早已过期，应与本节数字同步（本次未改，
   因为基线还会随批次变化）。
+
+## 2026-11-03 · 1.8.3-fix 批次三（续）：HTML 排版改成流式词法
+
+### 做了什么
+
+`crates/qlr-render/src/html.rs` 两处热路径（提交 `eca8801`）：
+
+- `tokenize(src) -> Vec<Tok>` 换成 `for_each_token(src, |tok| …)`，标签名复用一个 `String` 缓冲；
+  `Tok` 的变体从 `String` 改成 `&str`（HRTB `for<'a> FnMut(Tok<'a>)`）。
+- `Builder::push_text` 不再逐字符 `push`，改成按"非空白段"整段 `push_str`
+  （ASCII 空白按字节判；非 ASCII 字节才解 `char` 问 `is_whitespace()`）。
+- `bench_html_phases` 改成每个阶段跑 3 遍取最好成绩，并新增一条词法计时
+  （原来只有"tokenize 总数 + layout 全量"两个数，看不出排版侧占多少）。
+
+### 为什么
+
+8 MB 的 HTML 有 96 万个 token：先攒 `Vec<Tok>` 再消费，光结构体就约 46 MB，
+每个标签名还要各分配一个 `String`。而排版是严格顺序消费、从不回看的，
+中间态完全是白付的。这是"读大文件首屏"这条链上最后一处结构性的浪费
+（前面的单遍剥离已经把预处理从 145 ms 压到 8.8 ms）。
+
+### 怎么验证的（数字）
+
+release，8 MB HTML → 233638 显示行，各阶段取 3 遍最好：
+
+- 词法：38.1 → **10.2 ms**（3.7 倍）
+- `layout` 全量：122.7 → **74.8 ms**（−39%）
+- `render_with(head=true, 400 行)`：260.0（1.8.3 基线）→ 120.7（批次二单遍剥离后）→ **87.1 ms**
+- 峰值少一份 `Vec<Tok>` ≈ 46 MB，另加近百万个标签名小分配
+
+`cargo test` **299 passed / 10 ignored / 0 failed**（render 117+6），fmt/clippy 零输出；
+`scripts/verify-media.ps1` **15 PASS · 0 FAIL · 0 SKIP**（HTML 走排版预览、正文有内容、无行号栏）。
+
+### 顺手记下的
+
+`push_text` 那条单独测时落在噪声里（本机单次抖动 ±6 ms），提交说明里只报"两项合起来"的数字，
+并把基准改成 3 遍取最好——见 CONVENTIONS #158。
+
+### 下一步（未开工）
+
+- 每行落盘的分配（`emit_line`/`flush` 里 `trim().to_string()` + `format!` + `clip` 三次分配，
+  233638 行 ≈ 56 ms）：要么改成"一个可复用缓冲拼好再 push"，要么让 `clip` 就地截断。
+- Markdown 侧同样有 `layout` 全量 240 ms 的余量（早停只解决首屏）。
+- §6-6 折行结果缓存、§6-7 `PaintBuffer` 复用（先各加一条基准再决定做不做）。

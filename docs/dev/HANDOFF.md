@@ -576,21 +576,22 @@ CI 里加 `verify-*.ps1`（需要 Windows runner + Office）。
 
 ## 1.8.3-fix 批次三接力说明（2026-11-03）
 
-**状态**：分支 `fix/1.8.3-batch1` 上共有 **19 个提交**（批次一 8 + 批次二 7 + 批次三 3 + 文档 1），
-`main` 仍是 `71999be`，未推送。批次三的三个提交：
+**状态**：分支 `fix/1.8.3-batch1` 上共有 **21 个提交**（批次一 8 + 批次二 7 + 批次三 4 + 文档 2），
+`main` 仍是 `71999be`，未推送。批次三的四个提交：
 
 | 提交 | 内容 |
 |---|---|
 | `8dd38dc` | 视频帧改 `Arc` 共享、`video_paint` 贴图移出 `STATE` 锁；`with_state` 锁中毒不再静默哑火 |
 | `3a0d720` | 新增 `scripts/verify-layers.ps1`（11 条分层断言）+ `ARCH.md` 按代码事实重写 |
 | `915ef49` | 三处缓存共用 256 MB 总预算（`crates/qlr-render/src/budget.rs`），日志多一行 `MEM` |
+| `eca8801` | `html.rs` 词法改流式（不再先攒 96 万个 `Vec<Tok>`）+ 文本按非空白段整段拷入 |
 
 **回归结果（release，本机交互式会话）**：
 
 ```
 cargo fmt --all -- --check                        # 零输出
 cargo clippy --all-targets -- -D warnings         # 零输出（--features alloc-stats 也零）
-cargo test                                        # 298 passed / 10 ignored / 0 failed
+cargo test                                        # 299 passed / 10 ignored / 0 failed
 pwsh -NoProfile -File scripts\smoke.ps1 -Exe target\release\qlrust.exe            # 16 PASS · 1 SKIP · 0 FAIL
 pwsh -NoProfile -File scripts\verify-layers.ps1                                   # 11 PASS · 0 FAIL
 pwsh -NoProfile -File scripts\verify-media.ps1 -Video <720p mp4>                  # 15 PASS · 0 FAIL · 0 SKIP
@@ -635,8 +636,9 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 
 **下一步（建议顺序）**
 
-1. §6-6 折行结果缓存：先加一条 `#[ignore]` 基准量 `paint_code` 里 wrap 的占比，再决定做不做。
-2. HTML 流式词法（tokenize 32.8 ms + layout 122.7 ms 是 md/html 里最后两块大数）。
+1. 每行落盘的分配：`emit_line`/`flush` 里 `trim().to_string()` + `format!` + `clip` 是三次分配，
+   8 MB HTML 有 233638 行、合计约 56 ms——要么改成"一个可复用缓冲拼好再 push"，要么让 `clip` 就地截断。
+2. §6-6 折行结果缓存：先加一条 `#[ignore]` 基准量 `paint_code` 里 wrap 的占比，再决定做不做。
 3. 发布前：把 `AGENTS.md` §8 的"当前基线（1.8.2 / 251 passed）"和 §4 的矩阵按现状同步
    （本批没改，因为基线每批都在动）。
 4. 推送/发版：`git checkout main; git merge --ff-only fix/1.8.3-batch1; git push origin main`，

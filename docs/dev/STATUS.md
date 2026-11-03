@@ -1,14 +1,15 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-03 · **1.8.3-fix**（批次三，未发版）：把结构评审里"先量过、还成立"的三项收掉——
+> 更新时间：2026-11-03 · **1.8.3-fix**（批次三，未发版）：把结构评审里"先量过、还成立"的四项收掉——
 > **视频帧改 `Arc` 共享、贴图移出 `STATE` 锁**（720p 一帧整帧克隆 579262 ns → Arc 克隆 12 ns），
 > `with_state` 锁中毒不再静默哑火（289 处调用点统一取回继续）；**新增 `scripts/verify-layers.ps1`**：
 > 11 条分层断言（`use windows::` 白名单 + 计数棘轮），`ARCH.md` 的分层描述按代码事实重写
 > （render 其实依赖 windows，例外是 `media.rs` / `svg.rs`）；**三处缓存共用 256 MB 总预算**
 > （源图档位 64 + PDF 页缓存 64 + 文档槽 256 原本是加法 ≈ 408 MB，现在一本账：
-> `MEM used=100MB cap=256MB`，拿不到额度就不常驻）。评审 §6 十项逐条核对：
-> §6-1/§6-2/§6-5 已过期、§6-8 实测不值得（空闲 30 s CPU 15.6 ms = 单核 0.05%）。
-> 回归：`cargo test` **298 passed / 10 ignored**、fmt/clippy（含 `alloc-stats`）零输出；
+> `MEM used=100MB cap=256MB`，拿不到额度就不常驻）；**HTML 排版改流式词法**
+> （不再先攒 96 万个 token：词法 38.1 → 10.2 ms，8 MB 首屏 120.7 → 87.1 ms，峰值少约 46 MB）。
+> 评审 §6 十项逐条核对：§6-1/§6-2/§6-5 已过期、§6-8 实测不值得（空闲 30 s CPU 15.6 ms = 单核 0.05%）。
+> 回归：`cargo test` **299 passed / 10 ignored**、fmt/clippy（含 `alloc-stats`）零输出；
 > `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**、`verify-media.ps1` **15 PASS**、
 > `verify-layers.ps1` **11 PASS**、`verify-pdf.ps1`（100 MB 填充件）**PASS**。明细见 §47；
 > **200% 缩放视觉验收仍待用户真机**。
@@ -1487,13 +1488,14 @@ PDF 每次预览把全文件读 3 遍、md/html 全文排版、锁中毒三套�
 - **必须人工确认**：200% 缩放下看 4K 图滚轮缩放、PDF 翻页、md/html 长文档首屏，
   视觉与上一版一致（本批没动几何/DPI 逻辑，理论上不受影响，但没有真机视觉基线）。
 
-## §47 1.8.3-fix 批次三（结构评审"还成立"的三项：持锁贴帧 / 分层断言 / 内存总账）
+## §47 1.8.3-fix 批次三（结构评审"还成立"的四项：持锁贴帧 / 分层断言 / 内存总账 / HTML 词法）
 
 | # | 提交 | 做了什么 | 关键数字 |
 |---|---|---|---|
 | 1 | `8dd38dc` | 视频帧 `Option<RawFrame>` → `Option<Arc<RawFrame>>`，`video_paint` 与顶栏进度条都改成"锁内克隆 `Arc`、锁外贴图"；`with_state` 锁中毒从静默 `None` 改成 `log_error!` + `into_inner()` 取回继续 | 720p 3.6 MB 整帧克隆 **579262 ns** → `Arc` 克隆 **12 ns**；`verify-media.ps1` **15 PASS · 0 FAIL · 0 SKIP** |
 | 2 | `3a0d720` | 新增 `scripts/verify-layers.ps1`（11 条断言）+ `ARCH.md` 按代码事实重写 render/app 的 windows 边界；`AGENTS.md` 脚本表加一行 | **11 PASS**；反向测试（往 render 塞一个 `use windows::`）→ **10 PASS · 1 FAIL**、退出码 1 |
 | 3 | `915ef49` | 新增 `crates/qlr-render/src/budget.rs`（`Budget`/`Permit`，drop 即归还），接入 `source_cache` / `pdf` 文档槽 / `pagecache`；渲染线程每帧多打一行 `MEM used=..MB cap=256MB` | 100 MB 填充 PDF → `MEM used=100MB cap=256MB`、`SHOW 268ms`、`RENDER ... elapsed=0ms`；8 MP JPEG → `MEM used=39MB` |
+| 4 | `eca8801` | `html.rs` 词法改成 `for_each_token`（不再先攒 96 万个 `Vec<Tok>`，标签名复用缓冲）；`push_text` 按"非空白段"整段 `push_str` | 词法 **38.1 → 10.2 ms**；`layout` 全量 **122.7 → 74.8 ms**；8 MB 首屏（400 行）**120.7 → 87.1 ms**；峰值少约 **46 MB** |
 
 **为什么只做这三项**：评审 §6 十项里，§6-1（持锁动窗口）、§6-2（几何单点化）、§6-5（渲染 worker
 可重建）**已经过期**——代码里早就做完了（`hide_preview` 的注释直引 #1/#128、`layout.rs` 的

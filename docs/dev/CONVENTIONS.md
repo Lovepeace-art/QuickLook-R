@@ -1582,3 +1582,24 @@ toast 进了基准图。这是环境噪音，不是绘制差异。
 留下判据：**给"定时器/轮询"类优化立项前，先量住空闲 CPU 或唤醒次数**；
 没有数字的"应该会更省"不算理由（对照 #154 的"先量再猜"）。
 量法：`Get-Process` 的 CPU 秒数差值，或 `_inbox\idle-cpu.ps1` 这类探针（**不进仓库**）。
+
+## #158 顺序消费的东西别先攒成 `Vec`；逐字符 `push` 是 8 MB 文档的隐形税
+
+两处都是 1.8.3 遗留的"看起来没问题"的写法，8 MB 的 HTML 上合计吃掉 40+ ms 和 46 MB：
+
+1. **词法先攒后消费**：`tokenize(src) -> Vec<Tok>` 把 96 万个 token 全建出来再交给排版。
+   排版（`Builder`）严格顺序消费、从不回看，`Vec` 完全是多余的中间态：
+   结构体本身 967933 × ~48 B ≈ 46 MB，每个标签名还要各 allocate 一个 `String`（近百万次小分配）。
+   换成 `for_each_token(src, |tok| …)` + 复用一个标签名缓冲，**38.1 → 10.2 ms**。
+   - 借用怎么给：`fn for_each_token<F>(src: &str, f: F) where F: for<'a> FnMut(Tok<'a>)`
+     ——标签名借的是循环里的局部缓冲，必须 HRTB 才能过编译；`Tok` 的变体要用 `&'a str` 而不是 `String`。
+   - 双缓冲/复用 `String` 的时候注意非 ASCII：`for b in raw.bytes() { push(b as char) }`
+     会把 UTF-8 拆成 mojibake，先 `raw.is_ascii()` 分流。
+2. **文本逐字符入缓冲**：`for c in s.chars() { self.buf.push(c) }` 对 8 MB 正文就是 800 万次
+   `push`（每次都查容量）。改成按"非空白段"整段 `push_str`：ASCII 空白按字节判，
+   遇到非 ASCII 字节才解一个 `char` 问 `is_whitespace()`（U+3000 全角空格也得算空白）。
+
+**测量的纪律**：这台机器单次 `Instant` 测量抖动 ±6 ms，单独测第 2 项时数字落在噪声里。
+所以：① 基准里每个阶段跑 3 遍取最好；② 只在"两项合起来"这一级下结论
+（`layout 122.7 → 74.8 ms`、`render_with(head,400) 120.7 → 87.1 ms`）；
+③ 别把一次跑出来的小差异写进提交说明（对照 #154 / #157）。
