@@ -17,6 +17,7 @@
 //! 八类之外返回 `Error::Message`，壳层据此提示"后续以插件形式提供"。
 
 pub mod archive;
+pub mod budget;
 pub mod cancel;
 pub mod canvas;
 pub mod code;

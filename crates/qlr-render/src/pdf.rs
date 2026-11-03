@@ -22,6 +22,7 @@ use std::time::SystemTime;
 
 use libloading::Library;
 
+use crate::budget;
 use crate::canvas::{Bitmap, Canvas};
 use qlr_core::error::{Error, Result};
 
@@ -205,6 +206,11 @@ struct DocSlot {
     /// 关闭函数跟着槽走：槽是静态的，`Drop` 里没有 `Api` 可用。
     close: FnCloseDocument,
     pages: usize,
+    /// 常驻期间在进程级总预算上占的额度（不常驻时为 `None`）。
+    ///
+    /// 悬在槽里而不是调用方手里：额度跟着"文档还在内存里"这件事走，槽一清空
+    /// （换文件、超限、程序退出）`Drop` 就把它还回 [`crate::budget`]。
+    _permit: Option<budget::Permit<'static>>,
 }
 
 impl Drop for DocSlot {
@@ -271,6 +277,7 @@ fn load_document(api: &Api, path: &Path, stamp: Option<(SystemTime, u64)>) -> Re
         _data: data,
         close: api.close_document,
         pages: count.max(0) as usize,
+        _permit: None,
     };
     // 没有可渲染页面：`doc` 在这里 drop，句柄随之关闭，不会漏。
     if doc.pages == 0 {
@@ -300,12 +307,22 @@ fn with_document<T>(
         _ => false,
     };
     if !reuse {
-        let fresh = load_document(api, path, stamp)?;
+        // 旧文档先放掉：换文件时它本来就要关，额度也该先还回去再申请
+        // （不然"换一份同样大的文档"会自己把自己挡在预算外）。
+        *held = None;
+        let mut fresh = load_document(api, path, stamp)?;
         if fresh._data.len() > DOC_SLOT_MAX_BYTES {
             // 特大文档不常驻：`fresh` 在 `f` 返回后 drop，句柄随之关闭。
             return f(api, fresh.raw, fresh.pages);
         }
-        *held = Some(fresh); // 同一时刻只留一份，旧文档在这里 drop → 关闭
+        match budget::try_reserve(fresh._data.len()) {
+            Some(permit) => {
+                fresh._permit = Some(permit);
+                *held = Some(fresh); // 同一时刻只留一份，旧文档在这里 drop → 关闭
+            }
+            // 总预算被别的缓存占着：这次不常驻，本次照样能用（多读一次盘而已）。
+            None => return f(api, fresh.raw, fresh.pages),
+        }
     }
     let (raw, pages) = held
         .as_ref()

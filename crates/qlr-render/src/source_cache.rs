@@ -12,7 +12,9 @@
 //!
 //! ## 上限与代价
 //!
-//! - 总预算 [`CACHE_LIMIT_BYTES`] = 64 MB，超出按 LRU 淘汰；
+//! - 总预算 [`CACHE_LIMIT_BYTES`] = 64 MB，超出按 LRU 淘汰；**另受 [`crate::budget`]
+//!   的进程级总预算约束**（拿不到额度就先淘汰自家条目，还不行就不缓存——别把别人的
+//!   额度顶掉，PDF 文档槽那 100 MB 是换来 250 ms 的，比一张图的档位值钱）；
 //! - 单张超过 [`CACHE_MAX_PIXELS`] 像素的**不进缓存**：48MP 的 RGBA 是 192 MB 一张，
 //!   放进来会把预算一次性吃穿，而这类图本来就走流式降采样（`downscale`），也不需要缓存；
 //! - 命中判定用 `路径 + 修改时间 + 文件长度`：文件被覆盖（截图工具、编辑器另存）后
@@ -23,6 +25,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
+
+use crate::budget;
 
 /// 条目的"档位"标签。
 ///
@@ -70,6 +74,8 @@ struct Entry {
     img: Arc<SourceImage>,
     /// 最近一次使用时的全局计数（越小越旧）。
     used: u64,
+    /// 这份条目在进程级总预算上占的额度；条目被淘汰时随 `Drop` 自动归还。
+    _permit: budget::Permit<'static>,
 }
 
 struct Cache {
@@ -150,17 +156,19 @@ pub fn store_tagged(path: &Path, tag: Tag, img: Arc<SourceImage>) {
         let old = c.entries.remove(pos);
         c.bytes -= old.img.rgba.len();
     }
-    while c.bytes + size > CACHE_LIMIT_BYTES && !c.entries.is_empty() {
-        let oldest = c
-            .entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.used)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let gone = c.entries.remove(oldest);
-        c.bytes -= gone.img.rgba.len();
-    }
+    // 第一道：本缓存自己的 64 MB 上限。
+    while c.bytes + size > CACHE_LIMIT_BYTES && evict_oldest(&mut c) {}
+    // 第二道：进程级总预算（`crate::budget`）。拿不到额度就继续淘汰自家条目，
+    // 自家空了还拿不到就不缓存——占着额度的是别的缓存（多半是 PDF 文档槽那份
+    // 换来 250 ms 的整文件），这里动不了、也不该动。
+    let permit = loop {
+        if let Some(permit) = budget::try_reserve(size) {
+            break permit;
+        }
+        if !evict_oldest(&mut c) {
+            return;
+        }
+    };
     c.bytes += size;
     c.entries.push(Entry {
         path: path.to_path_buf(),
@@ -169,7 +177,24 @@ pub fn store_tagged(path: &Path, tag: Tag, img: Arc<SourceImage>) {
         tag,
         img,
         used: tick,
+        _permit: permit,
     });
+}
+
+/// 丢掉最久没用到的那一份；缓存已经空了就返回 `false`。
+fn evict_oldest(c: &mut Cache) -> bool {
+    let Some(oldest) = c
+        .entries
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, e)| e.used)
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    let gone = c.entries.remove(oldest);
+    c.bytes -= gone.img.rgba.len();
+    true
 }
 
 #[cfg(test)]

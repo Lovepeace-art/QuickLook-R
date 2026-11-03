@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use qlr_render::Canvas;
+use qlr_render::{Canvas, budget};
 
 /// 缓存上限：64 MB。一页 631×893 约 2.25 MB，够放 ~28 页。
 pub const CACHE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -50,6 +50,8 @@ struct Entry {
     key: PageKey,
     canvas: Arc<Canvas>,
     bytes: usize,
+    /// 这页在进程级总预算上占的额度；丢掉这页时随 `Drop` 自动归还。
+    _permit: budget::Permit<'static>,
 }
 
 /// 简单的 LRU：`VecDeque` 头是"最久没用到"，尾是"刚用过"。
@@ -89,14 +91,32 @@ impl PageCache {
         if bytes >= self.limit {
             return;
         }
-        self.entries.push_back(Entry { key, canvas, bytes });
-        self.bytes += bytes;
-        while self.bytes > self.limit {
+        // 第一道：本缓存自己的 64 MB 上限。
+        while self.bytes + bytes > self.limit {
             let Some(old) = self.entries.pop_front() else {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(old.bytes);
         }
+        // 第二道：进程级总预算（见 `qlr_render::budget`）。拿不到额度就继续丢自己最旧的页，
+        // 丢空了还拿不到就不缓存——占着额度的是别的缓存（源图档位、PDF 文档槽），
+        // 动它们只会让"翻回上一页"变慢。
+        let permit = loop {
+            if let Some(permit) = budget::try_reserve(bytes) {
+                break permit;
+            }
+            let Some(old) = self.entries.pop_front() else {
+                return;
+            };
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        };
+        self.entries.push_back(Entry {
+            key,
+            canvas,
+            bytes,
+            _permit: permit,
+        });
+        self.bytes += bytes;
     }
 
     pub fn contains(&self, key: &PageKey) -> bool {

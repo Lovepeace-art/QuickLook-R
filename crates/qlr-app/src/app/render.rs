@@ -361,6 +361,9 @@ pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64)
                         elapsed
                     ),
                 }
+                // 可丢缓存的总账（源图档位 + PDF 文档槽 + PDF 页缓存），一行固定格式：
+                // 排查"预览器占着几百兆"时先看这里，再看各缓存自己的淘汰日志。
+                log_info!(SCOPE, "MEM {}", qlr_render::budget::summary());
                 // 1.8.3：自愈换线程之后，旧线程迟早会从第三方代码里爬出来交活。
                 // 它的结果绝不能进结果槽、也不能通知 UI —— 那会顶掉新线程刚算好的那一帧
                 // （UI 只看代际号，一代就对得上），或者把用户早翻过去的旧图糊上来。
