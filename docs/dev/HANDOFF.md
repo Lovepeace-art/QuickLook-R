@@ -495,3 +495,33 @@ CI 里加 `verify-*.ps1`（需要 Windows runner + Office）。
   只有建出来之后的绘制才是逐窗口精确的。单屏不受影响。
 - **下一步（未开工）**：P0 度量（`bench.ps1` 补 PeakPrivate / GDI 对象 / 帧级 alloc + CI 门禁脚本），
   然后才是 T05–T11 里真正剩下的项（PDF 每次预览开 3 次文档、`video_tick` 锁内解码、`PageKey` 无 mtime）。
+
+## 1.8.3-fix 接力说明（2026-11-03）
+
+- **分支**：`fix/1.8.3-batch1`（基于 `71999be`，7 个提交，**快进关系**，不用 merge commit）。
+- **这批是什么**：评审报告里的"批次一"6 项小修（嗅探有界读 / 热键 `GetFocus` 死代码 + 钩子句柄 /
+  压缩包 `Box::leak` / `PageCache` 文件戳 / 相邻页预取复用文件戳 / `pack.ps1` 校验和顺序）。
+  细节与数字见 `docs/dev/LOG.md` 的 2026-11-03 条目、`STATUS.md` §45。
+- **评审里明确没做的**：`ShellPreview::close()` 的 `mem::forget` 方案——那个方法零调用点，
+  而 `forget` 会连 `IPreviewHandler` 的 COM 引用一起跳过释放。要收拾就单独提一个提交，
+  写成 `close(self) { drop(self) }` 或直接删掉死方法。
+- **回归命令**（顺序照抄；数字是 1.8.3-fix 之后的口径）：
+  ```powershell
+  cargo fmt --all -- --check                  # 零输出
+  cargo clippy --all-targets -- -D warnings   # 零输出
+  cargo test                                  # 期望 287 passed / 4 ignored
+  cargo build --release
+  pwsh -File scripts\smoke.ps1                # 16 PASS / 1 SKIP（管理员会话 UIPI）——合并后已跑
+  pwsh -File scripts\verify-archive.ps1       # 11 PASS · 0 FAIL（压缩包前缀改动在这里，已跑）
+  pwsh -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_8page.pdf   # PASS（页缓存改动，已跑）
+  pwsh -File scripts\verify-office.ps1        # 23 PASS（本批未碰 Office；下次动 IPreviewHandler 再跑）
+  ```
+- **必须人工确认的两条**（自动化测不出来）：
+  1. 嗅探：把几 GB 的 `.iso`/`.vhdx` 改名成 `.xyz` 后按空格——应提示"不支持"，任务管理器内存不飙升。
+  2. 热键（Win11）：桌面选中文件按 `F2` 进入就地重命名，再按空格——应能打出空格；
+     看 `app.log` 里 `passed_text_focus=` 与 `text_focus_level=`（**小写**，2 = 走类名兜底那条新生效的判据）。
+- **下一步（评审的批次二，未开工）**：JPEG 解码入 `source_cache` + PDF/视频缩放统一 `downscale_exact`
+  （同一处代码，一个提交）→ PDF 文档单槽缓存 → md/html 排版早停。这几项才是用户体感的那部分
+  （4K JPEG 每档重解码、30MB PDF 每页重读全文件），且都在渲染热路径上，**必须每步带基线**。
+- **文档口径提醒**：本文件上面 1.8.3 节里写的 "期望 264 passed" 是发布当时的数字，实测基线已是 286，
+  以本节为准。

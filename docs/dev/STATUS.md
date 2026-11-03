@@ -1,7 +1,24 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-02 · **1.8.3**：**修好"Win11 200% 缩放下界面小一半"**——根因是窗口坐标是物理像素，而 30/24/15 这些几何量是照 100% 写的（顶栏只剩 15 DIP、正文 7.5 DIP）。17 个几何常量改成 DIP→物理像素的函数（161 处引用），字号表、PDF/图片的自然尺寸、预热线程一并换算；图片默认缩放 50% → 100%（老配置有 schema 1→2 迁移）。**空格热键不再偷按键**：修饰键改成精确匹配（`Ctrl+Space`/`Alt+Space` 不再被吞，`Shift+=` 单独放行），前台在输入文字时（桌面 F2 改名）直接放行；**收起预览时释放数字输入模式**（此前会一直吞数字键）。
+> 更新时间：2026-11-03 · **1.8.3-fix**（批次一，未发版）：评审报告 7 项里收 5 项 + 1 项自加——
+> **扩展名不认识时的嗅探改成有界读**（`kind_for_path` 原本 `fs::read` 整个文件、只取前 512 B，
+> GB 级 `.iso` 改名成 `.xyz` 就能把内存顶满）；**热键级 2 判据从死代码变成真生效**
+> （`GetFocus` 线程亲和、钩子线程恒 NULL，改用 `GetGUIThreadInfo` 的 `hwndFocus`，Win11 桌面
+> F2 就地改名不再吞空格），并补上钩子 stop 事件句柄的 `CloseHandle`；**压缩包目录前缀只在
+> 新值时 `Box::leak`**（原本无条件 leak，连看 N 个压缩包进程内存线性涨）；**`PageCache` key
+> 补文件戳**（mtime+len，预览中文件被覆盖后不再显示旧页，对齐 CONVENTIONS #112）；
+> **`pack.ps1` 先生成 SHA256SUMS 再压缩**。评审建议的 `ShellPreview::close()` 的
+> `std::mem::forget` 方案**没有收**——那个方法零调用点，`forget` 反而会漏掉
+> `IPreviewHandler` 的 COM 引用。
+> 回归：`cargo test` **287 passed / 4 ignored**、fmt/clippy 零输出、`cargo build --release` 通过；
+> `smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP = 管理员会话 UIPI 拒托盘图标，非回归）、
+> `verify-archive.ps1` **11 PASS · 0 FAIL**、`verify-pdf.ps1` **PASS**。明细见 §45。
+>
+> <details><summary>1.8.3 200% 缩放与空格偷按键</summary>
+>
+> **1.8.3**（2026-11-02）：**修好"Win11 200% 缩放下界面小一半"**——根因是窗口坐标是物理像素，而 30/24/15 这些几何量是照 100% 写的（顶栏只剩 15 DIP、正文 7.5 DIP）。17 个几何常量改成 DIP→物理像素的函数（161 处引用），字号表、PDF/图片的自然尺寸、预热线程一并换算；图片默认缩放 50% → 100%（老配置有 schema 1→2 迁移）。**空格热键不再偷按键**：修饰键改成精确匹配（`Ctrl+Space`/`Alt+Space` 不再被吞，`Shift+=` 单独放行），前台在输入文字时（桌面 F2 改名）直接放行；**收起预览时释放数字输入模式**（此前会一直吞数字键）。
 > 回归：`cargo test` **264 passed / 3 ignored**、fmt/clippy 零输出、`smoke.ps1` 17 PASS（1 SKIP=管理员会话 UIPI）、**视觉基线 5 张截图与改前逐字节一致**（96 DPI 下必须零变化）。200% 视觉验收待用户真机。
+> </details>
 >
 > <details><summary>1.8.2 图片/视频固定窗口大小</summary>
 
@@ -1373,3 +1390,34 @@ Excel 预览的**滚轮**（钩子放行 / `WM_MOUSEWHEEL` / `WM_VSCROLL` / `VK_
 
 发布：`git checkout --orphan publish-1.8.2` → 单条初始提交 → `gh repo create QuickLook-R --public --push`；
 详见 `docs/dev/HANDOFF.md`「发布准备记录」。
+
+## §45 1.8.3-fix 批次一（评审 7 项：收 5 项 + 自加 1 项，撤 1 项）
+
+**一句话**：一轮全仓评审之后挑"小改动、高确定性"的 6 项落地，不改变行为契约、不碰渲染热路径；
+评审里那条 `mem::forget` 的"修复"是拿真泄漏换假收益，没要。分支 `fix/1.8.3-batch1`（基于 `71999be`，7 个提交，快进关系）。
+
+| # | 点 | 做法 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | 嗅探全量读 | `crates/qlr-core/src/format.rs::kind_for_path` 改 `File::open` + `read(&mut [0u8; 512])` | 只取前 512 B 却 `fs::read` 整个文件，12 个调用点 |
+| 2 | 热键级 2 是死代码 | `GetFocus` → 同一次 `GetGUIThreadInfo` 输出里的 `gti.hwndFocus` | `GetFocus` 线程亲和，钩子线程恒 NULL；1.8.3 声称的"前台打字时不吞空格"从未生效 |
+| 2 | 钩子句柄泄漏 | `HotkeyGuard::stop()` 在 join 之后 `CloseHandle(stop)` 并归零；`start()` 的 spawn 失败路径补关 | 每进程泄漏 1 个内核事件 |
+| 3 | 压缩包前缀泄漏 | `crates/qlr-render/src/archive.rs` 两处插入点先 `contains` 再 `leak` | 重复值被 `BTreeSet` 丢弃但 `leak` 已经发生 → 确定性泄漏 |
+| 4 | `PageCache` 没有文件戳 | `PageKey` 加 `mtime`/`len`，`new()` 加 `stamp: (u64,u64)`，4 个调用点统一用 `file_stamp()` | 预览中文件被覆盖 → 翻页/翻回命中旧像素（与 CONVENTIONS #112 同坑） |
+| 5 | 预取重复查戳 | `prefetch_neighbor_pages()` 直接沿用 `key.mtime` / `key.len` | 省一次 metadata，且避免与触发它的 key 版本不一致 |
+| 6 | zip 里没有校验和 | `scripts/pack.ps1` 先生成 `SHA256SUMS.txt` 再 `Compress-Archive` | 清单原本在压缩之后才写 |
+| — | `ShellPreview::close()` | **不收**。`close()` 零调用点，实际收尸走 `app/shell.rs` 的 `drop(pending)` | `std::mem::forget(self)` 会跳过 `handler: IPreviewHandler` 的 Drop → 每次漏一个 COM 引用 |
+
+验证：
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出
+  （本批自带一处 fmt 违规——`render.rs:522` 单行超长、`hotkey.rs:34` import 换行——已单独 `style(fmt)` 提交修掉）。
+- `cargo test`：**287 passed / 4 ignored**（1.8.3 基线 286 + `pagecache::tests::stale_stamp_does_not_hit`）；
+  `cargo build --release` 通过。
+- 端到端（release 构建，本机交互式会话）：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP = 管理员会话
+  UIPI 拒托盘图标，非回归）、`verify-archive.ps1` **11 PASS · 0 FAIL**、`verify-pdf.ps1` **PASS**。
+  `verify-office.ps1` 未跑——本批不碰 Office 路径。
+- **必须人工确认的两条**：① 几 GB 的 `.iso` 改名成 `.xyz` 后按空格，任务管理器内存不飙升；
+  ② Win11 桌面 F2 就地改名之后按空格能打出空格，`app.log` 里 `text_focus_level=2`、`passed_text_focus=` 大于 0。
+
+范围外（评审的批次二，未开工，也是真正影响体感的那部分）：JPEG 解码不进 `source_cache`、
+PDF 每次预览把全文件读 3 遍、md/html 全文排版、锁中毒三套策略。

@@ -2618,3 +2618,74 @@ Excel/Word 的预览是 **OLE 就地激活**对象：容器窗口不激活、焦
   这是"只改了缩放、没改别的"的唯一硬证据。
 - `scripts/smoke.ps1`：17 PASS / 1 SKIP（管理员会话 UIPI，非回归）。
 - 200% 视觉验收待用户真机（`scripts/collect-diag.ps1` 收集日志 + DPI + 7 条口述答案）。
+
+## 2026-11-03 · 1.8.3-fix：批次一（评审 7 项里收 5 项 + 1 项自加）
+
+来源：对 1.8.3 全仓 7 个 crate 的一轮代码评审（报告 `QuickLook-R-review-1.8.3.md`，包外文件、不入库）。
+本批只做"小改动、高确定性"那一档：不碰渲染热路径，不动架构，不改变现有行为契约。
+
+### 做了什么
+
+1. **嗅探改有界读**（`qlr-core/src/format.rs::kind_for_path`）：扩展名不认识时的兜底嗅探原本用
+   `std::fs::read` 把**整个文件**读进内存、却只取前 512 字节（`SNIFF_LEN`）。改成 `File::open` +
+   `read(&mut [0u8; SNIFF_LEN])`，嗅探语义不变；12 个调用点全部受益（预览 .iso/.vhdx/无扩展名镜像
+   时内存峰值从"文件大小"降到 512 B）。
+2. **热键级 2 判据修死代码 + 钩子 stop 句柄泄漏**（`qlr-platform/src/hotkey.rs`）：
+   `foreground_is_text_entry()` 的级 2 用 `GetFocus()` 取焦点窗口——`GetFocus` 是**线程亲和**的，
+   钩子线程没有任何窗口，恒返回 NULL，所以级 2 自加进来就是死代码（上一节 1.8.3 条目里
+   "前台在打字时不吞空格"这句其实没有生效）。改用同一次 `GetGUIThreadInfo` 输出里的
+   `gti.hwndFocus`（跨线程有效），判据仍只认 `Edit` / `RichEdit20W` / `RichEdit50W` /
+   `RichEditD2DPT` 四个类名，不放大吞键面；`GetGUIThreadInfo` 失败时两级都判否（与原行为一致）。
+   顺带补 `HotkeyGuard::stop()` 的 `CloseHandle(stop)`（join 之后关、`self.stop` 归零防重关，
+   顺序必须是 SetEvent → join → CloseHandle）与 `start()` spawn 失败路径的漏关。
+3. **压缩包目录前缀只在新值时 leak**（`qlr-render/src/archive.rs`）：原本
+   `dirs.insert(prefix.clone().leak())` 无条件先 leak 再 insert——`BTreeSet` 对重复值会丢弃，
+   但泄漏已经发生。5000 个文件挤在同几层目录 = 上万次分配只有几条进集合，其余永久泄漏。
+   两处插入点（目录条目 + 每级前缀）都先 `contains` 判重，`dirs` 计数不变。
+4. **`PageCache` key 补文件戳**（`qlr-app/src/pagecache.rs` + `app/render.rs` 4 个调用点）：
+   `PageKey` 只有 路径+页号+宽高，预览中文件被编辑器保存/下载覆盖后翻页/翻回会直接命中**旧像素**
+   上屏——与 CONVENTIONS **#112**（`FrameKey` 就带了 mtime+len）是同一个坑。`PageKey` 增加
+   `mtime` / `len` 字段，`new()` 增加 `stamp: (u64, u64)` 参数，调用点统一用现成的 `file_stamp()`；
+   新增单测 `stale_stamp_does_not_hit` 钉住"mtime 或 len 任一变化都不命中"。
+5. **相邻页预取复用 key 里的文件戳**（同上，本批自加）：`prefetch_neighbor_pages()` 原先对同一个
+   文件再查一次 metadata，且查到的戳可能与触发它的 key 不一致（文件在这中间被覆盖时前后页会拿到
+   不同版本）；同一帧里前后页必然同属一个文件版本，直接沿用 `key.mtime` / `key.len`，省一次系统调用。
+6. **`pack.ps1` 先生成 SHA256SUMS 再压缩**：原本 `Compress-Archive` 在写清单之前，zip 里根本没有
+   校验和文件。现在先算清单、写文件，再压缩（清单本身不在清单里，属正常）。
+
+**没入库的两项**：
+
+- `ShellPreview::close()` 的"双重 Unload/DestroyWindow"经核**只存在于死代码**：`close()` 在整个
+  `crates/` 里零调用点（实际收尸走 `app/shell.rs` 的 `drop(pending)`，`Drop` 本就只跑一次）。
+  评审建议的 `std::mem::forget(self)` 会连 `handler: IPreviewHandler` 的 `Drop` 一起跳过
+  （`IUnknown::drop` 调 `Release`）——用无害的死代码换一个真 COM 引用泄漏，划不来，本批不收。
+  真要收拾就写成 `pub fn close(self) { drop(self) }`，或直接删掉这个方法。
+- 热键那项原本拆成两个提交（后一个只补前一个漏传的 `GetClassNameW` 实参、否则编译不过），
+  本批合并成一个逻辑改动，保证**每个提交都能编译**。
+
+### 为什么
+
+这几项全是"平时看不见、踩到就难看"的坑：GB 级未知文件顶满内存、Win11 桌面 F2 改名吞空格、
+常驻进程连看 N 个压缩包内存线性涨、PDF 被覆盖后显示旧页、发布 zip 缺校验和。
+它们都不改变任何行为契约，所以可以一次性合入，不需要视觉基线。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check`：零输出（本批自带一处 fmt 违规——`render.rs:522` 单行超长、
+  `hotkey.rs:34` import 换行——已单独 `style(fmt)` 提交修掉）。
+- `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**287 passed / 4 ignored / 0 failed**（app 62、core 54、platform 33+3、
+  plugin-api 4、plugin-demo 7、plugin-office 11、render 106+1、fuzz 1、malformed 9）；
+  较 1.8.3 基线 **+1** 个新单测（`pagecache::tests::stale_stamp_does_not_hit`，静态计数 290 → 291）。
+  上一节 1.8.3 条目记的"264 passed"是发布当时的数字，实测基线已到 286，别再照抄 264。
+- `cargo build --release`：通过。
+- `scripts/smoke.ps1`（release 构建）：**16 PASS · 1 SKIP · 0 FAIL**，覆盖 热键安装/热键处理链/
+  滚轮缩放/图片渲染 `elapsed=74ms`/干净退出 与"退出时卸载钩子"；SKIP 那条是托盘图标——
+  当前会话以管理员身份运行、explorer 非提权，`Shell_NotifyIconW` 被 UIPI 拒（0x80070005），非回归。
+  热键路径按 AGENTS §8 属于"改了就必须跑 smoke"的范围，已跑。
+- `scripts/verify-archive.ps1`：**11 PASS · 0 FAIL**——压缩包前缀改动在这里（目录树解析、
+  点目录行折叠/展开、滚轮按行滚动、`.cbz/.jar/.war` 接管、坏包不显示也不走渲染通道）。
+- `scripts/verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_8page.pdf`：**PASS**（页缓存改动在 PDF
+  翻页路径上；`SHOW 22ms` / `RENDER 5ms 619x876`、放大 0 残留）。
+- `verify-office.ps1` **未跑**：本批不碰 Office 路径，留到下次动 `IPreviewHandler` 时做防回归。
+

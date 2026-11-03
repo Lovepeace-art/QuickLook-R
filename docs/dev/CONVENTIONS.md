@@ -1088,6 +1088,11 @@ if edges.right  { r.right  = (r0.right  + (x - x0)).max(r.left  + MIN_W); }
 - 少了渲染尺寸/放大标志：缩放态与适应态互相命中，画面会被裁一刀。
 - 少了页号：PDF 第 1 页顶替第 5 页。
 
+**同一个坑踩第二次（1.8.3-fix）**：`PageCache` 的 `PageKey` 当初就少了文件戳，预览中文件被覆盖后
+翻页/翻回会直接命中旧像素（`crates/qlr-app/src/pagecache.rs`）。现已补 `mtime`/`len`，并有单测
+`stale_stamp_does_not_hit` 钉住。**结论：凡是"缓存到磁盘内容"的 key，都必须带文件戳**——
+`FrameKey`、`PageKey`、以及将来任何解码/排版缓存，一个都不能少。
+
 ## #113 `with_state` 不可重入：闭包里别再调 `with_state`
 
 `with_state` 底层是普通 `std::sync::Mutex`，**在闭包里再调一次就是自己锁自己**（死锁，不 panic）。
