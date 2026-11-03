@@ -87,11 +87,7 @@ try {
         New-Item -ItemType File -Force -Path (Join-Path $out 'portable.lock') | Out-Null
     }
 
-    # zip + 校验和
-    $zip = Join-Path $repo "dist\$name.zip"
-    if (Test-Path $zip) { Remove-Item $zip -Force }
-    Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -CompressionLevel Optimal
-
+    # 校验和清单先写好再压缩：这样 zip 里也带 SHA256SUMS.txt。
     $sums = Get-ChildItem $out -Recurse -File | Sort-Object FullName | ForEach-Object {
         $rel = $_.FullName.Substring($out.Length + 1) -replace '\\', '/'
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -99,6 +95,10 @@ try {
     }
     $sums | Set-Content (Join-Path $out 'SHA256SUMS.txt') -Encoding utf8NoBOM
     $sums | ForEach-Object { Write-Host "  $_" }
+
+    $zip = Join-Path $repo "dist\$name.zip"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -CompressionLevel Optimal
 
     $exeSize = (Get-Item (Join-Path $out 'qlrust.exe')).Length
     Write-Host ("  产物：{0}" -f $out)
