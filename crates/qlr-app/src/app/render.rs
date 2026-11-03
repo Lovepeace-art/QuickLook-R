@@ -1103,12 +1103,14 @@ pub(crate) fn prefetch_neighbor_pages(key: &pagecache::PageKey) {
         if target < 0 || target as usize >= total {
             continue;
         }
+        // 文件戳直接沿用当前这一页的 key：同一帧里前后页必然同属一个版本的
+        // 文件，再查一次 metadata 只是白花一次系统调用（还可能与 key 不一致）。
         let neighbor = pagecache::PageKey::new(
             &key.path,
             target as usize,
             key.width,
             key.height,
-            file_stamp(&key.path),
+            (key.mtime, key.len),
         );
         if pagecache::has(&neighbor) {
             continue;
