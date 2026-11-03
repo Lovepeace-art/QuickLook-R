@@ -1,6 +1,6 @@
 # QLRust 基准脚本（M6 A6.4：可无人值守跑，进 CI）
 #
-# 量三张表：冷启动、首帧（按键→可见）、内存（峰值/稳态）。
+# 量四张表：冷启动、首帧（按键→可见）、内存（峰值/稳态）、GDI/USER 对象（收起之后）。
 # 与上级目录 docs/bench-compare.md 里 QuickLook 4.5.0 的同机数字可比：
 #   QuickLook 4K 热路径 421 ms / 48MP 418 ms / 26 MB 文本 923 ms
 #
@@ -8,6 +8,7 @@
 #   pwsh -NoProfile -File scripts\bench.ps1                       # 默认夹具目录自动找
 #   pwsh -NoProfile -File scripts\bench.ps1 -FixtureDir target\bench-fixtures -Budget scripts\bench-budget.json
 #   pwsh -NoProfile -File scripts\bench.ps1 -Only pdf -Rounds 2   # 只跑名字含 pdf 的场景
+#   pwsh -NoProfile -File scripts\bench.ps1 -Only 4K -Rounds 1 -Passes 20   # GDI/内存泄漏浸泡
 # 输出：控制台三张表 + <JsonOut>（默认 scripts\bench-results.json）
 # 退出码：0 全通过；1 有 FAIL 或超预算
 #
@@ -17,7 +18,16 @@
 #   * PerceivedMs  = 从"第二实例投递请求"到"日志里出现 RENDER 行"的墙钟时间，含
 #                    进程创建、WM_COPYDATA、首帧上屏 —— 用户真正感觉到的那个数
 #   * PeakRSSMB    = 渲染过程中采样到的 working set 峰值（渲染完缓冲就释放，事后读不到）
+#   * PeakPrivateMB = 同上，但取 private bytes 峰值 —— 大图/PDF 的真实内存占用看这个，
+#                     working set 会被系统裁剪，看着小。
 #   * RSSMB / PrivateMB = 渲染完成后的稳态
+#   * AllocKB / LiveKB = 这一帧渲染一共分配了多少字节（日志 `RENDERALLOC gen=N bytes=… live=…`）。
+#                    只有 `cargo build --release -p qlr-app --target-dir target\alloc-stats
+#                    --features alloc-stats` 构建的 exe 才有这行；普通构建这一列是空的。
+#   * GdiAfterHide / UserAfterHide = 每轮"收起预览之后"日志里的 GDI/USER 对象数
+#                    （app 的 hide 打 `HIDE … GDI=n USER=n`）。判据是每轮回到同一个值：
+#                    每轮 +1 就是泄漏（进程级配额默认 1 万，攒够界面开始掉字）。
+#                    这条不依赖预算文件也会判红。
 #
 # 历史坑（见 docs/dev/CONVENTIONS.md #37）：上一轮的常驻实例没退出时，新实例只把请求
 # 转交给它，而它握着已删除日志的句柄 → 每轮 FAIL(无 RENDER)。本脚本因此对"停旧宿主"
@@ -28,6 +38,9 @@ param(
     [string]$FixtureDir = "",
     # 每场景重复几轮；第 0 轮是冷启动（新常驻实例），第 1 轮起是热路径
     [int]$Rounds = 2,
+    # 每轮里"显示→收起"重复几次；第 0 次是冷路径，第 1 次起是热路径。
+    # 想抓 GDI/内存泄漏就跑 `-Rounds 1 -Passes 20`（同一进程里连续开合 20 次）。
+    [int]$Passes = 2,
     # 只跑名字匹配的场景（-like 语义），空 = 全跑
     [string]$Only = "",
     # 预算文件（JSON）；给出则超预算退出码 1
@@ -164,7 +177,8 @@ foreach ($fx in $scenarios) {
             $results.Add([pscustomobject]@{
                 场景 = $fx.Name; 轮次 = $round; 结果 = "FAIL(壳层未就绪)"; 类型 = $null
                 ColdStartMs = $null; RenderMs = $null; PerceivedMs = $null
-                字节 = $null; PeakRSSMB = $null; RSSMB = $null; PrivateMB = $null
+                字节 = $null; PeakRSSMB = $null; PeakPrivateMB = $null; RSSMB = $null; PrivateMB = $null
+                GdiAfterHide = $null; UserAfterHide = $null; AllocKB = $null; LiveKB = $null
             })
             $failed = $true
             continue
@@ -173,13 +187,28 @@ foreach ($fx in $scenarios) {
         $coldStartMs = if ($shellLine) { [int]$shellLine.Matches[0].Groups[1].Value } else { $null }
 
         # 冷启动那一下：投递请求并等 RENDER
-        $passCount = 2   # 一次冷一次热
+        $passCount = [math]::Max(1, $Passes)
         $prevGen = 0
         for ($pass = 0; $pass -lt $passCount; $pass++) {
             # 同一个文件再请求一次是 Toggle（把窗口关掉），所以每轮先显式 --hide，
             # 否则第二轮只会看到 HIDE、永远等不到新的 RENDER。
             Start-Qlr -Exe $Exe -ArgList @("--hide") | Out-Null
             Start-Sleep -Milliseconds 80
+
+            # 收起之后的 GDI/USER 残留：app 在 hide 里打 "HIDE elapsed=… GDI=n USER=n"。
+            # 判据是"每轮回到同一个数"——现场报障过"每预览一个文件 GDI +1 且收起不释放"，
+            # 那是进程级配额（默认 1 万），攒够了界面开始掉字，靠肉眼发现已经太晚。
+            $gdiAfterHide = $null
+            $userAfterHide = $null
+            if (Test-Path $logFile) {
+                $hideText = Read-LogText
+                $mh = [regex]::Matches($hideText, "HIDE elapsed=(\d+)ms GDI=(\d+) USER=(\d+)")
+                if ($mh.Count -gt 0) {
+                    $lastHide = $mh[$mh.Count - 1]
+                    $gdiAfterHide = [int]$lastHide.Groups[2].Value
+                    $userAfterHide = [int]$lastHide.Groups[3].Value
+                }
+            }
 
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             Start-Qlr -Exe $Exe -ArgList @($path) | Out-Null
@@ -217,13 +246,30 @@ foreach ($fx in $scenarios) {
                 $results.Add([pscustomobject]@{
                     场景 = $fx.Name; 轮次 = "$round.$pass"; 结果 = "FAIL(无 RENDER)"; 类型 = $null
                     ColdStartMs = $coldStartMs; RenderMs = $null; PerceivedMs = $sw.ElapsedMilliseconds
-                    字节 = $null; PeakRSSMB = [math]::Round($peakRss / 1MB, 1); RSSMB = $null; PrivateMB = $null
+                    字节 = $null; PeakRSSMB = [math]::Round($peakRss / 1MB, 1)
+                    PeakPrivateMB = [math]::Round($peakPrivate / 1MB, 1); RSSMB = $null; PrivateMB = $null
+                    GdiAfterHide = $gdiAfterHide; UserAfterHide = $userAfterHide
+                    AllocKB = $null; LiveKB = $null
                 })
                 $failed = $true
                 continue
             }
 
             $proc = Get-HostProcess -Path $Exe
+            # 帧级分配：只有 `--features alloc-stats` 构建的 exe 才打 RENDERALLOC 行，
+            # 普通构建这里就是 $null（列保持为空，不伪造 0）。
+            $allocBytes = $null
+            $liveBytes = $null
+            if (Test-Path $logFile) {
+                $allocText = Read-LogText
+                $gen = [int]$renderLine.Groups[1].Value
+                foreach ($m in [regex]::Matches($allocText, "RENDERALLOC gen=(\d+) bytes=(\d+) live=(\d+)")) {
+                    if ([int]$m.Groups[1].Value -eq $gen) {
+                        $allocBytes = [int]$m.Groups[2].Value
+                        $liveBytes = [int]$m.Groups[3].Value
+                    }
+                }
+            }
             $results.Add([pscustomobject]@{
                 场景 = $fx.Name
                 轮次 = "$round.$pass"
@@ -234,8 +280,13 @@ foreach ($fx in $scenarios) {
                 PerceivedMs = $sw.ElapsedMilliseconds
                 字节 = [int]$renderLine.Groups[3].Value
                 PeakRSSMB = [math]::Round($peakRss / 1MB, 1)
+                PeakPrivateMB = [math]::Round($peakPrivate / 1MB, 1)
                 RSSMB = if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { $null }
                 PrivateMB = if ($proc) { [math]::Round($proc.PrivateMemorySize64 / 1MB, 1) } else { $null }
+                GdiAfterHide = $gdiAfterHide
+                UserAfterHide = $userAfterHide
+                AllocKB = if ($null -ne $allocBytes) { [math]::Round($allocBytes / 1KB, 1) } else { $null }
+                LiveKB = if ($null -ne $liveBytes) { [math]::Round($liveBytes / 1KB, 1) } else { $null }
             })
         }
 
@@ -247,10 +298,34 @@ foreach ($fx in $scenarios) {
                 foreach ($field in @(@{ Key = "RenderMs"; Budget = $b.Value.render_ms },
                                      @{ Key = "PerceivedMs"; Budget = $b.Value.perceived_ms },
                                      @{ Key = "PeakRSSMB"; Budget = $b.Value.peak_rss_mb },
+                                     @{ Key = "PeakPrivateMB"; Budget = $b.Value.peak_private_mb },
+                                     @{ Key = "GdiAfterHide"; Budget = $b.Value.gdi_after_hide },
                                      @{ Key = "ColdStartMs"; Budget = $budgetObj.cold_start_ms })) {
                     if ($null -ne $field.Budget -and $null -ne $hot.($field.Key) -and $hot.($field.Key) -gt $field.Budget) {
                         $overBudget.Add(("{0} {1}={2} > 预算 {3}" -f $fx.Name, $field.Key, $hot.($field.Key), $field.Budget))
                     }
+                }
+            }
+        }
+
+        # GDI/USER 泄漏判据（不依赖预算文件）：同一个进程里连续"显示→收起"之后，
+        # 对象数应该稳定不涨。现场报障的形态是"每预览一个文件 GDI +1 且收起不释放"，
+        # 攒到进程级配额（默认 1 万）界面就开始掉字 —— 靠肉眼发现已经太晚。
+        #
+        # 注意口径：每轮都会重启常驻实例，所以第 1 次收起是"冷启动后的稳态基线"
+        # （窗口刚建好，比空进程多几个对象是正常的）；判据只用第 2 次及以后的样本。
+        # 默认 2 次样本看不出趋势，想抓泄漏跑 `-Rounds 1 -Passes 20` 浸泡。
+        foreach ($key in @(@{ Field = "GdiAfterHide"; What = "GDI" },
+                           @{ Field = "UserAfterHide"; What = "USER" })) {
+            $series = @($results |
+                Where-Object { $_.场景 -eq $fx.Name -and $_.轮次 -like "$round.*" -and $null -ne $_.($key.Field) } |
+                ForEach-Object { [int]$_.($key.Field) })
+            if ($series.Count -ge 3) {
+                $settled = $series[1]
+                $worst = ($series[1..($series.Count - 1)] | Measure-Object -Maximum).Maximum
+                if ($worst -gt $settled + 2) {
+                    $overBudget.Add(("{0} 第 {1} 轮 {2} 收起后从 {3} 涨到 {4}（{5}）：疑似泄漏" -f
+                        $fx.Name, $round, $key.What, $settled, $worst, ($series -join " → ")))
                 }
             }
         }
@@ -269,7 +344,15 @@ $results | Select-Object 场景, 轮次, 结果, 类型, RenderMs, PerceivedMs, 
     Format-Table -AutoSize | Out-String | Write-Output
 
 Write-Output "=== 内存（峰值 / 稳态）==="
-$results | Select-Object 场景, 轮次, 结果, PeakRSSMB, RSSMB, PrivateMB |
+$results | Select-Object 场景, 轮次, 结果, PeakRSSMB, PeakPrivateMB, RSSMB, PrivateMB |
+    Format-Table -AutoSize | Out-String | Write-Output
+
+Write-Output "=== 帧级分配（只有 alloc-stats 构建才有数）==="
+$results | Select-Object 场景, 轮次, 结果, AllocKB, LiveKB |
+    Format-Table -AutoSize | Out-String | Write-Output
+
+Write-Output "=== GDI / USER 对象（收起之后）==="
+$results | Select-Object 场景, 轮次, 结果, GdiAfterHide, UserAfterHide |
     Format-Table -AutoSize | Out-String | Write-Output
 
 $payload = [ordered]@{
