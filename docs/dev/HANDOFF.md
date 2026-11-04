@@ -796,3 +796,14 @@ media 15 / mediashape 13。
 
 **下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；Markdown
 `layout` 240ms 可作渲染层独立小项；之后重心转插件。
+
+## 平台层收尾三件套 接力说明（2026-11-04）
+
+**这一批做了什么**：
+- `session.rs`：`impl State { State::new(config, host, preview, shadow, request_started) }` + `reset_for_hide()`（集中清 13 个瞬态：visible/pinned/resize_edges/resize_from/media_aspect/surface/drag_from/dragged/slide/toast/shell_input_pending/hold_frame/page_edit）；`boot.rs` State 初始化改 `State::new(...)`；`show.rs::hide_preview` 改调 `s.reset_for_hide()`。
+- `backend.rs`：`Surface::from_canvas(&Canvas)`；`session.rs::set_content` 用实际内容校准 `State.surface`。
+- `markdown.rs`：`is_plain` 纯文本行快速通道 + `layout_capped(..., fast)` + `fastpath_on()`（`QLRUST_NO_MD_FASTPATH` 关）；单测 `fast_path_matches_slow_path`。
+
+**实测**：8 MB Markdown `layout` 全量 **346→190 ms（−45%）**（`render_with(head,20万行)` 241→146 ms）；`cargo test` **314 passed / 0 failed**；`verify-layers` **14 PASS**；`smoke` 16 PASS·1 SKIP；release 32.71s。
+
+**下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件打磨。

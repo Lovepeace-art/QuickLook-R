@@ -24,6 +24,20 @@ pub(crate) enum Surface {
     List,
 }
 
+impl Surface {
+    /// 用"真正到手的 `Canvas`"校准表面（两者 `Bitmap`/`Text` 一一对应）。
+    ///
+    /// `show_preview` 是按 `Kind` **预算**表面（`backend.surface(kind)`），但插件返回的内容
+    /// 可能与预算不同（例如插件给的是文本而非位图）。内容抵达时以实际 `Canvas` 为准，
+    /// 保证 `State.surface` 与 `get_content()` 讲的是同一件事，`repaint` 才不会走错通道。
+    pub(crate) fn from_canvas(canvas: &qlr_render::Canvas) -> Surface {
+        match canvas {
+            qlr_render::Canvas::Bitmap(_) => Surface::Bitmap,
+            qlr_render::Canvas::Text(_) => Surface::Text,
+        }
+    }
+}
+
 /// 谁能接管一个文件的预览。
 ///
 /// 实现者应是**无状态零大小**的：`resolve` 每次按需返回静态引用，不分配。

@@ -317,6 +317,106 @@ pub(crate) struct State {
     pub(crate) wrap_cache: wrapcache::WrapCache,
 }
 
+impl State {
+    /// 构造一个全新的会话状态（`boot` 启动时唯一调用点；单测也用它）。
+    pub(crate) fn new(
+        config: Config,
+        host: Hwnd,
+        preview: Hwnd,
+        shadow: Option<Hwnd>,
+        request_started: Instant,
+    ) -> State {
+        State {
+            config,
+            host,
+            preview,
+            shadow,
+            visible: false,
+            last_path: None,
+            surface: None,
+            request_started,
+            render_gen: 0,
+            page: 0,
+            pages: None,
+            zoom: 1.0,
+            scroll: 0,
+            wrapped_consumed: 0,
+            natural: None,
+            base: None,
+            drag_from: None,
+            dragged: false,
+            drag_residual: 0,
+            zoom_anchor: None,
+            scroll_anchor: None,
+            zoom_preview: false,
+            pan: (0, 0),
+            styled_logged: false,
+            lens: None,
+            lens_zoom: LENS_DEFAULT_ZOOM,
+            hover_button: None,
+            page_edit: None,
+            wheel_acc: 0,
+            toc_scroll: 0,
+            hover_toc: false,
+            scroll_drag: false,
+            toc: Vec::new(),
+            toc_active: None,
+            pinned: false,
+            resize_edges: None,
+            resize_from: None,
+            media_aspect: None,
+            last_pos: None,
+            last_sizes: std::collections::BTreeMap::new(),
+            last_show_at: None,
+            prewarm_candidate: None,
+            render_since: None,
+            render_warned: false,
+            pending_key: None,
+            pending_frame: None,
+            shell_preview: None,
+            toast: None,
+            slide: None,
+            shell_input_pending: false,
+            hold_frame: false,
+            shell_cover: None,
+            shell_owns_input: false,
+            shell_poll: 0,
+            audio: None,
+            audio_ticking: false,
+            video: None,
+            wrap_cache: wrapcache::WrapCache::default(),
+        }
+    }
+
+    /// 收起预览时把"本次预览的瞬态状态"一次性清干净（§7 收尾，平台层完善第 7 项）。
+    ///
+    /// 以前这些赋值散在 `hide_preview` 的 `with_state` 闭包里：字段一多就漏清
+    /// （`surface` 就是新加的——忘了清会让下一帧按旧表面路由）。集中到一处后，
+    /// 新增瞬态字段只改这里 + `reset_for_hide_clears_transient_state` 单测。
+    ///
+    /// 为什么这些必须清：拖边/拖动的中间状态留着，下一次显示后第一条鼠标移动会拿
+    /// "上一次的原始矩形 + 这一次的位移"把窗口瞬间跳回旧尺寸；页码输入状态留着，
+    /// `CAPTURE_DIGITS` 会继续吞数字键，用户在别的程序里打不出字。
+    ///
+    /// 不收在此处的字段（`page`/`pages`/`scroll`/`zoom`/`toc` 等）由 `show_preview`
+    /// 每次打开时重置，属于"内容态"而非"本次预览的瞬态"。
+    pub(crate) fn reset_for_hide(&mut self) {
+        self.visible = false;
+        self.pinned = false;
+        self.resize_edges = None;
+        self.resize_from = None;
+        self.media_aspect = None;
+        self.surface = None;
+        self.drag_from = None;
+        self.dragged = false;
+        self.slide = None;
+        self.toast = None;
+        self.shell_input_pending = false;
+        self.hold_frame = false;
+        self.page_edit = None;
+    }
+}
+
 /// 视频播放状态（1.7.9）。
 ///
 /// 只有 UI 线程碰它（`TIMER_VIDEO` 也是在 UI 线程上来的），所以不需要锁。
@@ -518,6 +618,9 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         },
         _ => Vec::new(),
     };
+    // §7 收尾（平台层完善第 7 项）：内容抵达时用**实际 Canvas** 校准表面，
+    // 让 `State.surface` 与 `get_content()` 始终一致（`show_preview` 的预算是按 Kind 猜的）。
+    let surface = content.as_deref().map(backend::Surface::from_canvas);
     if let Some(slot) = CONTENT.get()
         && let Ok(mut guard) = slot.lock()
     {
@@ -533,6 +636,9 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.toc_scroll = 0;
         // 折行缓存是按"行号"存的，换内容必须整本作废（否则会拿旧文件的折行结果画新文件）。
         s.wrap_cache.clear();
+        if let Some(surface) = surface {
+            s.surface = Some(surface);
+        }
     });
 }
 
@@ -552,4 +658,50 @@ pub(crate) fn current_kind() -> Option<format::Kind> {
 /// 预览窗句柄（还没建过就是 `None`）。
 pub(crate) fn preview_raw() -> Option<HWND> {
     with_state(|s| s.preview.raw())
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    fn blank_state() -> State {
+        State::new(
+            crate::app::Config::default(),
+            Hwnd(0),
+            Hwnd(0),
+            None,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// `reset_for_hide` 必须把每个"本次预览的瞬态字段"清干净（§7 收尾，防止漏清）。
+    #[test]
+    fn reset_for_hide_clears_transient_state() {
+        let mut s = blank_state();
+        s.visible = true;
+        s.pinned = true;
+        s.surface = Some(crate::app::backend::Surface::List);
+        s.drag_from = Some((3, 4));
+        s.dragged = true;
+        s.slide = Some((2, 9));
+        s.toast = Some(("x".to_string(), std::time::Instant::now()));
+        s.shell_input_pending = true;
+        s.hold_frame = true;
+        s.page_edit = Some("12".to_string());
+        s.media_aspect = Some(1.5);
+        s.reset_for_hide();
+        assert!(!s.visible, "visible 应收起");
+        assert!(!s.pinned, "pinned 应清");
+        assert!(s.surface.is_none(), "surface 应清");
+        assert!(s.drag_from.is_none(), "drag_from 应清");
+        assert!(!s.dragged, "dragged 应清");
+        assert!(s.slide.is_none(), "slide 应清");
+        assert!(s.toast.is_none(), "toast 应清");
+        assert!(!s.shell_input_pending, "shell_input_pending 应清");
+        assert!(!s.hold_frame, "hold_frame 应清");
+        assert!(s.page_edit.is_none(), "page_edit 应清");
+        assert!(s.media_aspect.is_none(), "media_aspect 应清");
+        assert!(s.resize_edges.is_none(), "resize_edges 应清");
+        assert!(s.resize_from.is_none(), "resize_from 应清");
+    }
 }

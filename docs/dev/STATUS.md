@@ -1,5 +1,13 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **平台层收尾三件套（State.reset_for_hide / Canvas-Surface 对齐 / Markdown 排版快通道）**：
+> ① `State::new` + `reset_for_hide()` 把 13 个瞬态清理由 `hide_preview` 收成一处，补单测；
+> ② `Surface::from_canvas` 让 `State.surface` 以实际内容校准，与 `get_content` 对齐；
+> ③ Markdown 排版加"纯文本行快速通道"（`QLRUST_NO_MD_FASTPATH` 可关），8 MB 合成 `layout` 全量
+> **346 → 190 ms（−45%）**，`render_with(head,20万行)` 241 → 146 ms；逐字节等价有单测。回归 `cargo test`
+> **314 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。明细见 §55。
+>
+
 > 更新时间：2026-11-04 · **window.rs 纯搬家拆成 window/ 子模块（平台层完善第 6 项）**：把 3660 行的
 > `qlr-platform/src/window.rs` 拆成 `window/{mod,shadow,text,settings,chrome,paint,scroll,audio,toc,bitmap}.rs`，
 > 每块只多一行 `use super::*;`、函数体一字未改；`mod.rs` 剩 1381 行、最大子模块 `text.rs` 915 行。

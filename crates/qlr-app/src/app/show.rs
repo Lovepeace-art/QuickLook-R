@@ -988,30 +988,10 @@ pub(crate) fn hide_preview() {
     // 我们自己的 wndproc，而 `repaint` 那条路要再拿一次 STATE 锁。此时本线程正持着
     // 锁 → 重入等待，整窗假死（空格关不掉、托盘退出卡住）。
     let Some((preview, shadow, elapsed)) = with_state(|s| {
-        s.visible = false;
-        // 收起之后不再跟着选中项跑（否则看不见的窗口还在后台不停重光栅化）。
-        s.pinned = false;
-        // 1.7.4：**拖边/拖动的中间状态必须一起清掉**。
-        // 以前这里不清，若恰好在拖动/改大小的过程中被收起（空格、`--hide`、托盘），
-        // capture 与 `resize_from` 会留在状态里：下一次显示后第一条鼠标移动
-        // 会拿"上一次的原始矩形 + 这一次的位移"把窗口瞬间跳到旧尺寸（用户看到的
-        // 是"窗口自己跳回去了"）。同时 PPT 的翻页计数与提示也要跟本次预览一起失效。
-        s.resize_edges = None;
-        s.resize_from = None;
-        s.media_aspect = None;
-        s.surface = None;
-        s.drag_from = None;
-        s.dragged = false;
-        s.slide = None;
-        s.toast = None;
-        s.shell_input_pending = false;
-        s.hold_frame = false;
-        // 1.8.3（T03）：页码输入状态必须跟预览一起收起。
-        // 以前这里不清：点开页码框输到一半按空格/`--hide` 收起窗口，`page_edit` 留在
-        // 状态里、`CAPTURE_DIGITS` 还开着 → 全局钩子继续吞数字/退格/回车，用户在**别的
-        // 程序**里打不出数字（这个"谁吞了我的按键"极难自查）。`finish_page_edit(false)`
-        // 会同时把 `page_edit` 清掉并 `set_capture_digits(false)`。
-        s.page_edit = None;
+        // 收起时把所有"本次预览的瞬态状态"一次性清干净（§7 收尾，平台层完善第 7 项）。
+        // 以前这些赋值散在这里，字段一多就容易漏清（`surface` 就是新加的）。集中到
+        // `State::reset_for_hide()`，新增瞬态字段只改那里 + 单测。
+        s.reset_for_hide();
         (s.preview, s.shadow, s.request_started.elapsed().as_millis())
     }) else {
         return;

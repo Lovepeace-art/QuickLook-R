@@ -52,7 +52,7 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
     // `head` 模式排到 max_lines 就停手：后面的行本来也要被截掉。
     // 尾对齐模式（`head == false`）没这个便宜可占 —— 要看结尾就得把全文排完。
     let (mut lines, mut styles, capped) = if head {
-        layout_capped(&raw, max_lines)
+        layout_capped(&raw, max_lines, fastpath_on())
     } else {
         let (lines, styles) = layout(&raw);
         (lines, styles, false)
@@ -122,8 +122,38 @@ pub fn outline(lines: &[String], styles: &[LineStyle]) -> Vec<TocEntry> {
 /// 代码块内部保留原样（`**` 在代码里就是字面上的两个星号）；
 /// 其余行都过一遍 `inline()`，去掉行内标记。
 pub fn layout(lines: &[&str]) -> (Vec<String>, Vec<LineStyle>) {
-    let (texts, styles, _capped) = layout_capped(lines, usize::MAX);
+    let (texts, styles, _capped) = layout_capped(lines, usize::MAX, fastpath_on());
     (texts, styles)
+}
+
+/// 是否启用"纯文本行快速通道"（A/B 开关，遵循 06 文档的 `QLRUST_*` 约定）。
+///
+/// 置 `QLRUST_NO_MD_FASTPATH=1` 可关闭，回到"每行逐级尝试 block 再 inline"的老路径。
+fn fastpath_on() -> bool {
+    std::env::var_os("QLRUST_NO_MD_FASTPATH").is_none()
+}
+
+/// 判断一行能否按"纯文本"直出，跳过所有 Markdown 解析（性能快速通道）。
+///
+/// 安全性：块级记号只在**行首**起作用（`#` `>` `|` `-` `*` `+` / 数字有序列表 / ``` ```
+/// `~~~`）；行内记号 `* _ ~ ` [ ] < \ !` 可能出现在任意位置。只要两者都不出现，
+/// 所有 block 解析都会返回 `None`、`inline()` 也会原样返回，于是 `clip(line)` 与
+/// "逐级尝试再 inline" 的结果**逐字节一致**。纯文本行占 README 的绝大多数，
+/// 这条通道把 8 MB 排版从"每行多次 `Vec<char>` 分配"降为"一次字节扫描"。
+fn is_plain(line: &str) -> bool {
+    let t = line.trim_start();
+    if let Some(first) = t.chars().next() {
+        if matches!(first, '#' | '>' | '|' | '-' | '*' | '+' | '`' | '~') || first.is_ascii_digit()
+        {
+            return false;
+        }
+    }
+    !line.bytes().any(|b| {
+        matches!(
+            b,
+            b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'<' | b'\\' | b'!'
+        )
+    })
 }
 
 /// 排版，但产出满 `max_out` 行就停手。返回「(文本, 样式, 是否被截住)」。
@@ -132,7 +162,11 @@ pub fn layout(lines: &[&str]) -> (Vec<String>, Vec<LineStyle>) {
 /// `MAX_LINES` 也只要 20 万行——`head` 模式下后面的行反正要被 `truncate` 掉，
 /// 排它们纯属白干。一行源文本最多产出 1 行显示文本（围栏标记行产出 0 行），
 /// 所以在循环开头判断"已经够了"与"排完再截"结果完全一致。
-fn layout_capped(lines: &[&str], max_out: usize) -> (Vec<String>, Vec<LineStyle>, bool) {
+fn layout_capped(
+    lines: &[&str],
+    max_out: usize,
+    fast: bool,
+) -> (Vec<String>, Vec<LineStyle>, bool) {
     let mut out_text = Vec::with_capacity(lines.len().min(max_out));
     let mut out_style = Vec::with_capacity(lines.len().min(max_out));
     let mut in_fence = false;
@@ -146,6 +180,14 @@ fn layout_capped(lines: &[&str], max_out: usize) -> (Vec<String>, Vec<LineStyle>
 
         if is_fence(line) {
             in_fence = !in_fence;
+            continue;
+        }
+
+        // 快速通道：非代码块里的纯文本行直接出，跳过所有 block/inline 解析。
+        // 与下方"逐级尝试"结果逐字节一致（见 `is_plain` 的安全性说明）。
+        if fast && !in_fence && is_plain(line) {
+            out_text.push(clip(line));
+            out_style.push(LineStyle::Normal);
             continue;
         }
 
@@ -734,5 +776,36 @@ mod tests {
                 ms(t.elapsed())
             );
         }
+    }
+
+    /// 快速通道与老路径必须**逐字节一致**（否则会静默改变 Markdown 渲染结果）。
+    #[test]
+    fn fast_path_matches_slow_path() {
+        let corpus: Vec<&str> = vec![
+            "",
+            "普通中文段落，没有任何标记。",
+            "  ##  缩进标题  ##",
+            "| a | b |",
+            "| --- | :--: |",
+            "- 列表 **粗** 与 `code`",
+            "* 星号项",
+            "+ 加号项",
+            "1. 有序项",
+            "2) 另一种有序",
+            "> 引用 > 里还有尖括号",
+            "a_b_c 与 snake_case",
+            "2024 年的报告",
+            "```",
+            "code 里 **不解析** 与 `反引号`",
+            "```",
+            "---",
+            "***",
+            "text with [link](https://x) and <b>html</b> and \\*escaped",
+            "emoji 🚀 纯文本",
+        ];
+        let (fast_text, fast_style, _) = layout_capped(&corpus, usize::MAX, true);
+        let (slow_text, slow_style, _) = layout_capped(&corpus, usize::MAX, false);
+        assert_eq!(fast_text, slow_text, "快速通道的文本行必须与老路径一致");
+        assert_eq!(fast_style, slow_style, "快速通道的样式必须与老路径一致");
     }
 }

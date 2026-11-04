@@ -3159,3 +3159,19 @@ app 只编排、不碰 FFI：
 ### 下一步
 
 - `PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后转插件打磨。
+
+## 2026-11-04 · 平台层收尾三件套（State.reset_for_hide / Canvas-Surface 对齐 / Markdown 排版快通道）
+
+### 做了什么
+- **State 隐藏清理收口**：`session.rs` 新增 `impl State { fn new(...); fn reset_for_hide(&mut self) }`，把 `hide_preview` 里逐字段清 13 个瞬态搬进 `reset_for_hide`；`boot.rs` 的 State 字面量改用 `State::new(...)`；补单测 `reset_for_hide_clears_transient_state`（13 字段逐个断言）。
+- **Canvas/Surface 对齐**：`backend.rs` 加 `Surface::from_canvas(&Canvas)`；`session.rs::set_content` 用实际 Canvas 校准 `State.surface`（`set_content(None)` 的 ChildWindow/List 不受影响），保证 `surface` 与 `get_content` 永远一致、repaint 不走错通道。
+- **Markdown 排版快通道**：`markdown.rs` 加 `is_plain`，非代码块里的纯文本行（行首无 `#>|-*+`/数字、任意处无 `` * _ ~ ` [ ] < \ ! ``）直接 `clip(line)` 出 `Normal`，跳过全部 block/inline 解析；`layout_capped` 增加 `fast: bool` 参数，`fastpath_on()` 读 `QLRUST_NO_MD_FASTPATH` 做 A/B。新增单测 `fast_path_matches_slow_path` 用 20 行混合语料断言快慢路径**逐字节一致**。
+
+### 为什么
+- 隐藏时零散清字段，字段越多越容易漏清（本刀前刚因加 `surface` 需同步改 hide）；集中一处 + 单测兜底。
+- 插件可能返回与 Kind 预算不同的内容，`State.surface` 若只按 Kind 设置会和实际 `Canvas` 不符，repaint 走错通道。
+- 8 MB Markdown 的 `layout` 是首屏瓶颈；纯文本行占文档多数，却每行都做多次 `Vec<char>` 分配。
+
+### 怎么验证（实测数字）
+- Markdown 8 MB 合成（297354 行）`cargo test --release -p qlr-render --lib bench_md_phases -- --ignored --nocapture`：**layout 全量 346.1 → 190.0 ms（−45%）**；`render_with(head,200000 行)` 241.3 → 146.1 ms；`render_with(head,400 行)` 15.1 → 15.4 ms（首屏基本不变）。fastpath 关闭（`QLRUST_NO_MD_FASTPATH=1`）即基线。
+- `cargo test` **314 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 32.71s；`smoke` 16 PASS · 1 SKIP（tray UIPI）。
