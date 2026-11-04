@@ -22,6 +22,13 @@ use qlr_plugin_api::{
     SYM_TEXT, SYM_TEXT_FREE, parse_extensions,
 };
 
+/// 一次最多加载多少个插件（防止有人往 `plugins\` 里塞几百个 DLL）。
+const MAX_PLUGINS: usize = 64;
+/// 单个插件 DLL 的大小上限（超过直接跳过，不 `LoadLibrary`）。
+const MAX_DLL_BYTES: u64 = 64 * 1024 * 1024;
+/// 插件文本输出（大纲）的字节上限，超过就 `free` 后当作没有文本。
+const MAX_TEXT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 /// 插件渲染出来的一张图（宿主自己的类型，与 ABI 解耦）。
 #[derive(Clone, Debug)]
 pub struct PluginImage {
@@ -97,6 +104,11 @@ impl Plugin {
             if !ptr.is_null() {
                 unsafe { free_fn(ptr, len) };
             }
+            return None;
+        }
+        // 文本输出也要设上限：否则一个坏插件返回 4 GB 长度会让宿主直接 OOM。
+        if len > MAX_TEXT_OUTPUT_BYTES {
+            unsafe { free_fn(ptr, len) };
             return None;
         }
         let owned = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
@@ -210,7 +222,41 @@ impl PluginHost {
             })
             .collect();
         files.sort();
+        // 只接受 plugins 目录内的真实文件：符号链接指到目录外的一律拒绝（防 DLL 劫持）。
+        let dir_canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         for file in files {
+            if host.plugins.len() >= MAX_PLUGINS {
+                host.errors.push(format!(
+                    "{}：插件数量已达上限 {MAX_PLUGINS}，已忽略",
+                    file.display()
+                ));
+                continue;
+            }
+            let canonical = match std::fs::canonicalize(&file) {
+                Ok(p) => p,
+                Err(e) => {
+                    host.errors
+                        .push(format!("{}：无法解析真实路径（{e}）", file.display()));
+                    continue;
+                }
+            };
+            if !canonical.starts_with(&dir_canon) {
+                host.errors.push(format!(
+                    "{}：实际路径不在插件目录内，已拒绝",
+                    file.display()
+                ));
+                continue;
+            }
+            if let Ok(md) = std::fs::metadata(&file)
+                && md.len() > MAX_DLL_BYTES
+            {
+                host.errors.push(format!(
+                    "{}：DLL 过大（{} 字节，上限 {MAX_DLL_BYTES}）",
+                    file.display(),
+                    md.len()
+                ));
+                continue;
+            }
             match unsafe { load_plugin(&file) } {
                 Ok(plugin) => host.plugins.push(plugin),
                 Err(e) => host.errors.push(format!("{}：{e}", file.display())),
@@ -421,5 +467,23 @@ mod tests {
         short.height = 2;
         short.len = 8; // 应为 16
         assert!(copy_out(&short).is_err(), "len 与尺寸对不上必须被拒");
+    }
+
+    #[test]
+    fn oversized_dll_is_skipped() {
+        let dir = temp_dir("oversized");
+        let file = dir.join("huge.dll");
+        let f = std::fs::File::create(&file).expect("创建测试文件");
+        f.set_len(MAX_DLL_BYTES + 1).expect("设置文件长度");
+        drop(f);
+        let host = PluginHost::scan(&dir);
+        assert!(host.plugins().is_empty(), "超大 DLL 不应被加载");
+        assert_eq!(host.errors().len(), 1);
+        assert!(
+            host.errors()[0].contains("DLL 过大"),
+            "错误信息应说明是 DLL 过大：{:?}",
+            host.errors()
+        );
+        std::fs::remove_file(&file).ok();
     }
 }

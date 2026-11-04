@@ -1,5 +1,7 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **插件加载信任边界（安全加固第二刀）**：`plugins.rs` 的 `scan` 加“仅加载插件目录内真实文件（`canonicalize` 防符号链接越界）+ 单 DLL ≤ 64 MiB + 最多 64 个 + 文本输出 ≤ 64 MiB”边界，越界项记 `host.errors()` 不致命；新增 `oversized_dll_is_skipped` 单测。回归 `cargo test` **318 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。明细见 LOG。
+>
 > 更新时间：2026-11-04 · **文档解析安全加固（P0）**：ZIP 中央目录 `cd_size` 加 64 MiB 上限 + 越界校验、
 > 条目 10 万 / 文件名 4 KiB 上限；去掉 `Box::leak`（`BTreeSet<String>`）；图片整图解码 `MAX_IMAGE_PIXELS=100MP`；
 > PDF 单页 `MAX_PAGE_PIXELS=50MP` / 边 20000。恶意/畸形输入优雅拒绝，正常文件行为零变化。回归 `cargo test`

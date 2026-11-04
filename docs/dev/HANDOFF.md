@@ -846,3 +846,9 @@ media 15 / mediashape 13。
   图片整图解码 MAX_IMAGE_PIXELS=100MP；PDF 单页 MAX_PAGE_PIXELS=50MP / MAX_PAGE_EDGE=20000。全部落 qlr-render。
 - 回归：cargo test **317 passed / 0 failed**、fmt/clippy 零输出、erify-archive 11、erify-pdf PASS、erify-mediashape 13、smoke 16·1 SKIP。
 - 下一步：外部评估 P1 字体预览（插件/格式层，暂不做）；插件进程隔离/签名（v2，另行立项）；P2 渲染调度完善（非 async）。
+
+## 接力说明（2026-11-04 · 插件加载信任边界）
+
+- 完成：`crates/qlr-core/src/plugins.rs` 的 `PluginHost::scan` 加“仅插件目录内真实文件（`canonicalize` 防符号链接越界）+ 单 DLL 64 MiB + 最多 64 个”边界；插件文本输出加 `MAX_TEXT_OUTPUT_BYTES = 64 MiB` 上限（超限先 `free` 再当无文本）。越界项只记 `host.errors()`，不致命。新增 `oversized_dll_is_skipped` 单测。
+- 回归：`cargo test` **318 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。
+- 下一步：P2 渲染调度完善（非 async，基于已有四态/租约）；插件进程隔离留 v2；字体预览 / office 轻型按你安排。

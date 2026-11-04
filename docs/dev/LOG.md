@@ -3229,3 +3229,15 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 
 ### 怎么验证
 新增 `archive::tests::oversized_central_directory_is_rejected`（声明 `cd_size=0xFFFFFFFF` 的假 zip 必须报错）；`cargo test` **317 passed / 0 failed**；fmt/clippy 零输出；`verify-archive` **11 PASS**、`verify-pdf` PASS、`verify-mediashape` **13 PASS**、`smoke` **16 PASS · 1 SKIP**（tray UIPI）。
+
+## 2026-11-04 · 插件加载信任边界（安全加固第二刀）
+
+### 做了什么
+- `crates/qlr-core/src/plugins.rs`：`PluginHost::scan` 加加载信任边界——① 只接受 `plugins\` 目录内的真实文件（`canonicalize` 后必须 `starts_with` 插件目录，符号链接指到目录外一律拒绝）；② 单个 DLL `MAX_DLL_BYTES = 64 MiB` 上限，超限跳过、不 `LoadLibrary`；③ `MAX_PLUGINS = 64` 数量上限；④ 插件文本输出 `MAX_TEXT_OUTPUT_BYTES = 64 MiB` 上限（超限先 `free` 再当没有文本）。被跳过/拒绝的原因都记进 `host.errors()`，不致命。
+- 新增单测 `oversized_dll_is_skipped`（`set_len(MAX_DLL_BYTES+1)` 的 `huge.dll` 必须被拒，错误含“DLL 过大”）。
+
+### 为什么
+外部评估把“插件跑在主进程、返回指针无法证明有效”列为架构级风险。真正的隔离要进程外（v2，见 ADR-0010 预留的 `NeedsSidecar`）。但**当前进程内的加载边界可以先收紧**：别让超大 / 越界 / 非本目录的 DLL 进来，别让插件返回超大文本把宿主吃穿。成本极低，对正常插件零影响。
+
+### 怎么验证
+`cargo test` **318 passed / 0 failed**（+1 新测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 37.02s；`smoke` **16 PASS · 1 SKIP**。原有 7 个 plugins 单测（坏 dll 不致命 / 非 dll 忽略 / 空目录 / copy_out 校验等）保持绿。
