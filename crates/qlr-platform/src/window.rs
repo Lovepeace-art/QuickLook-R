@@ -1195,6 +1195,9 @@ struct PaintBuffer {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
+    /// 位图尺寸（物理像素）。§6-7：用于判断能否在下一帧复用同一块缓冲。
+    w: i32,
+    h: i32,
 }
 
 impl PaintBuffer {
@@ -1203,19 +1206,21 @@ impl PaintBuffer {
         if dc.0.is_null() {
             return None;
         }
-        let bitmap = unsafe {
-            CreateCompatibleBitmap(
-                window_dc,
-                (rc.right - rc.left).max(1),
-                (rc.bottom - rc.top).max(1),
-            )
-        };
+        let w = (rc.right - rc.left).max(1);
+        let h = (rc.bottom - rc.top).max(1);
+        let bitmap = unsafe { CreateCompatibleBitmap(window_dc, w, h) };
         if bitmap.0.is_null() {
             let _ = unsafe { DeleteDC(dc) };
             return None;
         }
         let old = unsafe { SelectObject(dc, bitmap.into()) };
-        Some(Self { dc, bitmap, old })
+        Some(Self {
+            dc,
+            bitmap,
+            old,
+            w,
+            h,
+        })
     }
 }
 
@@ -1226,6 +1231,68 @@ impl Drop for PaintBuffer {
             let _ = DeleteObject(self.bitmap.into());
             let _ = DeleteDC(self.dc);
         }
+    }
+}
+
+// §6-7：整窗离屏缓冲按尺寸复用，避免每帧都 CreateCompatibleBitmap + CreateCompatibleDC
+// 再销毁（4K 窗口下每帧 churn 一块 ~33MB 的 GDI 位图）。paint 只在 UI 线程的 `WM_PAINT`
+// 里跑，所以用 `thread_local` 就够，不需要锁。
+thread_local! {
+    static PAINT_BUFFER: std::cell::RefCell<Option<PaintBuffer>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// §6-7：设 `QLRUST_NO_PAINT_REUSE=1` 可关闭"整窗缓冲复用"，退化为每帧新建（仅用于 A/B 实测）。
+fn paint_reuse_disabled() -> bool {
+    std::env::var_os("QLRUST_NO_PAINT_REUSE").is_some()
+}
+
+/// 取一块可复用的整窗离屏缓冲。尺寸变了就重建；建不起来返回 `None`，调用方直画窗口 DC。
+fn acquire_paint_buffer(window_dc: HDC, rc: RECT) -> Option<PaintBuffer> {
+    let w = (rc.right - rc.left).max(1);
+    let h = (rc.bottom - rc.top).max(1);
+    if paint_reuse_disabled() {
+        return unsafe { PaintBuffer::new(window_dc, rc) };
+    }
+    PAINT_BUFFER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.take() {
+            Some(buf) if buf.w == w && buf.h == h => Some(buf),
+            // 尺寸不符（或首次）：旧缓冲在 `take` 出来的值被丢弃时已 `Drop` 释放。
+            _ => {
+                let nb = unsafe { PaintBuffer::new(window_dc, rc) };
+                // §6-7：只在"新建"时打一行，便于 bench/日志确认多帧只建一次（复用生效）。
+                if nb.is_some() && qlr_core::log::enabled(qlr_core::log::Level::Debug) {
+                    qlr_core::log_debug!("window", "PAINTBUF new {w}x{h}");
+                }
+                nb
+            }
+        }
+    })
+}
+
+/// 把缓冲放回缓存供下一次 `WM_PAINT` 复用（必须在 `EndPaint` 之前调）。
+fn release_paint_buffer(buf: Option<PaintBuffer>) {
+    if paint_reuse_disabled() {
+        return;
+    }
+    if let Some(buf) = buf {
+        PAINT_BUFFER.with(|slot| *slot.borrow_mut() = Some(buf));
+    }
+}
+
+/// 丢掉复用的离屏缓冲（收起预览 / 切换内容时调用，避免藏起来后仍占一块整窗位图）。
+pub fn drop_paint_buffer() {
+    PAINT_BUFFER.with(|slot| {
+        let _ = slot.borrow_mut().take();
+    });
+}
+
+/// §6-7：每帧 GDI/USER 对象计数 + 本帧绘制耗时（仅 debug 级打，用于 bench 确认无泄漏/无回退）。
+fn log_paint_gdi(tag: &str, ms: f64) {
+    if qlr_core::log::enabled(qlr_core::log::Level::Debug) {
+        let (g, u) = gui_resources();
+        qlr_core::log_debug!("window", "PAINT {tag} gdi={g} user={u} {ms:.2}ms");
     }
 }
 /// 列表视图的一行（压缩包目录用，1.7.2）。
@@ -1269,7 +1336,8 @@ pub fn paint_list(
             return;
         }
         let rc = client_rect(hwnd);
-        let buffer = PaintBuffer::new(window_dc, rc);
+        let pt0 = std::time::Instant::now();
+        let mut buffer = acquire_paint_buffer(window_dc, rc);
         let hdc: HDC = buffer.as_ref().map_or(window_dc, |b| b.dc);
         SetBkMode(hdc, TRANSPARENT);
         let brush = CreateSolidBrush(COLORREF(TEXT_BACKGROUND_RGB));
@@ -1380,6 +1448,8 @@ pub fn paint_list(
                 SRCCOPY,
             );
         }
+        log_paint_gdi("list", pt0.elapsed().as_secs_f64() * 1000.0);
+        release_paint_buffer(buffer.take());
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -1414,8 +1484,9 @@ pub fn paint_doc_with(
             return;
         }
         let rc = client_rect(hwnd);
+        let pt0 = std::time::Instant::now();
         // 双缓冲（1.5.1）：整屏先画进内存 DC，最后一次性 BitBlt 上屏。
-        let buffer = PaintBuffer::new(window_dc, rc);
+        let mut buffer = acquire_paint_buffer(window_dc, rc);
         let hdc: HDC = buffer.as_ref().map_or(window_dc, |b| b.dc);
         SetBkMode(hdc, TRANSPARENT);
 
@@ -1542,6 +1613,8 @@ pub fn paint_doc_with(
                 SRCCOPY,
             );
         }
+        log_paint_gdi("doc", pt0.elapsed().as_secs_f64() * 1000.0);
+        release_paint_buffer(buffer.take());
         let _ = EndPaint(hwnd, &ps);
     }
 }

@@ -1041,6 +1041,8 @@ pub(crate) fn hide_preview() {
     if let Some(preview) = with_state(|s| s.preview) {
         window::set_activatable(preview.raw(), false);
     }
+    // §6-7：收起后不再需要整窗离屏缓冲，主动释放，避免藏起来仍占一块位图。
+    window::drop_paint_buffer();
     // GDI/USER 计数：现场报障「每预览一个文件 GDI +1 且收起不释放」，这两行是二分的地基。
     // 正常应该每次回到同一个值；连续 10 次稳定 +1 就是泄漏。
     let (gdi, user) = window::gui_resources();

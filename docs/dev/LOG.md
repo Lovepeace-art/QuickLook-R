@@ -3032,3 +3032,35 @@ app 只编排、不碰 FFI：
 ### 下一步（未开工）
 
 - §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；后端契约第一刀（PreviewBackend，无 sidecar）。
+
+## 2026-11-04 · §6-7 PaintBuffer 复用 + 每帧 GDI 计数（平台层完善，第 3 项）
+
+### 做了什么
+
+- `crates/qlr-platform/src/window.rs`：`PaintBuffer` 增加 `w/h` 尺寸字段；新增线程本地缓存
+  `PAINT_BUFFER`（`RefCell<Option<PaintBuffer>>`）、`acquire_paint_buffer`（尺寸不变复用、变了重建）、
+  `release_paint_buffer`（`EndPaint` 前放回）、`pub fn drop_paint_buffer()`（收起预览时释放）、
+  `log_paint_gdi(tag, ms)`（debug 级打每帧 GDI/USER 与本帧耗时）；`paint_list` / `paint_doc_with`
+  改为"取用缓存缓冲 + 归还"，不再每帧 `PaintBuffer::new` 新建整窗位图。
+- `crates/qlr-app/src/app/show.rs`：`hide` 里调 `window::drop_paint_buffer()`，收起后不再占一块整窗位图。
+- A/B 开关：环境变量 `QLRUST_NO_PAINT_REUSE=1` 可退回"每帧新建"（仅用于实测对比，不影响默认行为）。
+
+### 为什么
+
+两条绘制通道原本每帧 `CreateCompatibleDC` + `CreateCompatibleBitmap`（整窗大小，4K≈33 MB）再在
+`Drop` 里销毁——是"每次重来"的最后一块。复用后每帧只做一次 `BitBlt`，省掉一次整窗位图与 DC 的
+分配/销毁及随之的 GDI 对象 churn。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**307 passed / 0 failed**；`scripts/verify-layers.ps1`：**12 PASS · 0 FAIL**；
+  `scripts/smoke.ps1`：**16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话托盘 UIPI）。
+- A/B 实测（`_bench/paint-measure.ps1`，`longlines.txt`、`--show` 后 `--scroll 3` ×10、`QLRUST_LOG=debug`）：
+  - 复用：`PAINTBUF new` 只 **1 次**（12 帧共用同一块 880×748）；`PAINT doc` 平均 **2.54 ms**（min 2.24 / max 3.98）。
+  - 每帧新建（`QLRUST_NO_PAINT_REUSE=1`）：`PAINT doc` 平均 **3.13 ms**（min 2.78 / max 3.90）。
+  - → 每帧省 **~0.59 ms（≈19%）**；GDI 对象恒为 **25**（user 17），多帧无增长（无泄漏）。
+
+### 下一步（未开工）
+
+- 后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，无 sidecar）。

@@ -1,5 +1,12 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **§6-7 PaintBuffer 复用 + 每帧 GDI 计数**（平台层完善，第 3 项）：两条绘制通道
+> 不再每帧 `CreateCompatibleBitmap/DC` 再销毁，改用线程本地、按尺寸复用的整窗离屏缓冲
+> （`acquire/release/drop_paint_buffer`），收起预览即释放。A/B 实测（880×748、滚 10 次）：每帧绘制
+> **3.13 → 2.54 ms**（省 ~0.59 ms / ≈19%），GDI 恒 **25**、无增长；新增 `QLRUST_NO_PAINT_REUSE` A/B 开关
+> 与 debug 级 `PAINT <tag> gdi/user/ms` 每帧日志。回归 `cargo test` **307 passed / 0 failed**、fmt/clippy 零输出、
+> `verify-layers` **12 PASS**、`smoke.ps1` **16 PASS · 1 SKIP**。明细见 §51。
+>
 > 更新时间：2026-11-04 · **折行量宽改 GetTextExtentExPointW**（平台层完善，第 2 项）：长段落每滚
 > **量宽 243 → 30 次 + 适配 24 次**、折行 **5.1 → 3.3 ms**（真窗口实测，`longlines.txt` 6648 行 / 宽 756px）；
 > 用 `GetTextExtentExPointW` 一次问"能放几个字符"替代 `log₂` 二分（`Measurer::fit_width_styled`、

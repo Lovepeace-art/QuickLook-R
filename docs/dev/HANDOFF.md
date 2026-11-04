@@ -727,3 +727,19 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 真窗口 `longlines.txt`（6648 行 / 756px）每滚 量宽 243→30、适配 24、折行 5.1→3.3 ms。
 
 **下一步**：§6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；后端契约第一刀（`PreviewBackend`，无 sidecar）。
+
+## §6-7 PaintBuffer 复用 + 每帧 GDI 计数接力说明（2026-11-04，平台层完善第 3 项）
+
+**这一批做了什么**：`window.rs` 的 `PaintBuffer` 加 `w/h`；新增线程本地缓存 `PAINT_BUFFER` +
+`acquire_paint_buffer` / `release_paint_buffer` / `pub drop_paint_buffer` / `log_paint_gdi`；
+`paint_list`、`paint_doc_with` 改"取用缓存缓冲 + `EndPaint` 前归还"，不再每帧新建/销毁整窗位图；
+`app/show.rs` 的 `hide` 调 `window::drop_paint_buffer()`。改动文件：`crates/qlr-platform/src/window.rs`、
+`crates/qlr-app/src/app/show.rs`。
+
+**A/B 开关**：`QLRUST_NO_PAINT_REUSE=1` 退回每帧新建（仅实测用）；debug 级每帧打 `PAINT doc gdi=.. user=.. Xms`。
+
+**回归**：`cargo test` **307 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **12 PASS**；
+`smoke.ps1` **16 PASS · 1 SKIP**。A/B（880×748、longlines.txt、滚 10 次）：每帧绘制 **3.13 → 2.54 ms**
+（省 ~0.59 ms / ≈19%），GDI 恒 **25**、无增长。
+
+**下一步**：后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，无 sidecar）。
