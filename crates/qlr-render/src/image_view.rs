@@ -15,6 +15,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use image::imageops::FilterType;
+
+/// 整图解码的像素上限：TIFF/GIF/BMP 等走 `render_via_image` 会整图解码，
+/// 而头部声明的尺寸不可信，超过这个量级直接拒绝（不再尝试分配）。
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 use qlr_core::{Error, Result};
 
 use crate::canvas::{Bitmap, Canvas};
@@ -272,6 +276,17 @@ fn render_via_image(path: &Path, max_width: u32, max_height: u32, upscale: bool)
                 crate::display_name(path)
             );
             return Ok(Canvas::Bitmap(bitmap));
+        }
+    }
+
+    // 安全预算：整图解码前先按头部尺寸挡掉超大图（TIFF/GIF/BMP 等可能整图解码）。
+    if let Some((w, h)) = dimensions(path) {
+        let px = u64::from(w) * u64::from(h);
+        if px > MAX_IMAGE_PIXELS {
+            return Err(Error::Message(format!(
+                "图片尺寸过大（{w}x{h}，{px} 像素，上限 {MAX_IMAGE_PIXELS}）：{}",
+                crate::display_name(path)
+            )));
         }
     }
 

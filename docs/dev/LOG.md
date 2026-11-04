@@ -3215,3 +3215,17 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 
 ### 怎么验证
 `cargo test` **316 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP、`verify-office` 23 / `verify-media` 15 / `verify-mediashape` 13 / `verify-archive` 11 全绿。对比明细见 `docs/dev/COMPARE-live-1.8.3-fix.md`。
+
+## 2026-11-04 · 文档解析安全加固（P0：ZIP 上限 / 去 Box::leak / 图片与 PDF 尺寸预算）
+
+### 做了什么
+- `crates/qlr-render/src/archive.rs`：中央目录 `cd_size` 来自文件内容，新增 `MAX_CD_BYTES = 64 MiB` 上限 + `cd_offset + cd_size` 越界校验；新增 `MAX_ENTRIES = 100_000` 条目上限、`MAX_NAME_LEN = 4096` 文件名上限。恶意/畸形 zip 声明近 4 GB 目录时优雅报错，不再 `vec![0u8; cd_size]` 直接 OOM。
+- `archive.rs` 去掉 `prefix_owned`（`Box::leak`），目录前缀改拥有型 `BTreeSet<String>`，常驻进程连看多个压缩包不再线性泄漏。
+- `crates/qlr-render/src/image_view.rs`：`render_via_image` 整图解码前按头部尺寸挡 `MAX_IMAGE_PIXELS = 100_000_000`（TIFF/GIF/BMP 等整图路径）。
+- `crates/qlr-render/src/pdf.rs`：单页渲染加 `MAX_PAGE_PIXELS = 50_000_000` / `MAX_PAGE_EDGE = 20_000`，异常页尺寸/超大画布直接报错，不分配位图。
+
+### 为什么
+外部《深度代码评估》指出 ZIP 中央目录无上限、`Box::leak` 永久分配、图片/PDF 缺少解码预算。核实属实后按"不可信输入"处理修补；均属 `qlr-render`，不改 app/platform/插件，对正常文件行为零变化。
+
+### 怎么验证
+新增 `archive::tests::oversized_central_directory_is_rejected`（声明 `cd_size=0xFFFFFFFF` 的假 zip 必须报错）；`cargo test` **317 passed / 0 failed**；fmt/clippy 零输出；`verify-archive` **11 PASS**、`verify-pdf` PASS、`verify-mediashape` **13 PASS**、`smoke` **16 PASS · 1 SKIP**（tray UIPI）。

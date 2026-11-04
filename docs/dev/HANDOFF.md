@@ -839,3 +839,10 @@ media 15 / mediashape 13。
 **回归**：`cargo test` **316 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`smoke` 16 PASS·1 SKIP。
 
 **下一步**：office 轻型 / html 改进（进程内只读或系统隔离）；Markdown `layout` 240ms 可作渲染层独立小项；之后重心转插件打磨。
+
+## 接力说明（2026-11-04 · P0 文档解析安全加固）
+
+- 完成：ZIP 中央目录（64 MiB）+ 条目（10 万）+ 文件名（4 KiB）上限与越界校验；去掉 Box::leak（改 BTreeSet<String>）；
+  图片整图解码 MAX_IMAGE_PIXELS=100MP；PDF 单页 MAX_PAGE_PIXELS=50MP / MAX_PAGE_EDGE=20000。全部落 qlr-render。
+- 回归：cargo test **317 passed / 0 failed**、fmt/clippy 零输出、erify-archive 11、erify-pdf PASS、erify-mediashape 13、smoke 16·1 SKIP。
+- 下一步：外部评估 P1 字体预览（插件/格式层，暂不做）；插件进程隔离/签名（v2，另行立项）；P2 渲染调度完善（非 async）。

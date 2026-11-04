@@ -1,5 +1,10 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **文档解析安全加固（P0）**：ZIP 中央目录 `cd_size` 加 64 MiB 上限 + 越界校验、
+> 条目 10 万 / 文件名 4 KiB 上限；去掉 `Box::leak`（`BTreeSet<String>`）；图片整图解码 `MAX_IMAGE_PIXELS=100MP`；
+> PDF 单页 `MAX_PAGE_PIXELS=50MP` / 边 20000。恶意/畸形输入优雅拒绝，正常文件行为零变化。回归 `cargo test`
+> **317 passed / 0 failed**、fmt/clippy 零输出、verify-archive 11 / verify-pdf PASS / verify-mediashape 13 / smoke 16·1 SKIP。
+>
 > 更新时间：2026-11-04 · **原版对比复测 + 暂缓 pdfium sidecar（平台层收尾）**：崩溃探测 1004 例变异 PDF
 > **0 次访问违例** → 暂缓 sidecar（ADR-0010 补「已评估并暂缓」，保留 `QLRUST_PDF_INPROC` 回退与四态状态机）；
 > `README` 对比表按复测刷新、新增 `docs/dev/COMPARE-live-1.8.3-fix.md`。复测：QLRust 出窗 17/18、窗口出现均值 58 ms、

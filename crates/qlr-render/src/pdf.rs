@@ -32,6 +32,10 @@ pub const LIBRARY_NAME: &str = "pdfium.dll";
 pub const ENV_LIBRARY: &str = "QLRUST_PDFIUM";
 /// 最多渲染的页数上限（防御超长文档，先只渲染请求的那一页）。
 pub const MAX_PAGES: usize = 10_000;
+/// 单页渲染像素上限（防异常页尺寸 / 超大画布把内存吃穿）。
+pub const MAX_PAGE_PIXELS: u64 = 50_000_000;
+/// 单边像素上限。
+pub const MAX_PAGE_EDGE: u32 = 20_000;
 
 // pdfium C API 常量（见 fpdfview.h）
 const FPDF_ERR_SUCCESS: u32 = 0;
@@ -467,6 +471,15 @@ pub fn render_page(
         // 但页面在屏幕上是"缩放后"呈现，所以直接按目标像素渲染即可。
         let width = rw.max(1);
         let height = rh.max(1);
+        if u64::from(width) * u64::from(height) > MAX_PAGE_PIXELS
+            || width > MAX_PAGE_EDGE
+            || height > MAX_PAGE_EDGE
+        {
+            return Err(Error::Message(format!(
+                "PDF 页面渲染尺寸过大（{width}x{height}）：{}",
+                path.display()
+            )));
+        }
         let stride = width as usize * 4;
         let mut buffer = vec![0u8; stride * height as usize];
 

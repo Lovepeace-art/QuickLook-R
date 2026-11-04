@@ -12,6 +12,13 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// 安全上限：中央目录最大字节数（`cd_size` 来自文件内容，恶意 ZIP 可声明近 4 GB）。
+const MAX_CD_BYTES: usize = 64 * 1024 * 1024;
+/// 中央目录最多条目数（EOCD 的 16 位 count 本就 ≤ 65535，这里留余量兜底）。
+const MAX_ENTRIES: usize = 100_000;
+/// 单条目文件名最大长度（防畸形包把名字撑爆内存）。
+const MAX_NAME_LEN: usize = 4096;
+
 /// 中央目录里的一个条目。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -81,19 +88,34 @@ pub fn open(path: &Path) -> Result<Archive, String> {
     if cd_size == 0 || cd_offset >= len {
         return Ok(Archive::default());
     }
+    // 安全上限：cd_size 来自文件内容，恶意包可声明接近 4 GB，直接分配会 OOM。
+    if cd_size > MAX_CD_BYTES {
+        return Err(format!(
+            "压缩包中央目录过大（{cd_size} 字节，上限 {MAX_CD_BYTES}）"
+        ));
+    }
+    if cd_offset.checked_add(cd_size as u64).is_none_or(|end| end > len) {
+        return Err("压缩包中央目录越界".to_string());
+    }
     let mut cd = vec![0u8; cd_size];
     file.seek(SeekFrom::Start(cd_offset))
         .map_err(|e| e.to_string())?;
     file.read_exact(&mut cd).map_err(|e| e.to_string())?;
 
     let mut archive = Archive::default();
-    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
     let mut at = 0usize;
     for _ in 0..count {
+        if archive.entries.len() >= MAX_ENTRIES {
+            break;
+        }
         if at + 46 > cd.len() || cd[at..at + 4] != [0x50, 0x4b, 0x01, 0x02] {
             break;
         }
         let name_len = u16::from_le_bytes([cd[at + 28], cd[at + 29]]) as usize;
+        if name_len > MAX_NAME_LEN {
+            break;
+        }
         let extra_len = u16::from_le_bytes([cd[at + 30], cd[at + 31]]) as usize;
         let comment_len = u16::from_le_bytes([cd[at + 32], cd[at + 33]]) as usize;
         let size = u32::from_le_bytes([cd[at + 24], cd[at + 25], cd[at + 26], cd[at + 27]]) as u64;
@@ -112,10 +134,8 @@ pub fn open(path: &Path) -> Result<Archive, String> {
         let is_dir = name.ends_with('/');
         let clean = name.trim_end_matches('/').to_string();
         if is_dir {
-            // 只有新前缀才 leak：先 insert 重复值会被集合丢弃，但 leak 已经发生。
-            if !dirs.contains(clean.as_str()) {
-                dirs.insert(prefix_owned(&clean));
-            }
+            // 拥有型 String：不同压缩包之间不再累积泄漏（去重交给集合）。
+            dirs.insert(clean.clone());
         } else {
             archive.files += 1;
             archive.uncompressed += size;
@@ -129,9 +149,7 @@ pub fn open(path: &Path) -> Result<Archive, String> {
                 prefix.push_str(part);
                 // 只有新前缀才 leak：5000 个文件挤在同几级目录下时，
                 // 无条件 leak 会让泄漏量随条目数线性涨（KB～MB 级）。
-                if !dirs.contains(prefix.as_str()) {
-                    dirs.insert(prefix.clone().leak());
-                }
+                dirs.insert(prefix.clone());
             }
         }
         let depth = clean.matches('/').count();
@@ -146,15 +164,6 @@ pub fn open(path: &Path) -> Result<Archive, String> {
     archive.dirs = dirs.len();
     archive.entries.sort_by_key(|e| e.path.to_lowercase());
     Ok(archive)
-}
-
-/// 目录前缀进 `BTreeSet<&str>` 需要 `'static`；这里用 `Box::leak` 换生命周期。
-///
-/// 调用点必须先用 `contains` 去重再 leak：一个压缩包的目录数量级是几十到几千，
-/// 进程退出才回收 —— 只有真正的新前缀才允许 leak，否则常驻进程连看 N 个
-/// 压缩包会线性涨。
-fn prefix_owned(prefix: &str) -> &'static str {
-    Box::leak(prefix.to_string().into_boxed_str())
 }
 
 fn decode_name(raw: &[u8]) -> String {
@@ -199,5 +208,19 @@ mod tests {
     #[test]
     fn missing_file_is_an_error() {
         assert!(open(Path::new(r"C:\definitely\not\here.zip")).is_err());
+    }
+
+    #[test]
+    fn oversized_central_directory_is_rejected() {
+        // 只有 EOCD、却声明 cd_size = 0xFFFFFFFF 的假 zip：必须优雅报错而不是分配 4 GB。
+        let mut data = vec![0u8; 22];
+        data[0..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        data[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/zip_bomb_{}.zip", std::process::id()));
+        std::fs::write(&dir, &data).unwrap();
+        let r = open(&dir);
+        let _ = std::fs::remove_file(&dir);
+        assert!(r.is_err(), "超大 cd_size 必须被拒绝");
     }
 }
