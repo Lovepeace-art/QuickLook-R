@@ -694,3 +694,21 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
   （本批没动几何/DPI 与字体路径）。
 - 拿一份**长段落**文档（自己写一份每行 300 字以上的 txt/md 即可）滚轮滚动，
   确认不再有"一格一顿"的顿感；再看 `app.log` 是否还有 `SLOWWRAP`。
+
+## §6-4 裸 Win32 收口接力说明（2026-11-04，平台层完善）
+
+**这一批做了什么**：app 层最后 6 处直接 Win32 调用收进 `qlr-platform::window`
+（新增 `stop_timers / post_quit / terminate_self / now_ms`），`app/mod.rs` prelude 不再再导出
+`GetTickCount / GetCurrentProcess / TerminateProcess / KillTimer / PostQuitMessage / SetTimer`；
+`scripts/verify-layers.ps1` 新增「app 不直接调 Win32 计时/退出原语」断言（**11 → 12 PASS**）。
+纯重构、行为与热路径零改动（不在 `repaint`/滚动/折行循环里，零分配）。
+
+**改动文件**：`crates/qlr-platform/src/window.rs`、`crates/qlr-app/src/app/{mod,boot,shell,chrome,show,input}.rs`、
+`scripts/verify-layers.ps1`。
+
+**回归**：`cargo test` **306 passed / 0 failed**；`cargo fmt`/`clippy` 零输出；`verify-layers` **12 PASS · 0 FAIL**。
+
+**下一步（建议顺序，都有数字依据）**：
+1. §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数（`bench.ps1` 已有 GDI 列，app 侧还没有每帧数）；
+2. `GetTextExtentExPointW` 折行量宽（长段落 5.1 ms → 约 0.7 ms，需"能放几个字符"口径的对拍测试）；
+3. 后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，不含 sidecar）。

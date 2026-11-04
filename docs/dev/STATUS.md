@@ -1,5 +1,12 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **§6-4 裸 Win32 收口（平台层完善）**（未发版）：app 层最后 6 处直接调用的
+> `KillTimer / SetTimer / PostQuitMessage / TerminateProcess / GetCurrentProcess / GetTickCount`
+> 全部收进 `qlr-platform::window`（新增 `stop_timers / post_quit / terminate_self / now_ms`），
+> `app/mod.rs` prelude 不再再导出；`scripts/verify-layers.ps1` 新增「app 不直接调 Win32 计时/退出原语」
+> 断言，分层断言 **11 → 12 PASS**。回归：`cargo test` **306 passed / 0 failed**、fmt/clippy 零输出、
+> `verify-layers` **12 PASS · 0 FAIL**；纯重构、行为与热路径零改动。明细见 §49。
+>
 > 更新时间：2026-11-03 · **1.8.3-fix 批次四**（未发版）：`SLOWPAINT` 只覆盖真正的 GDI 绘制，
 > "滚一下卡"却发生在折行上——所以先在绘制循环里补了折行计时与量宽次数，再用真窗口读数，
 > 看到两处真问题：**量宽逐字符累加**（长段落文档每滚一格 1359 次 `GetTextExtentPoint32W` / 12.1 ms）

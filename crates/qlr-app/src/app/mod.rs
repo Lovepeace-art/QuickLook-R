@@ -27,13 +27,13 @@ pub(crate) use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 pub(crate) use std::time::{Duration, Instant};
 pub(crate) use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 pub(crate) use windows::Win32::Graphics::Gdi::HDC;
-pub(crate) use windows::Win32::System::SystemInformation::GetTickCount;
-pub(crate) use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+// 计时器 / 退出 / 时钟原语一律走 `qlr_platform::window` 的薄封装（§6-4 收口），
+// 这里**不再**再导出 `GetTickCount / GetCurrentProcess / TerminateProcess /
+// KillTimer / PostQuitMessage / SetTimer`——`verify-layers.ps1` 会断言 app 不许直接调。
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, KillTimer, PostQuitMessage, SetTimer, WM_ACTIVATE, WM_CLOSE, WM_COPYDATA,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NCCALCSIZE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SIZE, WM_TIMER,
+    DefWindowProcW, WM_ACTIVATE, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_ERASEBKGND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER,
 };
 
 mod archive;

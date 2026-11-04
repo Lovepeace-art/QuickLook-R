@@ -1026,11 +1026,10 @@ pub(crate) fn hide_preview() {
     // capture 也要放掉：它挂在窗口上，隐藏窗口持有 capture 会吞掉后续鼠标消息。
     window::release_capture();
     window::allow_shadow();
-    unsafe {
-        let _ = KillTimer(Some(preview.raw()), TIMER_TOAST);
-        let _ = KillTimer(Some(preview.raw()), TIMER_SHELL_INPUT);
-        let _ = KillTimer(Some(preview.raw()), TIMER_SHELL_SWAP);
-    }
+    window::stop_timers(
+        preview.raw(),
+        &[TIMER_TOAST, TIMER_SHELL_INPUT, TIMER_SHELL_SWAP],
+    );
     // 计时器不在这里停（1.1.0）：窗口收着的时候它转去做投机预渲染。
     // 位置记忆（1.0.13）：收起时把位置落盘，下次打开直接用。
     persist_position();

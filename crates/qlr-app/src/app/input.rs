@@ -1218,7 +1218,7 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
         _ => {}
     }
 
-    let now = unsafe { GetTickCount() };
+    let now = window::now_ms();
     let hook_to_handler = now.wrapping_sub(pressed_at);
     let found = selection::current_selection();
     log_info!(

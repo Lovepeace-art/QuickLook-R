@@ -2952,3 +2952,42 @@ plugin-demo 7、plugin-office 11、render 120+6、fuzz 1、malformed 9），fmt/
   "宽度严格小于"的口径可能差一个字符，需要另建对拍测试。
 - §6-4 裸 Win32 收口残量、§6-7 `PaintBuffer` 复用 + 每帧 GDI 计数：仍留到下一批。
 - Markdown 侧 `layout` 全量仍有 240 ms 余量（早停只解决首屏）。
+
+## 2026-11-04 · §6-4 裸 Win32 收口（平台层完善）
+
+### 做了什么
+
+把 app 层最后 6 处直接调用的 Win32 计时/退出/时钟原语收进 `qlr-platform::window`，
+app 只编排、不碰 FFI：
+
+- `crates/qlr-platform/src/window.rs` 新增 4 个薄封装（紧挨 `start_timer`/`stop_timer`）：
+  `stop_timers(hwnd, &[usize])`、`post_quit()`、`terminate_self(code)`、`now_ms()`。
+- `crates/qlr-app/src/app/mod.rs`：prelude 不再再导出 `GetTickCount / GetCurrentProcess /
+  TerminateProcess / KillTimer / PostQuitMessage / SetTimer`。
+- 调用点改写：`app/boot.rs`（9 处：退出看门狗 `terminate_self`、热键时间戳 `now_ms`、
+  `quit`/`WM_DESTROY` 的 `post_quit`、AUDIO/TOAST/SHELL_INPUT/SHELL_SWAP 的 `stop_timer`/`start_timer`）、
+  `app/shell.rs`（3 处）、`app/chrome.rs`（1 处）、`app/show.rs`（3 个 `KillTimer` 合成一次 `stop_timers`）、
+  `app/input.rs`（1 处 `now_ms`）。
+- `scripts/verify-layers.ps1` 新增断言「app 不直接调 Win32 计时/退出原语」（扫
+  `\b(KillTimer|SetTimer|PostQuitMessage|TerminateProcess|GetCurrentProcess|GetTickCount)\s*\(` 必须为 0）：
+  分层断言 11 → **12 PASS**。
+
+### 为什么
+
+§6-4 是"后端契约 / 后端抽象 / 插件"的前置：app 直接摸 Win32，平台层就永远只是"薄封装的样子"，
+换实现、加退出看门狗、做多后端都收不住。把边界钉成 `verify-layers.ps1` 的计数棘轮
+（只许减不许增），口头规矩才不会漂（该脚本注释记着"漂移过三次"）。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**306 passed / 0 failed**（app 67+1、core 54、platform 33+3、plugin-api 4、
+  plugin-demo 7、plugin-office 11、render 120+6、fuzz 1、malformed 9），与改前一致。
+- `scripts/verify-layers.ps1`：**12 PASS · 0 FAIL**（新增那条 PASS，旧 11 条不动）。
+- 纯重构、无热路径改动：计时器/退出/时钟都不在 `repaint`/滚动/折行循环里，每个调用只多一层
+  普通函数（<1%）开销；零分配、内存与包体基本不变。
+
+### 下一步（未开工）
+
+- §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；`GetTextExtentExPointW` 折行量宽（5.1 → 约 0.7 ms）。
+- 之后才动"后端契约"第一刀（PreviewBackend + 现有自研渲染接入，无 sidecar）。

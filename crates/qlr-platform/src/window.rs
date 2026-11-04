@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT, SND_SYSTEM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_SHIFT,
 };
@@ -34,12 +36,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect, HWND_NOTOPMOST,
     HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     IDI_APPLICATION, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_ICONWARNING,
-    MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, MessageBoxW, PostMessageW, RegisterClassW,
-    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_SETREDRAW, WNDCLASS_STYLES, WNDCLASSW,
-    WNDPROC, WS_CHILD, WS_VISIBLE, WindowFromPoint,
+    MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL,
+    WM_SETREDRAW, WNDCLASS_STYLES, WNDCLASSW, WNDPROC, WS_CHILD, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -537,6 +539,37 @@ pub fn stop_timer(hwnd: HWND, id: usize) {
     unsafe {
         let _ = KillTimer(Some(hwnd), id);
     }
+}
+
+/// 一次停掉多个定时器（`KillTimer` 循环包装）。
+///
+/// app 层不直接碰 Win32 计时器：批量停用这个，单停用 [`stop_timer`]。
+pub fn stop_timers(hwnd: HWND, ids: &[usize]) {
+    for &id in ids {
+        stop_timer(hwnd, id);
+    }
+}
+
+/// 请求消息泵退出（`PostQuitMessage(0)`）。只应在 UI 线程调用。
+pub fn post_quit() {
+    unsafe {
+        PostQuitMessage(0);
+    }
+}
+
+/// 强制结束当前进程（退出看门狗用）。
+///
+/// 用 `TerminateProcess` 而不是 `std::process::exit`：**不触发 DLL detach**
+/// （卡住清理的正是它），也不等任何线程收尾。
+pub fn terminate_self(code: u32) {
+    unsafe {
+        let _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+}
+
+/// 单调毫秒计数（`GetTickCount`，约 49.7 天回绕一次）。给钩子时间戳用。
+pub fn now_ms() -> u32 {
+    unsafe { GetTickCount() }
 }
 
 /// 窗口最外圈的**发丝边**（1.0.10 定稿）。

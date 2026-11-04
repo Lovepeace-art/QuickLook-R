@@ -136,6 +136,19 @@ Check "app 的 windows 用法没扩散" ($appViol.Count -eq 0) (
     $(if ($appViol.Count -eq 0) { "$($appHits.Count) 个文件，均在白名单内" } else { $appViol -join "; " })
 )
 
+# ---- 2b. app 不许直接调用 Win32 计时/退出/时钟原语（§6-4 收口到 qlr-platform）----
+# 这些原语由 `qlr_platform::window` 封装提供（start_timer / stop_timer(s) / post_quit /
+# terminate_self / now_ms）。app 直接调等于绕过平台层：换实现、加看门狗、做后端抽象都收不住。
+$appPrim = @()
+$appSrcFiles = Get-ChildItem (Join-Path $Root "crates\qlr-app\src") -Recurse -Filter *.rs
+foreach ($f in $appSrcFiles) {
+    $hits = Select-String -Path $f.FullName -Pattern '\b(KillTimer|SetTimer|PostQuitMessage|TerminateProcess|GetCurrentProcess|GetTickCount)\s*\(' -Encoding utf8
+    foreach ($h in $hits) { $appPrim += "$(RelName $f.FullName):$($h.LineNumber)" }
+}
+Check "app 不直接调 Win32 计时/退出原语" ($appPrim.Count -eq 0) (
+    $(if ($appPrim.Count -eq 0) { "全部走 qlr_platform::window" } else { $appPrim -join ", " })
+)
+
 # ---- 3. platform 不许调用上层的类型 ----
 $platformFiles = Get-ChildItem (Join-Path $Root "crates\qlr-platform\src") -Recurse -Filter *.rs
 $platformBad = @()

@@ -81,9 +81,7 @@ pub(crate) fn drop_stale_shell_preview() {
         s.shell_input_pending = false;
     });
     if let Some(preview) = with_state(|s| s.preview) {
-        unsafe {
-            let _ = KillTimer(Some(preview.raw()), TIMER_SHELL_INPUT);
-        }
+        window::stop_timer(preview.raw(), TIMER_SHELL_INPUT);
     }
     // 处理器卸掉了：滚轮回到我们自己手里（缩放/滚文本），窗口也回到"不抢焦点"。
     if let Some(preview) = with_state(|s| s.preview) {
@@ -133,14 +131,7 @@ pub(crate) fn open_shell_preview(path: Option<&Path>) -> bool {
             if let Some(previous) = old.take() {
                 previous.raise();
                 with_state(|s| s.shell_cover = Some(previous));
-                let _ = unsafe {
-                    SetTimer(
-                        Some(preview.raw()),
-                        TIMER_SHELL_SWAP,
-                        SHELL_SWAP_DELAY_MS,
-                        None,
-                    )
-                };
+                window::start_timer(preview.raw(), TIMER_SHELL_SWAP, SHELL_SWAP_DELAY_MS);
                 log_debug!(SCOPE, "换帧：旧内容继续盖住，等新处理器出首帧");
             }
             log_info!(
@@ -168,9 +159,7 @@ pub(crate) fn open_shell_preview(path: Option<&Path>) -> bool {
                 s.shell_poll = 0;
             });
             if let Some(preview) = with_state(|s| s.preview) {
-                let _ = unsafe {
-                    SetTimer(Some(preview.raw()), TIMER_SHELL_INPUT, SHELL_POLL_MS, None)
-                };
+                window::start_timer(preview.raw(), TIMER_SHELL_INPUT, SHELL_POLL_MS);
             }
             // PPT：翻页也由我们接管。为什么必须接管：处理器的"放映"没有"跳页"接口，
             // 我们只能给它投 `VK_NEXT`/`VK_PRIOR`；而它自己**翻过最后一页就切到黑屏

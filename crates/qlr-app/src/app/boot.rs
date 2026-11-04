@@ -541,9 +541,7 @@ pub(crate) fn arm_exit_watchdog(limit: Duration) {
                 "退出清理超过 {}s 仍未结束（第三方 DLL/钩子线程卡住），强制结束进程",
                 limit.as_secs()
             );
-            unsafe {
-                let _ = TerminateProcess(GetCurrentProcess(), 1);
-            }
+            window::terminate_self(1);
             // TerminateProcess 正常情况下当场生效；万一被拒（受保护句柄），
             // 再用 std 的保底退出，至少不会把控制权交给卡住的清理代码。
             std::process::exit(1);
@@ -624,7 +622,7 @@ pub(crate) fn apply_request(request: &Request) {
                     .vk
             })
             .unwrap_or(0x20);
-            on_hotkey(vk as usize, unsafe { GetTickCount() })
+            on_hotkey(vk as usize, window::now_ms())
         }
         Action::Settings => open_settings(),
         Action::PageNext => turn_page(1),
@@ -694,7 +692,7 @@ pub(crate) fn quit() {
     log_info!(SCOPE, "收到退出请求");
     // 位置记忆（1.0.13）：托盘退出时窗口可能还开着，退出前补一次落盘。
     persist_position();
-    unsafe { PostQuitMessage(0) };
+    window::post_quit();
 }
 
 pub(crate) fn pending_requests() -> &'static Mutex<Vec<Request>> {
@@ -926,13 +924,13 @@ pub(crate) unsafe extern "system" fn wndproc(
             // 音频进度条（1.7.9）：只重画进度条那一条，整窗不动。
             WM_TIMER if wparam.0 == TIMER_AUDIO => {
                 let Some((pos, dur)) = audio_progress() else {
-                    let _ = KillTimer(Some(hwnd), TIMER_AUDIO);
+                    window::stop_timer(hwnd, TIMER_AUDIO);
                     with_state(|s| s.audio_ticking = false);
                     return LRESULT(0);
                 };
                 // 播完了（MCI 停在末尾不再前进）：收掉计时器、给一句提示、进度条复位到 0。
                 if dur > 0 && pos + AUDIO_TICK_MS as u64 >= dur {
-                    let _ = KillTimer(Some(hwnd), TIMER_AUDIO);
+                    window::stop_timer(hwnd, TIMER_AUDIO);
                     with_state(|s| s.audio_ticking = false);
                     let _ = with_state(|s| s.audio.as_ref().map(|p| p.seek(0)));
                     let content = window::chrome_rects(window::client_rect(hwnd)).content;
@@ -952,13 +950,13 @@ pub(crate) unsafe extern "system" fn wndproc(
             // 顶栏提示到期（1.7.4）：擦掉那一句话，并把顶栏重画一次。
             WM_TIMER if wparam.0 == TIMER_TOAST => {
                 with_state(|s| s.toast = None);
-                let _ = KillTimer(Some(hwnd), TIMER_TOAST);
+                window::stop_timer(hwnd, TIMER_TOAST);
                 window::invalidate(hwnd);
                 LRESULT(0)
             }
             // 接管处理器输入（1.7.4）：等首帧画完再关，给它留出 DoPreview 的时间。
             WM_TIMER if wparam.0 == TIMER_SHELL_INPUT => {
-                let _ = KillTimer(Some(hwnd), TIMER_SHELL_INPUT);
+                window::stop_timer(hwnd, TIMER_SHELL_INPUT);
                 // 轮询"内容真的画出来了吗"（1.7.7）。判据 = 内容区里最大那块可见后代窗口
                 // 占到 50% 以上；到点没收尾就再等 120 ms，最多 3 s（`SHELL_POLL_MAX`）。
                 let content = window::chrome_rects(window::client_rect(hwnd)).content;
@@ -979,7 +977,7 @@ pub(crate) unsafe extern "system" fn wndproc(
                 .unwrap_or(0);
                 let ready = ratio >= 50 || !has_preview || poll >= SHELL_POLL_MAX;
                 if !ready {
-                    let _ = SetTimer(Some(hwnd), TIMER_SHELL_INPUT, SHELL_POLL_MS, None);
+                    window::start_timer(hwnd, TIMER_SHELL_INPUT, SHELL_POLL_MS);
                     return LRESULT(0);
                 }
                 log_debug!(SCOPE, "SHELL 就绪：内容占 {ratio}%（轮询 {poll} 次）");
@@ -1013,7 +1011,7 @@ pub(crate) unsafe extern "system" fn wndproc(
             }
             // 换帧（1.7.6）：到点把"盖住"的旧处理器卸掉，露出新处理器的首帧。
             WM_TIMER if wparam.0 == TIMER_SHELL_SWAP => {
-                let _ = KillTimer(Some(hwnd), TIMER_SHELL_SWAP);
+                window::stop_timer(hwnd, TIMER_SHELL_SWAP);
                 // 换帧不再"死等 260 ms"（1.7.8）：Excel 的 `DoPreview` 要 768 ms，
                 // 掀开得太早会露出还没画完的白/黑底（用户说的"Office 之间切换有黑边"）。
                 // 判据同 `TIMER_SHELL_INPUT`：新处理器内容占到 50% 才掀开，最多等 1.8 s。
@@ -1034,7 +1032,7 @@ pub(crate) unsafe extern "system" fn wndproc(
                 })
                 .unwrap_or(0);
                 if has_preview && ratio < 50 && waited < 15 {
-                    let _ = SetTimer(Some(hwnd), TIMER_SHELL_SWAP, SHELL_POLL_MS, None);
+                    window::start_timer(hwnd, TIMER_SHELL_SWAP, SHELL_POLL_MS);
                     return LRESULT(0);
                 }
                 let cover = with_state(|s| s.shell_cover.take()).flatten();
@@ -1068,7 +1066,7 @@ pub(crate) unsafe extern "system" fn wndproc(
                 }
             }
             WM_DESTROY => {
-                PostQuitMessage(0);
+                window::post_quit();
                 LRESULT(0)
             }
             // 窗口尺寸变了：**投递**一条消息，等这条同步呼叫退栈后再对齐系统预览处理器（1.7.9）。

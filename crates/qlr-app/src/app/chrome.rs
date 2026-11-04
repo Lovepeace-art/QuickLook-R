@@ -84,9 +84,7 @@ pub(crate) fn show_toast(hwnd: HWND, text: impl Into<String>) {
 pub(crate) fn show_toast_ms(hwnd: HWND, text: impl Into<String>, ms: u64) {
     let until = Instant::now() + std::time::Duration::from_millis(ms);
     with_state(|s| s.toast = Some((text.into(), until)));
-    unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_TOAST, ms as u32, None);
-    }
+    window::start_timer(hwnd, TIMER_TOAST, ms as u32);
     window::invalidate(hwnd);
 }
 
