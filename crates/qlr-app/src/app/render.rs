@@ -52,6 +52,10 @@ pub(crate) fn fake_hang_ms() -> Option<u64> {
 /// 这里**不**预先生成任务描述：那要在每一帧（包括 3 ms 的文本帧）上多一次 `format!` 和
 /// 一次堆分配，而描述只在"真的判挂"那一次才用得上（`mark_hung` 里现算）。
 pub(crate) fn begin_lease(job: &RenderJob) {
+    let kind = format::kind_for_path(&job.path);
+    let backend = backend::resolve(&job.path, kind)
+        .map(|b| b.id())
+        .unwrap_or("none");
     let lease = Lease {
         epoch: RENDER_EPOCH.load(Ordering::Acquire),
         generation: job.generation,
@@ -60,6 +64,7 @@ pub(crate) fn begin_lease(job: &RenderJob) {
     };
     if let Ok(mut guard) = render_track().lock() {
         guard.lease = Some(lease);
+        guard.set_state(SessionState::Active, backend);
     }
 }
 
@@ -93,11 +98,16 @@ pub(crate) fn describe_job(job: &RenderJob) -> String {
 
 /// 投递失败（线程已退出）：撤掉刚登记的租约，否则看门狗会为一条根本不存在的活重建线程。
 pub(crate) fn abort_lease(generation: u64) {
-    if let Ok(mut guard) = render_track().lock()
-        && let Some(lease) = guard.lease.as_ref()
-        && lease.generation == generation
-    {
-        guard.lease = None;
+    if let Ok(mut guard) = render_track().lock() {
+        let matched = guard
+            .lease
+            .as_ref()
+            .is_some_and(|l| l.generation == generation);
+        if matched {
+            guard.lease = None;
+            let backend = guard.backend;
+            guard.set_state(SessionState::Idle, backend);
+        }
     }
 }
 
@@ -110,13 +120,16 @@ pub(crate) fn end_lease(epoch: u64, generation: u64) {
     let Ok(mut guard) = render_track().lock() else {
         return;
     };
-    if let Some(lease) = guard.lease.as_ref()
-        && lease.epoch == epoch
-        && lease.generation == generation
-    {
+    let matched = guard
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.epoch == epoch && lease.generation == generation);
+    if matched {
         guard.lease = None;
         // 有帧真的跑完了 = 线程是活的：连续自愈计数清零，退避不会累积到下一次偶发挂死。
         guard.consecutive = 0;
+        let backend = guard.backend;
+        guard.set_state(SessionState::Idle, backend);
     }
 }
 
@@ -142,6 +155,8 @@ pub(crate) fn mark_hung() -> Option<(String, u128, RenderJob, u32, u32)> {
         (describe_job(&lease.job), ms.as_millis(), lease.job.clone())
     };
     guard.healing = true;
+    let backend = guard.backend;
+    guard.set_state(SessionState::Reclaiming, backend);
     Some((
         desc,
         ms,
@@ -160,6 +175,8 @@ pub(crate) fn heal_failed() {
         if let Some(lease) = guard.lease.as_mut() {
             lease.started = Instant::now();
         }
+        let backend = guard.backend;
+        guard.set_state(SessionState::Crashed, backend);
     }
 }
 
@@ -174,6 +191,13 @@ pub(crate) fn heal_succeeded(requeue: Option<&RenderJob>) {
         guard.lease = None;
         guard.consecutive = guard.consecutive.saturating_add(1);
         guard.total = guard.total.saturating_add(1);
+        let backend = guard.backend;
+        let next = if requeue.is_some() {
+            SessionState::Active
+        } else {
+            SessionState::Idle
+        };
+        guard.set_state(next, backend);
     }
     if let Some(job) = requeue {
         begin_lease(job);

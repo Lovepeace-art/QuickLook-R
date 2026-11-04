@@ -817,3 +817,13 @@ media 15 / mediashape 13。
 **回归**：`cargo test` **315 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.72s；`smoke` 16 PASS·1 SKIP。
 
 **下一步**：① 进程内"后端会话契约 + 租约四态状态机"（活跃/空闲/回收/崩溃 + 日志），不动热路径；② 若批准，做 pdfium 单客户 sidecar 试点（常驻子进程 + 一条 IPC + 共享内存零拷贝 + 看门狗）；③ office 轻型 / html 改进优先进程内只读渲染或系统隔离。
+
+## 后端会话四态状态机（进程内）接力说明（2026-11-04，ADR-0010 跟进）
+
+**这一批做了什么**：`session.rs` 新增 `SessionState{Idle,Active,Reclaiming,Crashed}` 与 `RenderTrack::set_state()`；`RenderTrack` 增 `state`/`backend`。四态直接挂在**现有**线程级租约生命周期上：`render.rs` 的 `begin_lease`→Active（记 backend id）、`end_lease`/`abort_lease`→Idle、`mark_hung`→Reclaiming、`heal_failed`→Crashed、`heal_succeeded`→Active/Idle；只在真变化时打 `SESSION backend= state=` debug。单测 `session_state_transitions_and_labels`。
+
+**口径**：不新建并行状态机、不新增进程、不动热路径；`RenderTrack` 就是原来那把租约锁，四态是它的可诊断视图。
+
+**回归**：`cargo test` **316 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.38s；`smoke` 16 PASS·1 SKIP。
+
+**下一步**：仍是 ADR-0010 的两条——① 若批准，pdfium 单客户 sidecar 试点（常驻子进程 + 一条 IPC + 共享内存零拷贝 + 看门狗），把四态复用给进程外后端；② office 轻型 / html 改进优先进程内只读渲染或系统隔离。

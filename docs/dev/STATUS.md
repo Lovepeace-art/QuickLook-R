@@ -1,5 +1,12 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **后端会话四态状态机（进程内）**：`SessionState{Idle/Active/Reclaiming/Crashed}`
+> 挂到现有 `RenderTrack`/`Lease` 生命周期（begin→Active、end/abort→Idle、mark_hung→Reclaiming、
+> heal_failed→Crashed、heal_succeeded→Active/Idle），只在真变化时打 `SESSION backend= state=` 日志；
+> 不新增进程、不动热路径。补单测 `session_state_transitions_and_labels`。回归 `cargo test` **316 passed / 0 failed**、
+> fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。ADR-0010 跟进。
+>
+
 > 更新时间：2026-11-04 · **ADR-0010 多进程决策 + 后端能力契约**：不做全面多进程；`PreviewBackend` 增
 > `isolation()`/`interactive()` 元数据（Native/Archive/Plugin=InProc，Shell=SystemProcess/prevhost），
 > 判挂日志带 `[后端id]`。新增 `docs/adr/0010-*.md`（可选进程外后端，首个且仅 pdfium 试点，另行批准）。

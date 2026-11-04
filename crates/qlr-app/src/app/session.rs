@@ -523,6 +523,35 @@ pub(crate) struct Lease {
     pub(crate) job: RenderJob,
 }
 
+/// 预览会话的后端状态（进程内四态）。任一时刻会话处于 `Idle`/`Active`/`Reclaiming`/`Crashed`
+/// 之一；转换只在 `RenderTrack` 的锁里发生，并打一行 debug 日志（见 `RenderTrack::set_state`）。
+///
+/// 这是 ADR-0010 说的"后端会话可诊断"的进程内第一步：不引入进程，只把"现在这套渲染会话
+/// 活到哪一步"显式化。将来真做 pdfium sidecar 时，这套四态可直接复用给进程外后端。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionState {
+    /// 没有在跑的帧。
+    Idle,
+    /// 有一条租约正在渲染。
+    Active,
+    /// 判挂，正在换线程/回收。
+    Reclaiming,
+    /// 回收失败（重建起不来）。
+    Crashed,
+}
+
+impl SessionState {
+    /// 稳定标签（进日志、可 grep）。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SessionState::Idle => "idle",
+            SessionState::Active => "active",
+            SessionState::Reclaiming => "reclaiming",
+            SessionState::Crashed => "crashed",
+        }
+    }
+}
+
 /// 租约 + 自愈状态（1.8.3）。**一把锁**，因为这三件事每次都要一起看。
 ///
 /// 为什么不塞进 `State`：`State` 是 UI 线程的大锁（里面的字段牵着窗口/COM 句柄的生命
@@ -536,6 +565,26 @@ pub(crate) struct RenderTrack {
     pub(crate) total: u32,
     /// 有重建在飞：从判挂到换完发送端之间置位，保证任何时刻最多一个重建。
     pub(crate) healing: bool,
+    /// 当前后端会话状态（四态）。
+    pub(crate) state: SessionState,
+    /// 当前/最近一次租约的后端 id（诊断用；无后端时 `"none"`）。
+    pub(crate) backend: &'static str,
+}
+
+impl RenderTrack {
+    /// 状态转换 + 一行 debug 日志（只在状态真的变了、或活跃后端换了才打，避免每 250 ms 刷屏）。
+    pub(crate) fn set_state(&mut self, next: SessionState, backend: &'static str) {
+        if self.state != next || (next == SessionState::Active && self.backend != backend) {
+            self.state = next;
+            self.backend = backend;
+            qlr_core::log_debug!(
+                "render",
+                "SESSION backend={} state={}",
+                backend,
+                next.label()
+            );
+        }
+    }
 }
 
 pub(crate) static RENDER_TRACK: OnceLock<Mutex<RenderTrack>> = OnceLock::new();
@@ -547,6 +596,8 @@ pub(crate) fn render_track() -> &'static Mutex<RenderTrack> {
             consecutive: 0,
             total: 0,
             healing: false,
+            state: SessionState::Idle,
+            backend: "none",
         })
     })
 }
@@ -703,5 +754,37 @@ mod reset_tests {
         assert!(s.media_aspect.is_none(), "media_aspect 应清");
         assert!(s.resize_edges.is_none(), "resize_edges 应清");
         assert!(s.resize_from.is_none(), "resize_from 应清");
+    }
+
+    #[test]
+    fn session_state_transitions_and_labels() {
+        let mut t = RenderTrack {
+            lease: None,
+            consecutive: 0,
+            total: 0,
+            healing: false,
+            state: SessionState::Idle,
+            backend: "none",
+        };
+        assert_eq!(t.state, SessionState::Idle);
+        t.set_state(SessionState::Active, "native");
+        assert_eq!((t.state, t.backend), (SessionState::Active, "native"));
+        t.set_state(SessionState::Reclaiming, "native");
+        assert_eq!(t.state, SessionState::Reclaiming);
+        t.set_state(SessionState::Crashed, "native");
+        assert_eq!(t.state, SessionState::Crashed);
+        t.set_state(SessionState::Idle, "native");
+        assert_eq!(t.state, SessionState::Idle);
+        // 同是 Active 但后端变了，也要更新 backend 并记日志。
+        t.set_state(SessionState::Active, "shell");
+        assert_eq!((t.state, t.backend), (SessionState::Active, "shell"));
+        for (state, label) in [
+            (SessionState::Idle, "idle"),
+            (SessionState::Active, "active"),
+            (SessionState::Reclaiming, "reclaiming"),
+            (SessionState::Crashed, "crashed"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
     }
 }

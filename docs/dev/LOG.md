@@ -3189,3 +3189,16 @@ app 只编排、不碰 FFI：
 
 ### 怎么验证
 `cargo test` **315 passed / 0 failed**（+1 isolation 单测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.72s；`smoke` 16 PASS·1 SKIP（tray UIPI）。
+
+## 2026-11-04 · 后端会话四态状态机（进程内，ADR-0010 跟进）
+
+### 做了什么
+- `session.rs`：新增 `SessionState{Idle,Active,Reclaiming,Crashed}` + `label()`；`RenderTrack` 增 `state`/`backend` 字段与 `set_state()`（只在真变化时打 `SESSION backend= state=` debug 日志）。四态直接挂在现有线程级租约表上，不新建并行状态。
+- `render.rs`：`begin_lease`→Active（带后端 id）、`end_lease`/`abort_lease`→Idle、`mark_hung`→Reclaiming、`heal_failed`→Crashed、`heal_succeeded`→Active/Idle。
+- 单测 `session_state_transitions_and_labels`（四态迁移 + 同 Active 换后端 + label）。
+
+### 为什么
+ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给出可诊断四态 + 日志。复用现有 `RenderTrack`/`Lease` 生命周期事件，不新增进程、不动热路径（关键点只加一次状态比较，命中才打日志）。
+
+### 怎么验证
+`cargo test` **316 passed / 0 failed**（+1 四态单测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.38s；`smoke` 16 PASS·1 SKIP（tray UIPI）。
