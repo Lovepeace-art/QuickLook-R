@@ -318,7 +318,8 @@ pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64)
                 // 文本布局字符串、Vec 扩容都在里面，量出来才知道"每帧重建"值不值得优化。
                 #[cfg(feature = "alloc-stats")]
                 let alloc_before = crate::alloc_stats::total_allocated();
-                let result = if qlr_render::viewer_for(kind).is_some() {
+                let native = backend::resolve(&job.path, kind).is_some_and(|b| b.id() == "native");
+                let result = if native {
                     qlr_render::render_file_at_zoom(
                         &job.path,
                         job.max_width,
@@ -1027,7 +1028,7 @@ pub(crate) fn warm_prepared(job: &RenderJob) {
         return;
     }
     let kind = format::kind_for_path(&job.path);
-    if qlr_render::viewer_for(kind).is_none() {
+    if !backend::resolve(&job.path, kind).is_some_and(|b| b.id() == "native") {
         // 插件渲染一律不预热：插件是第三方代码，不该在"用户没要求"时跑。
         return;
     }
@@ -1263,7 +1264,7 @@ pub(crate) fn maybe_prewarm() {
     };
     let kind = format::kind_for_path(&path);
     // 不支持/只有插件接的格式不预热：插件是第三方代码，不该在"用户没要求"时跑。
-    if qlr_render::viewer_for(kind).is_none() {
+    if !backend::resolve(&path, kind).is_some_and(|b| b.id() == "native") {
         return;
     }
     if !prewarm_within_budget(&path, kind) {

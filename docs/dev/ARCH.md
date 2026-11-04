@@ -28,14 +28,16 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
   **两处平台边界例外**（各文件顶部有说明）：`svg`（Direct2D 1.3，只有它能栅格化 SVG）与
   `media`（Media Foundation 探针 + 视频首帧）。
 - `qlr-app`：宿主进程。`app`（状态机 + `wndproc` + 渲染线程调度 + 压缩包列表 + PPT 翻页接管）· `cli`（参数解析）· `main`。
-  存量例外（§6-4「裸 Win32 收口」未做）：`layout.rs:35` 的 `RECT`、`settings.rs:23-24` 的
-  `HWND/LPARAM/LRESULT/WPARAM` 直接 `use windows::`；`app/mod.rs` 是给整个 `app` 模块用的 prelude 再导出。
+  `app/backend.rs`（§7 起）：`PreviewBackend` 契约 + `resolve`，是"这个文件交给谁画（选择 / 表面 / 自然尺寸）"的
+  **唯一入口**；`show`/`render`/`shell` 不再各自枚举 `Kind`，新增后端只改这一处。
+  存量例外：`layout.rs:35` 的 `RECT`、`settings.rs:23-24` 的 `HWND/LPARAM/LRESULT/WPARAM` 直接 `use windows::`；
+  `app/mod.rs` 是给整个 `app` 模块用的 prelude 再导出。（§6-4 起 app 已不直接调计时 / 退出原语。）
 
 规则：**业务判断不许下沉到 platform，FFI 细节不许上浮到 app**。
 
 上面这些不是口头约定——`scripts/verify-layers.ps1` 逐条断言（依赖方向、`use windows::` 的文件白名单、
 app 侧的**计数棘轮**：现存例外只许减少不许增加）。`pwsh -NoProfile -File scripts/verify-layers.ps1`
-应输出 `11 PASS · 0 FAIL`。**改架构时必须同步改这个脚本**，否则断言会把新结构判成违规。
+应输出 `13 PASS · 0 FAIL`。**改架构时必须同步改这个脚本**，否则断言会把新结构判成违规。
 
 ## 2. 进程与线程模型
 

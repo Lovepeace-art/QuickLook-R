@@ -3064,3 +3064,39 @@ app 只编排、不碰 FFI：
 ### 下一步（未开工）
 
 - 后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，无 sidecar）。
+
+## 2026-11-04 · §7 PreviewBackend 预览后端契约（第一刀）
+
+### 做了什么
+
+把「这个文件由谁来画」从 `show.rs` / `render.rs` / `shell.rs` 三处重复枚举 `Kind` 收口到一个入口：
+
+- 新建 `crates/qlr-app/src/app/backend.rs`：`trait PreviewBackend`（`id/priority/can_handle/surface/natural_size`）
+  + 四个零大小后端 `NativeBackend` / `ArchiveBackend` / `ShellBackend` / `PluginBackend`
+  + `resolve(path, kind)` 取首个 `can_handle`。
+- `show.rs`：`supported`、`natural`、`plugin`、`archive`、`renderable`、`shell`、`shell_wanted`、build_lines 的
+  插件提示，全部改由 `backend::resolve(...)` 驱动；新增 debug 级 `BACKEND <id> surface=<..>` 日志。
+- `render.rs`：worker 的 `native` 判定与两处 prewarm 的前置判断改走 `backend::resolve`。
+- `shell.rs`：删除 `shell_candidate`，规则并入 `ShellBackend`。
+- **压缩包按扩展名优先**：`resolve` 第一步 `if is_archive(path)` 直接返回 `ArchiveBackend`——否则一个内容被
+  嗅探成文本的假 `.zip` 会退化成文本预览、不再走"解析失败"提示（这是改造中实测发现并修掉的回归）。
+- `scripts/verify-layers.ps1`：新增 §2c「app 只在 backend.rs 里枚举 `viewer_for`」（13 PASS）。
+
+### 为什么
+
+"加格式 = 改平台"的根因不是 `Kind` 太多，而是**判定散落**：每加一个后端要在四五个文件各补分支。
+本刀只抽"选择 / 表面 / 自然尺寸"三件，不碰渲染/窗口/音视频，保证行为等价、可增量演进。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**312 passed / 0 failed**（307 + backend 5 个单测）。
+- `scripts/verify-layers.ps1`：**13 PASS · 0 FAIL**（新增 §2c PATCH）。
+- `scripts/smoke.ps1`：**16 检查全过 · 1 SKIP · 0 FAIL**（SKIP=管理员会话托盘 UIPI）；冷启 81 ms、RENDER 110 ms。
+- 端到端：`verify-archive` **11 PASS**、`verify-media` **15 PASS**、`verify-office` **23 PASS**、
+  `verify-mediashape` **13 PASS**、`verify-pdf` 静默（夹具缺失）。
+
+### 下一步（未开工）
+
+- 让 `repaint` 的绘制通道按 `Surface` 驱动（本刀只分类未重构）。
+- `PreviewBackend` 之上接入"office 轻型 / html 改进"新后端；PDF 单客户 sidecar 后续评估。

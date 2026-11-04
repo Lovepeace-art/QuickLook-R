@@ -37,6 +37,7 @@ pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 mod archive;
+pub(crate) mod backend;
 mod boot;
 mod chrome;
 mod input;

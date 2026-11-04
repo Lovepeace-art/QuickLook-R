@@ -743,3 +743,21 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 （省 ~0.59 ms / ≈19%），GDI 恒 **25**、无增长。
 
 **下一步**：后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，无 sidecar）。
+
+## §7 PreviewBackend 接力说明（2026-11-04，平台层完善第 4 项）
+
+**这一批做了什么**：新建 `crates/qlr-app/src/app/backend.rs` —— `trait PreviewBackend`
+（`id/priority/can_handle/surface/natural_size`）+ 四个零大小后端（`NativeBackend`/`ArchiveBackend`/
+`ShellBackend`/`PluginBackend`）+ `resolve(path,kind)` 单一入口；`show.rs`/`render.rs` 的选路全部改走
+`resolve`，`shell.rs::shell_candidate` 删除并入 `ShellBackend`。改动文件：`app/backend.rs`(新)、
+`app/mod.rs`、`app/show.rs`、`app/render.rs`、`app/shell.rs`、`scripts/verify-layers.ps1`；文档 ADR-0009 + ARCH + LOG + STATUS。
+
+**关键口径（不是回归，是修正）**：`resolve` 第一步 `if is_archive(path)` 直接返回 `ArchiveBackend`——
+压缩包按**扩展名**判定，即使内容被嗅探成文本（假 `.zip`）也走"解析失败"提示，而不是退化成文本预览。
+
+**回归**：`cargo test` **312 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **13 PASS**
+（新增 §2c「app 只在 backend.rs 里枚举 viewer_for」）；`smoke` **16 PASS · 1 SKIP**；
+端到端 verify-archive **11 PASS**、verify-media 15、verify-office 23、verify-mediashape 13。
+
+**下一步**：让 `repaint` 的绘制通道按 `Surface` 驱动（本刀只分类未重构）；然后在 `PreviewBackend`
+之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件。

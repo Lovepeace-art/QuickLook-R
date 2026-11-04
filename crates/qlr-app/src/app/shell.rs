@@ -3,26 +3,8 @@
 
 use super::*;
 
-/// 试一把系统预览处理器（1.4.1）：只对"内置四类之外、且有插件接管"的文件尝试，
-/// 因为这类文件我们自己画得最简陋，系统处理器画得最好。
-///
-/// 成功返回 true（调用方跳过插件渲染），失败返回 false（照常走插件卡片）。
-/// 只判断"要不要试系统预览处理器"，不做任何 COM 调用（COM 部分要等窗口显示后再做）。
-pub(crate) fn shell_candidate(path: Option<&Path>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    let kind = format::kind_for_path(path);
-    if qlr_render::viewer_for(kind).is_some() {
-        // 图片/PDF/文本/Markdown 由我们自己画，且我们的交互（缩放/滚动/目录）比处理器好。
-        return false;
-    }
-    if qlr_core::plugins::host().find_for_path(path).is_none() {
-        // 没插件 = 本来就不支持（预览窗根本不会开），不用试。
-        return false;
-    }
-    shellpreview::has_handler(path)
-}
+// "这个文件交给谁来画"的判定已收口到 `backend.rs`（§7 后端契约；`ShellBackend` 里就是
+// 原来的 `shell_candidate` 规则）。本模块只负责在**已经确定**走系统处理器之后，做窗口 / COM 那一套。
 
 /// 系统预览处理器的"延迟拆卸"队列。
 ///

@@ -270,8 +270,7 @@ pub(crate) fn follow_picked(next: PathBuf) {
     // 不支持的文件直接忽略（不切换、也不响铃）：鼠标扫过一堆无关文件时，
     // 每越过一个就"叮"一声会把用户逼疯；响铃只在**用户主动按空格**时给。
     let kind = format::kind_for_path(&next);
-    let supported =
-        qlr_render::viewer_for(kind).is_some() || plugins::host().find_for_path(&next).is_some();
+    let supported = backend::resolve(&next, kind).is_some();
     if !supported {
         log_debug!(SCOPE, "跟随：跳过不支持的 {}（{kind}）", next.display());
         return;
@@ -428,11 +427,17 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
         .as_deref()
         .map(format::kind_for_path)
         .unwrap_or(format::Kind::Unsupported);
+    // §7 后端契约：谁能接这个文件由 `backend::resolve` 一处给出（原生 > 压缩包 >
+    // 系统处理器 > 插件）；自然尺寸、表面、渲染分发都问它。
+    let backend = target.as_deref().and_then(|p| backend::resolve(p, kind));
+    if let Some(b) = backend {
+        log_debug!(SCOPE, "BACKEND {} surface={:?}", b.id(), b.surface(kind));
+    }
     // 按**原始尺寸**开窗（1.0.1）：图片读文件头像素尺寸、PDF 取首页 point 尺寸，
     // 探测不到（文本/插件/坏文件）才退回配置里的比例。
     let natural = target
         .as_deref()
-        .and_then(|p| qlr_render::natural_size(p, kind));
+        .and_then(|p| backend.and_then(|b| b.natural_size(p, kind)));
     // 图片/视频（1.8.1）：窗口比例锁成素材比例——之后改大小只做等比缩放、内容始终铺满。
     let aspect = match (kind, natural) {
         (format::Kind::Image | format::Kind::Video, Some((w, h))) if w > 0 && h > 0 => {
@@ -490,16 +495,12 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     }
 
     // 1) 先定内容与占位：旧帧立刻作废，避免"上一张图"残留在新窗口上。
-    // 内置查看器优先，内置没有才问插件（与渲染线程的分发规则一致）。
     let plugin = target
         .as_deref()
-        .filter(|_| qlr_render::viewer_for(kind).is_none())
+        .filter(|_| backend.is_some_and(|b| b.id() == "plugin"))
         .and_then(|p| plugins::host().find_for_path(p));
-    // 压缩包（1.7.3）：内置列表视图是壳层自己画的，既没有 `Viewer` 也可能没有插件，
-    // 所以单独放行一次——否则 `.zip` 会掉进下面"不支持"分支被响铃拒绝。
-    let archive = target.as_deref().is_some_and(is_archive);
-    let renderable =
-        target.is_some() && (qlr_render::viewer_for(kind).is_some() || plugin.is_some() || archive);
+    let archive = backend.is_some_and(|b| b.id() == "archive");
+    let renderable = target.is_some() && backend.is_some();
 
     // 不支持的文件（1.0.10）：**一个像素都不画**，只"响一声"然后收起窗口。
     //
@@ -551,7 +552,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
 
     clear_archive_view();
     if let Some(p) = target.as_deref()
-        && is_archive(p)
+        && archive
     {
         if !open_archive_view(p) {
             // 解析失败（不是真 zip / 截断 / 加密 / 空）：按"不支持"处理——响一声、
@@ -588,7 +589,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // 交给系统预览处理器（Office）时**连文件信息页也一起删掉**（1.8.1 用户要求
     // "把占位页面直接删掉"）：窗口先空着，处理器第一帧到了直接铺满，中间不闪一页文字。
     // 只有走我们自己渲染的格式才留"正在渲染…"那一行。
-    let shell = shell_candidate(target.as_deref());
+    let shell = backend.is_some_and(|b| b.id() == "shell");
     if shell {
         lines.clear();
     } else if renderable {
@@ -642,7 +643,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // 1.4.1：系统装了 Office 预览处理器就优先交给它（真排版）。
     // 这里只做"判断"：真正 DoPreview 必须等窗口 show 出来之后——在隐藏窗口上 DoPreview
     // 会让处理器等一个永远不会到来的激活，UI 线程直接卡死（踩过，表现为"未响应"）。
-    let shell_wanted = shell_candidate(target.as_deref());
+    let shell_wanted = backend.is_some_and(|b| b.id() == "shell");
     // 换到"不需要系统预览处理器"的文件（图片/文本…）时同样要卸掉上一个文件的处理器，
     // 否则它的子窗口会盖住新内容（1.7.5，见 `drop_stale_shell_preview`）。
     if !shell_wanted {
@@ -1084,7 +1085,8 @@ pub(crate) fn build_lines(target: Option<&Path>) -> Vec<String> {
             }
             // 1.0.10：不支持的文件不再画占位（`show_preview` 直接响铃收起），
             // 所以这里只剩"插件接管了"这一种非内置情形。
-            if qlr_render::viewer_for(format::kind_for_path(p)).is_none()
+            let k = format::kind_for_path(p);
+            if backend::resolve(p, k).is_some_and(|b| b.id() == "plugin")
                 && let Some(plugin) = plugins::host().find_for_path(p)
             {
                 lines.push(format!(

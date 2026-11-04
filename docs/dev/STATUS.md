@@ -1,5 +1,13 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **§7 PreviewBackend 预览后端契约（第一刀，平台层完善第 4 项）**：「这个文件由谁来画」
+> 从 `show.rs`/`render.rs`/`shell.rs` 三处重复枚举 `Kind` 收口到 `app/backend.rs` 的 `trait PreviewBackend`
+> + `resolve`（四个零大小后端 Native/Archive/Shell/Plugin）。压缩包按扩展名优先（修掉"假 .zip 退化成文本"
+> 的回归）。`shell_candidate` 删除。回归 `cargo test` **312 passed / 0 failed**、fmt/clippy 零输出、
+> `verify-layers` **13 PASS**（新增 §2c）、`smoke` **16 PASS · 1 SKIP**；端到端 verify-archive 11 / media 15 /
+> office 23 / mediashape 13。ADR-0009。明细见 §52。
+>
+
 > 更新时间：2026-11-04 · **§6-7 PaintBuffer 复用 + 每帧 GDI 计数**（平台层完善，第 3 项）：两条绘制通道
 > 不再每帧 `CreateCompatibleBitmap/DC` 再销毁，改用线程本地、按尺寸复用的整窗离屏缓冲
 > （`acquire/release/drop_paint_buffer`），收起预览即释放。A/B 实测（880×748、滚 10 次）：每帧绘制

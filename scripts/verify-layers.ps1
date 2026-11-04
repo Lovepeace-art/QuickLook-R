@@ -149,6 +149,19 @@ Check "app 不直接调 Win32 计时/退出原语" ($appPrim.Count -eq 0) (
     $(if ($appPrim.Count -eq 0) { "全部走 qlr_platform::window" } else { $appPrim -join ", " })
 )
 
+# ---- 2c. §7 后端契约：app 侧不许再各自枚举 `viewer_for`（"谁来画"收口到 backend.rs）----
+# 以前 show/render/shell 各自 `viewer_for(kind).is_some()` 判一遍，加一个后端要改一圈。
+# 现在统一走 `backend::resolve(path, kind)`；`viewer_for` 只许出现在 backend.rs 的实现里。
+$appViewerScatter = @()
+foreach ($f in $appSrcFiles) {
+    if ($f.Name -eq "backend.rs") { continue }
+    $hits = Select-String -Path $f.FullName -Pattern 'viewer_for\s*\(' -Encoding utf8
+    foreach ($h in $hits) { $appViewerScatter += "$(RelName $f.FullName):$($h.LineNumber)" }
+}
+Check "app 只在 backend.rs 里枚举 viewer_for" ($appViewerScatter.Count -eq 0) (
+    $(if ($appViewerScatter.Count -eq 0) { "选择逻辑已收口到 backend.rs" } else { $appViewerScatter -join ", " })
+)
+
 # ---- 3. platform 不许调用上层的类型 ----
 $platformFiles = Get-ChildItem (Join-Path $Root "crates\qlr-platform\src") -Recurse -Filter *.rs
 $platformBad = @()
