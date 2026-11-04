@@ -38,6 +38,33 @@ impl Surface {
     }
 }
 
+/// 后端跑在哪个进程里——**契约元数据，不是行为**。
+///
+/// 把它显式化，是为了让"这个后端将来要不要隔离"在选后端时就能被读到、写进日志，
+/// 而不是散落在注释里。当前只有系统预览处理器（Office）天然在独立进程；其余都在本进程。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Isolation {
+    /// 与本进程同生共死（原生自研、压缩包列表、进程内 C ABI 插件）。
+    InProc,
+    /// 由系统在独立代理进程里承载（`IPreviewHandler` → `prevhost.exe`）。
+    SystemProcess,
+    /// 需要自建 sidecar 才安全（不可信的二进制解码器 / 易挂起）。**当前无后端使用**，
+    /// 作为契约预留：真正要隔离 `pdfium` 一类时，在这里声明而不是散改调用点。
+    #[allow(dead_code)]
+    NeedsSidecar,
+}
+
+impl Isolation {
+    /// 稳定标签（进日志、可被 grep）。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Isolation::InProc => "inproc",
+            Isolation::SystemProcess => "system",
+            Isolation::NeedsSidecar => "sidecar",
+        }
+    }
+}
+
 /// 谁能接管一个文件的预览。
 ///
 /// 实现者应是**无状态零大小**的：`resolve` 每次按需返回静态引用，不分配。
@@ -52,6 +79,10 @@ pub(crate) trait PreviewBackend: Sync {
     fn surface(&self, kind: format::Kind) -> Surface;
     /// 按原始尺寸开窗用的像素尺寸（无自然尺寸的后端返回 `None`）。
     fn natural_size(&self, path: &Path, kind: format::Kind) -> Option<(u32, u32)>;
+    /// 跑在哪个进程里（见 [`Isolation`]）。
+    fn isolation(&self) -> Isolation;
+    /// 是否需要把输入事件转发给它（滚动/翻页/Office 点选=是；v1 插件静态位图=否）。
+    fn interactive(&self) -> bool;
 }
 
 /// 原生自研渲染（`qlr_render::Viewer`）。最高优先级。
@@ -79,6 +110,12 @@ impl PreviewBackend for NativeBackend {
     fn natural_size(&self, path: &Path, kind: format::Kind) -> Option<(u32, u32)> {
         qlr_render::natural_size(path, kind)
     }
+    fn isolation(&self) -> Isolation {
+        Isolation::InProc
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 /// 压缩包目录树（壳层自绘列表，1.7.3）。
@@ -99,6 +136,12 @@ impl PreviewBackend for ArchiveBackend {
     }
     fn natural_size(&self, _path: &Path, _kind: format::Kind) -> Option<(u32, u32)> {
         None
+    }
+    fn isolation(&self) -> Isolation {
+        Isolation::InProc
+    }
+    fn interactive(&self) -> bool {
+        true
     }
 }
 
@@ -130,6 +173,12 @@ impl PreviewBackend for ShellBackend {
     fn natural_size(&self, _path: &Path, _kind: format::Kind) -> Option<(u32, u32)> {
         None
     }
+    fn isolation(&self) -> Isolation {
+        Isolation::SystemProcess
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 /// 插件兜底（`qlr-plugin-api` 的进程内 C ABI）。默认出位图（插件也能给文本大纲，
@@ -155,6 +204,12 @@ impl PreviewBackend for PluginBackend {
     }
     fn natural_size(&self, _path: &Path, _kind: format::Kind) -> Option<(u32, u32)> {
         None
+    }
+    fn isolation(&self) -> Isolation {
+        Isolation::InProc
+    }
+    fn interactive(&self) -> bool {
+        false
     }
 }
 
@@ -236,5 +291,21 @@ mod tests {
     fn priorities_are_strictly_increasing() {
         let ps: Vec<u8> = BACKENDS.iter().map(|b| b.priority()).collect();
         assert!(ps.windows(2).all(|w| w[0] < w[1]), "{ps:?}");
+    }
+
+    #[test]
+    fn isolation_and_interactive_contract() {
+        assert_eq!(NATIVE.isolation(), Isolation::InProc);
+        assert!(NATIVE.interactive());
+        assert_eq!(ARCHIVE.isolation(), Isolation::InProc);
+        assert!(ARCHIVE.interactive());
+        assert_eq!(SHELL.isolation(), Isolation::SystemProcess);
+        assert!(SHELL.interactive(), "Office 类需要把点选/翻页转发给它");
+        assert_eq!(PLUGIN.isolation(), Isolation::InProc);
+        assert!(!PLUGIN.interactive(), "v1 插件只出静态位图，不接输入");
+        // 标签进日志，必须稳定可 grep。
+        assert_eq!(Isolation::InProc.label(), "inproc");
+        assert_eq!(Isolation::SystemProcess.label(), "system");
+        assert_eq!(Isolation::NeedsSidecar.label(), "sidecar");
     }
 }

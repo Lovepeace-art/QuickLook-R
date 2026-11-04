@@ -807,3 +807,13 @@ media 15 / mediashape 13。
 **实测**：8 MB Markdown `layout` 全量 **346→190 ms（−45%）**（`render_with(head,20万行)` 241→146 ms）；`cargo test` **314 passed / 0 failed**；`verify-layers` **14 PASS**；`smoke` 16 PASS·1 SKIP；release 32.71s。
 
 **下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件打磨。
+
+## ADR-0010 多进程决策 + 后端能力契约 接力说明（2026-11-04）
+
+**这一批做了什么**：新增 `docs/adr/0010-no-full-multiprocess-optional-isolated-backend.md`（不做全面多进程，采用可选进程外后端，首个且仅 pdfium 试点另行批准）。`backend.rs` 的 `PreviewBackend` 增加 `isolation()/interactive()` 契约元数据并给四个后端赋值（Native/Archive/Plugin=InProc，Shell=SystemProcess/prevhost；interactive 除 v1 插件外均 true）；`show.rs` 的 BACKEND 日志打印二者；`render.rs::describe_job` 前缀 `[后端id]`，看门狗判挂日志能定位卡在哪个后端。
+
+**为什么**：评审要"宿主级后端管理"，但全面多进程吃掉速度护城河（冷启动 18–24ms / 内存 18.6MB / 包体 2.29MB），且 Office 已 prevhost、WebView2 自带多进程，唯一候选是进程内 pdfium。先把"进程归属/输入需求"显式化，进程外作为后端形态预留（不改插件 ABI）。
+
+**回归**：`cargo test` **315 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.72s；`smoke` 16 PASS·1 SKIP。
+
+**下一步**：① 进程内"后端会话契约 + 租约四态状态机"（活跃/空闲/回收/崩溃 + 日志），不动热路径；② 若批准，做 pdfium 单客户 sidecar 试点（常驻子进程 + 一条 IPC + 共享内存零拷贝 + 看门狗）；③ office 轻型 / html 改进优先进程内只读渲染或系统隔离。

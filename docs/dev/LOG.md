@@ -3175,3 +3175,17 @@ app 只编排、不碰 FFI：
 ### 怎么验证（实测数字）
 - Markdown 8 MB 合成（297354 行）`cargo test --release -p qlr-render --lib bench_md_phases -- --ignored --nocapture`：**layout 全量 346.1 → 190.0 ms（−45%）**；`render_with(head,200000 行)` 241.3 → 146.1 ms；`render_with(head,400 行)` 15.1 → 15.4 ms（首屏基本不变）。fastpath 关闭（`QLRUST_NO_MD_FASTPATH=1`）即基线。
 - `cargo test` **314 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 32.71s；`smoke` 16 PASS · 1 SKIP（tray UIPI）。
+
+## 2026-11-04 · ADR-0010 + 后端能力契约（isolation/interactive）+ 租约判挂日志带后端 id
+
+### 做了什么
+- 新增 `docs/adr/0010-no-full-multiprocess-optional-isolated-backend.md`：决策"不做全面多进程"，采用可选进程外后端，首个且仅 pdfium 试点（试点另行批准）。
+- `backend.rs`：`PreviewBackend` 增加 `isolation() -> Isolation{InProc|SystemProcess|NeedsSidecar}` 与 `interactive() -> bool`；四个后端分别声明（Native/Archive=InProc+interactive；Shell=SystemProcess+interactive；Plugin=InProc+非交互）；补单测 `isolation_and_interactive_contract`。
+- `show.rs`：`BACKEND` 调试日志打印 `isolation`/`interactive`。
+- `render.rs::describe_job`：判挂/自愈日志描述前缀 `[后端id]`，定位"卡在哪个后端"。
+
+### 为什么
+评审要"把单进程渲染器升级为能管理多后端的宿主骨架"。但全面多进程会吃掉冷启动/内存/包体护城河；Office 已由 prevhost 隔离、WebView2 自带多进程，唯一值得隔离的是进程内 pdfium。故先把"这个后端在哪个进程/要不要转发输入"做成**显式契约**（不改 ABI），进程外留作后端形态，实现与否另行批准。
+
+### 怎么验证
+`cargo test` **315 passed / 0 failed**（+1 isolation 单测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.72s；`smoke` 16 PASS·1 SKIP（tray UIPI）。

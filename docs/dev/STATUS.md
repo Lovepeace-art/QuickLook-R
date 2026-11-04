@@ -1,5 +1,11 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **ADR-0010 多进程决策 + 后端能力契约**：不做全面多进程；`PreviewBackend` 增
+> `isolation()`/`interactive()` 元数据（Native/Archive/Plugin=InProc，Shell=SystemProcess/prevhost），
+> 判挂日志带 `[后端id]`。新增 `docs/adr/0010-*.md`（可选进程外后端，首个且仅 pdfium 试点，另行批准）。
+> 回归 `cargo test` **315 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。
+>
+
 > 更新时间：2026-11-04 · **平台层收尾三件套（State.reset_for_hide / Canvas-Surface 对齐 / Markdown 排版快通道）**：
 > ① `State::new` + `reset_for_hide()` 把 13 个瞬态清理由 `hide_preview` 收成一处，补单测；
 > ② `Surface::from_canvas` 让 `State.surface` 以实际内容校准，与 `get_content` 对齐；

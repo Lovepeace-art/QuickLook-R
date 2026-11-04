@@ -71,15 +71,23 @@ pub(crate) fn describe_job(job: &RenderJob) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("<无名>");
     let kind = format::kind_for_path(&job.path);
+    // 后端标识也带上：看门狗判挂/自愈的日志里能一眼看出"卡在哪个后端"，
+    // 这是把线程级租约往"后端级可诊断"推进一步（决定将来是否要把某后端搬进程外）。
+    let backend = backend::resolve(&job.path, kind)
+        .map(|b| b.id())
+        .unwrap_or("none");
     if kind == format::Kind::Pdf {
         format!(
-            "{name} {kind} {}x{} 第{}页",
+            "[{backend}] {name} {kind} {}x{} 第{}页",
             job.max_width,
             job.max_height,
             job.page + 1
         )
     } else {
-        format!("{name} {kind} {}x{}", job.max_width, job.max_height)
+        format!(
+            "[{backend}] {name} {kind} {}x{}",
+            job.max_width, job.max_height
+        )
     }
 }
 

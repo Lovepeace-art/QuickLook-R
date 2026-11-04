@@ -431,7 +431,14 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // 系统处理器 > 插件）；自然尺寸、表面、渲染分发都问它。
     let backend = target.as_deref().and_then(|p| backend::resolve(p, kind));
     if let Some(b) = backend {
-        log_debug!(SCOPE, "BACKEND {} surface={:?}", b.id(), b.surface(kind));
+        log_debug!(
+            SCOPE,
+            "BACKEND {} surface={:?} isolation={} interactive={}",
+            b.id(),
+            b.surface(kind),
+            b.isolation().label(),
+            b.interactive()
+        );
     }
     // §7 第二刀：把"用哪种表面承载"记进状态，`repaint` 顶层通道据此路由。
     with_state(|s| s.surface = backend.map(|b| b.surface(kind)));
