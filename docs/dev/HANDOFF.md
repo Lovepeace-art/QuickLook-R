@@ -778,3 +778,21 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 media 15 / mediashape 13。
 
 **下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件。
+
+## window.rs 纯搬家拆 window/ 接力说明（2026-11-04，平台层完善第 6 项）
+
+**这一批做了什么**：`crates/qlr-platform/src/window.rs`（3660 行）纯搬家拆成 `window/` 目录：
+`mod.rs`（窗口类/创建/显示/几何/输入/消息泵/子窗口）+ `shadow`/`text`/`settings`/`chrome`/`paint`/`scroll`/
+`audio`/`toc`/`bitmap` 九个子模块。每个子模块顶部只多一行 `use super::*;`，函数体一字未改；`mod.rs` 末尾
+`pub use <mod>::*;` 再导出（`paint` 用 `pub(crate) use`）。改动文件：`crates/qlr-platform/src/window/**`、
+`scripts/verify-layers.ps1`；文档 ARCH + LOG + STATUS。
+
+**口径**：只动了可见性（跨模块把 `fill_solid/frame_solid/draw_line/measure_line`、`FONTS`/`FontSet::get`、
+`TextStyle::weight/color` 提到 `pub(crate)`），**无任何逻辑改动**。`window/mod.rs` 的 `mod tests` 仍在，
+经 `use super::*` + 再导出看到各子模块项。
+
+**回归**：`cargo test` **312 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**（新增 §3b
+「platform 单文件 ≤ 1600 行」）；`cargo build --release` 26.05s；`smoke` 16 PASS · 1 SKIP（tray UIPI）。
+
+**下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；Markdown
+`layout` 240ms 可作渲染层独立小项；之后重心转插件。

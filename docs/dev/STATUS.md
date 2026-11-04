@@ -1,5 +1,12 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **window.rs 纯搬家拆成 window/ 子模块（平台层完善第 6 项）**：把 3660 行的
+> `qlr-platform/src/window.rs` 拆成 `window/{mod,shadow,text,settings,chrome,paint,scroll,audio,toc,bitmap}.rs`，
+> 每块只多一行 `use super::*;`、函数体一字未改；`mod.rs` 剩 1381 行、最大子模块 `text.rs` 915 行。
+> `verify-layers` 新增 §3b「platform 单文件 ≤ 1600 行」。回归 `cargo test` **312 passed / 0 failed**、
+> fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。明细见 §54。
+>
+
 > 更新时间：2026-11-04 · **§7 第二刀 repaint 按 Surface 驱动（平台层完善第 5 项）**：`State` 新增 `surface`，
 > `show_preview` 从 `backend::resolve` 写入，`repaint` 顶层通道改按 `Surface` 路由（List/ChildWindow/
 > Bitmap/Text，运行时守卫保留），为后续接 office 轻型 / html 后端铺路。`fit_bitmap/plain_doc/reserve_bar`

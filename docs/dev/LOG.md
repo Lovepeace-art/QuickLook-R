@@ -3131,3 +3131,31 @@ app 只编排、不碰 FFI：
 ### 下一步
 
 - 在 `PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后转插件打磨。
+
+## 2026-11-04 · window.rs 纯搬家拆成 window/ 子模块（平台层完善第 6 项）
+
+### 做了什么
+
+- `crates/qlr-platform/src/window.rs`（3660 行）纯搬家拆成 `crates/qlr-platform/src/window/`：
+  `mod.rs`（窗口类/创建/显示/几何/输入/消息泵/子窗口）+ `shadow`/`text`/`settings`/`chrome`/`paint`/
+  `scroll`/`audio`/`toc`/`bitmap` 九个子模块。每个子模块顶部只多一行 `use super::*;`，函数体一字未改；
+  `mod.rs` 末尾 `pub use <mod>::*;` 再导出（`paint` 用 `pub(crate) use`，因其四个原语只 crate 内用）。
+- 仅做可见性微调（跨模块用到的 `fill_solid/frame_solid/draw_line/measure_line`、`FONTS`/`FontSet::get`、
+  `TextStyle::weight/color` 加 `pub(crate)`），无逻辑改动。
+- `scripts/verify-layers.ps1` 新增 §3b「platform 单文件 ≤ 1600 行」（防止再长出一个 3600 行文件）。
+
+### 为什么
+
+平台层 `window.rs` 3660 行把类注册/绘制原语/文本测量/滚动条/子窗口全挤一处，违背"薄平台"。按架构评估
+第 3.1 项拆分（纯搬家、行为等价）：拆分后最大文件 `window/mod.rs` 1381 行、`window/text.rs` 915 行。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**312 passed / 0 failed**（与拆分前一致）。
+- `verify-layers`：**14 PASS · 0 FAIL**（新增 §3b PASS）。
+- `cargo build --release` 26.05s；`smoke` **16 检查全过 · 1 SKIP**（tray UIPI；冷启 88ms、RENDER 111ms）。
+
+### 下一步
+
+- `PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后转插件打磨。

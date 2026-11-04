@@ -14,7 +14,7 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
 - `qlr-core`：**不依赖 `windows` crate**，纯逻辑，可跨平台单测。
   `config`（JSON 配置）· `paths`（便携/非便携数据目录）· `log`（自研文件日志）· `ipc`（协议常量与 `Request` 编解码）· `error` · `version`。
 - `qlr-platform`：Win32 薄封装，只做 FFI，不做业务决策。
-  `window`（窗口类/创建/显示/绘制/消息泵/滚动条/贴图）· `hotkey`（`WH_KEYBOARD_LL` + `WH_MOUSE_LL` 钩子）·
+  `window`（窗口类/创建/显示/绘制/消息泵/滚动条/贴图；2026-11-04 纯搬家拆成 `window/{mod,shadow,text,settings,chrome,paint,scroll,audio,toc,bitmap}.rs`，`mod.rs` 只留窗口生命周期/几何/输入/消息泵）· `hotkey`（`WH_KEYBOARD_LL` + `WH_MOUSE_LL` 钩子）·
   `selection`（资源管理器选中项）· `shellpreview`（系统预览处理器宿主 `IPreviewHandler`）·
   `audio`（MCI 播放条）· `tray`（托盘图标与右键菜单）· `instance`（单实例互斥体 + `WM_COPYDATA` 转发）·
   `win11`（圆角 + 系统 backdrop）· `dpi` · `integrity`（进程令牌完整性）· `crash`（崩溃报告）· `wide`（字符串转换）。
@@ -39,7 +39,7 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
 
 上面这些不是口头约定——`scripts/verify-layers.ps1` 逐条断言（依赖方向、`use windows::` 的文件白名单、
 app 侧的**计数棘轮**：现存例外只许减少不许增加）。`pwsh -NoProfile -File scripts/verify-layers.ps1`
-应输出 `13 PASS · 0 FAIL`。**改架构时必须同步改这个脚本**，否则断言会把新结构判成违规。
+应输出 `14 PASS · 0 FAIL`。**改架构时必须同步改这个脚本**，否则断言会把新结构判成违规。
 
 ## 2. 进程与线程模型
 

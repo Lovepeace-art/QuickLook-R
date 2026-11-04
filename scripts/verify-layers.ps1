@@ -171,6 +171,19 @@ foreach ($f in $platformFiles) {
 }
 Check "platform 不反向 use render/app" ($platformBad.Count -eq 0) ($platformBad -join ", ")
 
+# ---- 3b. platform 单文件行数上限（薄平台：防止再长出一个 3600 行的 window.rs）----
+# 2026-11-04：window.rs 曾 3660 行（类注册/绘制/文本/滚动条/子窗口全挤一块），
+# 已纯搬家拆成 window/{mod,shadow,text,settings,chrome,paint,scroll,audio,toc,bitmap}.rs。
+# 这里钉一个上限，谁再把新功能往单文件里堆就会红。
+$platformFat = @()
+foreach ($f in $platformFiles) {
+    $lc = (Get-Content $f.FullName -Encoding utf8 | Measure-Object -Line).Lines
+    if ($lc -gt 1600) { $platformFat += "$(RelName $f.FullName)（$lc 行 > 1600）" }
+}
+Check "platform 单文件 ≤ 1600 行" ($platformFat.Count -eq 0) (
+    $(if ($platformFat.Count -eq 0) { "无膨胀文件" } else { $platformFat -join "; " })
+)
+
 # ---- 4. app 的入口文件不该再长出 FFI ----
 $mainRs = Join-Path $Root "crates\qlr-app\src\main.rs"
 $mainHit = (Select-String -Path $mainRs -Pattern 'use\s+windows' -Encoding utf8 | Measure-Object).Count
