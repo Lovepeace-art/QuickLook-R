@@ -94,7 +94,10 @@ pub fn open(path: &Path) -> Result<Archive, String> {
             "压缩包中央目录过大（{cd_size} 字节，上限 {MAX_CD_BYTES}）"
         ));
     }
-    if cd_offset.checked_add(cd_size as u64).is_none_or(|end| end > len) {
+    if cd_offset
+        .checked_add(cd_size as u64)
+        .is_none_or(|end| end > len)
+    {
         return Err("压缩包中央目录越界".to_string());
     }
     let mut cd = vec![0u8; cd_size];
