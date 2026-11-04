@@ -433,6 +433,8 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     if let Some(b) = backend {
         log_debug!(SCOPE, "BACKEND {} surface={:?}", b.id(), b.surface(kind));
     }
+    // §7 第二刀：把"用哪种表面承载"记进状态，`repaint` 顶层通道据此路由。
+    with_state(|s| s.surface = backend.map(|b| b.surface(kind)));
     // 按**原始尺寸**开窗（1.0.1）：图片读文件头像素尺寸、PDF 取首页 point 尺寸，
     // 探测不到（文本/插件/坏文件）才退回配置里的比例。
     let natural = target
@@ -997,6 +999,7 @@ pub(crate) fn hide_preview() {
         s.resize_edges = None;
         s.resize_from = None;
         s.media_aspect = None;
+        s.surface = None;
         s.drag_from = None;
         s.dragged = false;
         s.slide = None;

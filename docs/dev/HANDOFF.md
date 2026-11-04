@@ -761,3 +761,20 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 
 **下一步**：让 `repaint` 的绘制通道按 `Surface` 驱动（本刀只分类未重构）；然后在 `PreviewBackend`
 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件。
+
+## §7 第二刀 repaint 按 Surface 驱动 接力说明（2026-11-04，平台层完善第 5 项）
+
+**这一批做了什么**：`State` 加 `surface: Option<backend::Surface>`；`show_preview` 在 `backend::resolve`
+后写入（`hide_preview` 收起清 `None`）；`chrome.rs::repaint` 顶层通道改按 `surface` 路由
+（List→paint_archive、ChildWindow→系统处理器只画顶栏、其余 Canvas::Bitmap/Text），仍保留
+`has_archive_view()`/`shell_preview.is_some()` 运行时守卫。改动文件：`crates/qlr-app/src/app/session.rs`、
+`app/show.rs`、`app/chrome.rs`、`app/boot.rs`。
+
+**设计边界**：`fit_bitmap`（SVG/视频等比、图片按窗口比例）/`plain_doc`（HTML/音频去行号）/`reserve_bar`
+（视频留进度条）是逐格式呈现特例，`Surface` 只分 Bitmap/Text 表达不了，**故意留在 repaint**，不硬塞。
+
+**回归**：`cargo test` **312 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **13 PASS**；
+`cargo build --release` 24.20s；`smoke` 全过（16·1 SKIP=托盘 UIPI）、verify-archive 11 / office 23 /
+media 15 / mediashape 13。
+
+**下一步**：`PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后重心转插件。

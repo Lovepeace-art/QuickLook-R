@@ -302,6 +302,7 @@ pub fn run() -> ExitCode {
         shadow,
         visible: false,
         last_path: None,
+        surface: None,
         request_started: started,
         render_gen: 0,
         page: 0,

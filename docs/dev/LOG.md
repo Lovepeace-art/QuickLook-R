@@ -3100,3 +3100,34 @@ app 只编排、不碰 FFI：
 
 - 让 `repaint` 的绘制通道按 `Surface` 驱动（本刀只分类未重构）。
 - `PreviewBackend` 之上接入"office 轻型 / html 改进"新后端；PDF 单客户 sidecar 后续评估。
+
+## 2026-11-04 · §7 第二刀：repaint 按 Surface 驱动（平台层完善第 5 项）
+
+### 做了什么
+
+- `State` 新增 `surface: Option<backend::Surface>`；`show_preview` 在 `backend::resolve` 之后
+  `with_state(|s| s.surface = backend.map(|b| b.surface(kind)))` 写入；`hide_preview` 收起时清 `None`。
+- `chrome.rs::repaint` 顶层通道改为按 `s.surface` 路由：`List`→`paint_archive`、`ChildWindow`→
+  系统处理器子窗口（只画顶栏）、其余走 `Canvas::Bitmap/Text` 内容通道；`List`/`ChildWindow` 仍配
+  `has_archive_view()` / `shell_preview.is_some()` 运行时守卫（槽没就绪退回占位，不画空树/不空窗）。
+- 改动文件：`crates/qlr-app/src/app/session.rs`、`app/show.rs`、`app/chrome.rs`、`app/boot.rs`（State 初始化 +1 行）。
+
+### 为什么
+
+"用什么方式承载"原本散在 repaint 里各自探测（`has_archive_view` / `shell_preview.is_some`），
+与 `backend` 的判定重复。本刀把"表面"显式化进状态，让 repaint 的问句从"现在是什么状态"
+变成"这个后端声明的表面是什么"，为后面接 office 轻型 / html 后端铺路（它们只改 backend.rs）。
+`fit_bitmap`（SVG/视频等比、图片按窗口比例）/`plain_doc`（HTML/音频去行号）/`reserve_bar`（视频留进度条）
+三处是**真正的逐格式呈现特例**，`Surface` 只分 Bitmap/Text 无法表达，故暂留在 repaint，不硬塞。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**312 passed / 0 failed**（与上一刀一致，未增删测试）。
+- `verify-layers`：**13 PASS · 0 FAIL**；`cargo build --release` 24.20s。
+- 端到端全绿：`smoke` 全过（16 检查 · 1 SKIP=托盘 UIPI）、`verify-archive` 11、`verify-office` 23、
+  `verify-media` 15、`verify-mediashape` 13 —— 覆盖了 List / ChildWindow / Bitmap / Text 四条通道。
+
+### 下一步
+
+- 在 `PreviewBackend` 之上接 office 轻型 / html 改进后端；PDF 单客户 sidecar 后续评估；之后转插件打磨。

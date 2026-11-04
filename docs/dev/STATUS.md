@@ -1,5 +1,13 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **§7 第二刀 repaint 按 Surface 驱动（平台层完善第 5 项）**：`State` 新增 `surface`，
+> `show_preview` 从 `backend::resolve` 写入，`repaint` 顶层通道改按 `Surface` 路由（List/ChildWindow/
+> Bitmap/Text，运行时守卫保留），为后续接 office 轻型 / html 后端铺路。`fit_bitmap/plain_doc/reserve_bar`
+> 三处逐格式呈现特例暂留 repaint（Surface 表达不了）。回归 `cargo test` **312 passed / 0 failed**、fmt/clippy
+> 零输出、`verify-layers` **13 PASS**、`smoke` 16 PASS·1 SKIP、端到端 archive 11 / office 23 / media 15 /
+> mediashape 13 全绿。明细见 §53。
+>
+
 > 更新时间：2026-11-04 · **§7 PreviewBackend 预览后端契约（第一刀，平台层完善第 4 项）**：「这个文件由谁来画」
 > 从 `show.rs`/`render.rs`/`shell.rs` 三处重复枚举 `Kind` 收口到 `app/backend.rs` 的 `trait PreviewBackend`
 > + `resolve`（四个零大小后端 Native/Archive/Shell/Plugin）。压缩包按扩展名优先（修掉"假 .zip 退化成文本"

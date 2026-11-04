@@ -30,6 +30,8 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
 - `qlr-app`：宿主进程。`app`（状态机 + `wndproc` + 渲染线程调度 + 压缩包列表 + PPT 翻页接管）· `cli`（参数解析）· `main`。
   `app/backend.rs`（§7 起）：`PreviewBackend` 契约 + `resolve`，是"这个文件交给谁画（选择 / 表面 / 自然尺寸）"的
   **唯一入口**；`show`/`render`/`shell` 不再各自枚举 `Kind`，新增后端只改这一处。
+  `resolve` 出的 `Surface` 记进 `State.surface`，`repaint` 顶层通道据此路由（List→压缩包、ChildWindow→
+  系统处理器子窗口、Bitmap/Text→内置内容）；逐格式呈现特例（等比/去行号/进度条）仍留在 repaint。
   存量例外：`layout.rs:35` 的 `RECT`、`settings.rs:23-24` 的 `HWND/LPARAM/LRESULT/WPARAM` 直接 `use windows::`；
   `app/mod.rs` 是给整个 `app` 模块用的 prelude 再导出。（§6-4 起 app 已不直接调计时 / 退出原语。）
 

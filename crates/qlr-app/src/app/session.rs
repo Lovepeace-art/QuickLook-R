@@ -134,6 +134,11 @@ pub(crate) struct State {
     pub(crate) shadow: Option<Hwnd>,
     pub(crate) visible: bool,
     pub(crate) last_path: Option<PathBuf>,
+    /// §7 第二刀：本次预览由哪个后端、以什么表面承载（`backend::resolve` 一处给出）。
+    ///
+    /// `repaint` 的顶层通道据此路由：`List`→压缩包列表、`ChildWindow`→系统处理器子窗口、
+    /// `Bitmap`/`Text`→内置渲染内容。`None` = 尚未解析（占位/不支持）。
+    pub(crate) surface: Option<backend::Surface>,
     /// 本次请求（热键/命令行/转交）开始处理的时刻。
     ///
     /// 注意这里**没有**"进程启动时刻"：常驻实例里那可能是几小时前，

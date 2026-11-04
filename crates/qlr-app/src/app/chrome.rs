@@ -388,13 +388,19 @@ pub(crate) fn repaint(hwnd: HWND) {
         window::paint_chrome_strip(hwnd, &chrome);
         return;
     }
+    // §7 第二刀：顶层通道按后端解析出的 `Surface` 路由，不再各自探测状态。
+    let surface = with_state(|s| s.surface).unwrap_or(None);
     // 压缩包（1.7.3）：内置列表视图，不走文本/位图通道。
-    if has_archive_view() {
+    // 仍配 `has_archive_view()` 运行时守卫：列表槽没就绪时退回占位/内容通道，不画空树。
+    if surface == Some(backend::Surface::List) && has_archive_view() {
         paint_archive(hwnd);
         return;
     }
     // 系统预览处理器接管内容时（1.4.1）：正文由它的子窗口自己画，我们只画顶栏。
-    if with_state(|s| s.shell_preview.is_some()).unwrap_or(false) {
+    // 同样保留 `shell_preview.is_some()` 守卫（处理器就绪前退回占位页）。
+    if surface == Some(backend::Surface::ChildWindow)
+        && with_state(|s| s.shell_preview.is_some()).unwrap_or(false)
+    {
         let title = file_title();
         let (page_now, page_total, editing) =
             with_state(|s| (s.page, s.pages, s.page_edit.clone())).unwrap_or((0, None, None));
