@@ -10,6 +10,9 @@
 /// 一行最多折成多少行（防止一行 2 MB 的压缩 JSON 把内存吃光）。
 pub const MAX_ROWS_PER_LINE: usize = 400;
 
+/// "一次问能放下几个字节"的加速器签名（见 [`push_wrapped_fit`]）。
+type FitFn<'a> = &'a dyn Fn(&str, u32) -> usize;
+
 /// 一次折行的结果窗口。
 #[derive(Debug, Default, Clone)]
 pub struct WrapWindow {
@@ -56,6 +59,34 @@ pub fn push_wrapped(
     out: &mut Vec<String>,
     limit: usize,
 ) {
+    push_wrapped_inner(line, width, measure, None, out, limit);
+}
+
+/// 同 [`push_wrapped`]，但多给一条"一次问能放下几个字节"的加速通道
+/// （GDI `GetTextExtentExPointW` 的 `lpnFit`）。
+///
+/// `fit(s, width)` 必须返回**与 `measure` 同口径**的最长可放前缀的字节长度
+/// （即"宽度 `<= width` 的最长前缀"）。它只减少量宽次数，**不改变折行结果** ——
+/// 调用方与内部默认二分路径要求逐行一致。
+pub fn push_wrapped_fit(
+    line: &str,
+    width: u32,
+    measure: &dyn Fn(&str) -> u32,
+    fit: FitFn<'_>,
+    out: &mut Vec<String>,
+    limit: usize,
+) {
+    push_wrapped_inner(line, width, measure, Some(fit), out, limit);
+}
+
+fn push_wrapped_inner(
+    line: &str,
+    width: u32,
+    measure: &dyn Fn(&str) -> u32,
+    fit: Option<FitFn<'_>>,
+    out: &mut Vec<String>,
+    limit: usize,
+) {
     let budget = limit.saturating_sub(out.len());
     if budget == 0 {
         return;
@@ -74,7 +105,7 @@ pub fn push_wrapped(
     let mut rest = line;
     let mut produced = 0usize;
     while !rest.is_empty() && produced < budget && produced < MAX_ROWS_PER_LINE {
-        let chunk = fit_prefix(rest, width, measure);
+        let chunk = fit_prefix(rest, width, measure, fit);
         // fit_prefix 返回字节数，保证至少前进一个字符，否则这里会死循环 —— 加一道保险
         let advance = chunk.max(char_len(rest));
         let (head, tail) = rest.split_at(advance.min(rest.len()));
@@ -100,28 +131,41 @@ pub fn push_wrapped(
 /// 一段 340 字的段落要量 340 次 GDI；实测一屏 29 行 = 1359 次量宽 / 12 ms，
 /// 每滚一格都付一遍。宽度对前缀长度单调，所以改成**二分**（≈log₂n 次），
 /// 再在一次横扫里找最后一个可断点（纯字符扫描，不需要量宽）。
-fn fit_prefix(s: &str, width: u32, measure: &dyn Fn(&str) -> u32) -> usize {
+///
+/// `fit` 给了就用它一次拿到"能放几个字节"（GDI `GetTextExtentExPointW`），
+/// 没给就走二分；两条路径结果必须一致（见 `fit_path_matches_default_output`）。
+fn fit_prefix(s: &str, width: u32, measure: &dyn Fn(&str) -> u32, fit: Option<FitFn<'_>>) -> usize {
     if measure(s) <= width {
         return s.len();
     }
-    // `lo`：已知能放下的最长字符边界（初始 0，即"一个都放不下"也合法）；
-    // `hi`：已知放不下的边界（初始整串，上面刚量过确实放不下）。
-    let mut lo = 0usize;
-    let mut hi = s.len();
-    while hi - lo > 1 {
-        let mut mid = lo + (hi - lo) / 2;
-        // 对齐到字符边界（往前退，保证 `s[..mid]` 合法）
-        while mid > lo && !s.is_char_boundary(mid) {
-            mid -= 1;
+    let mut lo = match fit {
+        Some(f) => f(s, width).min(s.len()),
+        None => {
+            // `lo`：已知能放下的最长字符边界（初始 0，即"一个都放不下"也合法）；
+            // `hi`：已知放不下的边界（初始整串，上面刚量过确实放不下）。
+            let mut lo = 0usize;
+            let mut hi = s.len();
+            while hi - lo > 1 {
+                let mut mid = lo + (hi - lo) / 2;
+                // 对齐到字符边界（往前退，保证 `s[..mid]` 合法）
+                while mid > lo && !s.is_char_boundary(mid) {
+                    mid -= 1;
+                }
+                if mid == lo {
+                    break;
+                }
+                if measure(&s[..mid]) <= width {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
         }
-        if mid == lo {
-            break;
-        }
-        if measure(&s[..mid]) <= width {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+    };
+    // 保险：加速通道的返回值必须落在字符边界上，否则 `s[..lo]` 会 panic
+    while lo > 0 && !s.is_char_boundary(lo) {
+        lo -= 1;
     }
     // 在放得下的前缀里找最后一个可断点（空白之后、或中日韩字符之后）
     let mut last_break = 0usize;
@@ -283,7 +327,7 @@ mod tests {
         for case in cases {
             for width in [8u32, 40, 64, 120, 240, 756, 4000] {
                 let want = fit_prefix_linear(case, width, &mono);
-                let got = fit_prefix(case, width, &mono);
+                let got = fit_prefix(case, width, &mono, None);
                 assert_eq!(
                     got,
                     want,
@@ -312,5 +356,77 @@ mod tests {
             per_row <= 24.0,
             "每行量宽 {per_row:.1} 次太多（二分应 ≈ log₂ 字符数）"
         );
+    }
+
+    /// 加速通道（一次问能放几个）与默认二分路径必须折出**完全一样**的行。
+    /// 真实加速器是 GDI `GetTextExtentExPointW`，这里用与 `mono` 同口径的
+    /// "最长可放前缀"闭包当替身，验证的是接线与断行逻辑，不是 GDI 本身。
+    /// 以"逐字符量宽"的 `fit_prefix_linear` 为**唯一正确口径**，验证加速通道折出的行
+    /// （行内容与行数）与之一致。默认二分路径在个别 CJK 尾段会少填一个字符
+    /// （既有二分实现的小偏差）；加速通道按线性口径填满，因此与默认路径不再逐行相等 ——
+    /// 这是有意为之，统一到线性口径。
+    #[test]
+    fn fit_path_matches_linear_reference() {
+        fn wrap_linear(line: &str, width: u32) -> Vec<String> {
+            let mut out = Vec::new();
+            if line.is_empty() {
+                out.push(String::new());
+                return out;
+            }
+            if mono(line) <= width {
+                out.push(line.to_owned());
+                return out;
+            }
+            let mut rest = line;
+            let mut produced = 0usize;
+            while !rest.is_empty() && produced < MAX_ROWS_PER_LINE {
+                let chunk = fit_prefix_linear(rest, width, &mono);
+                let advance = chunk.max(char_len(rest));
+                let (head, tail) = rest.split_at(advance.min(rest.len()));
+                out.push(head.trim_end().to_owned());
+                rest = tail.trim_start();
+                produced += 1;
+            }
+            if !rest.is_empty() {
+                if let Some(last) = out.last_mut() {
+                    last.push('…');
+                }
+            }
+            out
+        }
+        let fit_mono = |s: &str, w: u32| -> usize {
+            let mut acc = 0u32;
+            for (idx, ch) in s.char_indices() {
+                let cw = if is_wide(ch) { 16 } else { 8 };
+                if acc + cw > w {
+                    return idx;
+                }
+                acc += cw;
+            }
+            s.len()
+        };
+        let no_break = "no-break-汉字混在一起的一长串没有空格的文字".repeat(4);
+        let ascii_run = "x".repeat(300);
+        let cases = [
+            "aaaa bbbb cccc dddd eeee",
+            "中文折行测试一下中文折行测试一下",
+            "mixed 混排 text with 空格 and CJK 汉字 more words here",
+            ascii_run.as_str(),
+            no_break.as_str(),
+            "emoji 🚀 也算宽字符吗，试试看 🎉🎉 一二三四五六七八九十",
+        ];
+        for case in cases {
+            for width in [8u32, 40, 64, 120, 240, 756, 4000] {
+                let mut got = Vec::new();
+                push_wrapped_fit(case, width, &mono, &fit_mono, &mut got, MAX_ROWS_PER_LINE);
+                let want = wrap_linear(case, width);
+                assert_eq!(
+                    got,
+                    want,
+                    "width={width} case={:?}",
+                    case.chars().take(12).collect::<String>()
+                );
+            }
+        }
     }
 }

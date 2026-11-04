@@ -2991,3 +2991,44 @@ app 只编排、不碰 FFI：
 
 - §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；`GetTextExtentExPointW` 折行量宽（5.1 → 约 0.7 ms）。
 - 之后才动"后端契约"第一刀（PreviewBackend + 现有自研渲染接入，无 sidecar）。
+
+## 2026-11-04 · 折行量宽改 GetTextExtentExPointW（平台层完善，第 2 项）
+
+### 做了什么
+
+- `crates/qlr-platform/src/window.rs`：`Measurer` 抽出私有 `select_style(&self, style)`
+  （原 `width_styled` 里内联的换字体逻辑），新增
+  `pub fn fit_width_styled(&self, style: TextStyle, text: &str, width: u32) -> u32`——
+  一次 `GetTextExtentExPointW` 问"给定宽度能放几个 UTF-16 码元"，用 `ch.len_utf16()`
+  累加换算成 UTF-8 字节返回。
+- `crates/qlr-render/src/wrap.rs`：新增 `type FitFn<'a> = &'a dyn Fn(&str, u32) -> usize`、
+  `pub fn push_wrapped_fit(...)`；`push_wrapped` 委托 `push_wrapped_inner(..., None, ...)`；
+  `fit_prefix` 增加 `fit: Option<FitFn>`：`Some` 走"一次适配"取 `lo`，`None` 走原二分；
+  并对 `lo` 加"必须落在字符边界，否则回退到上一个边界"的保险。
+- `crates/qlr-app/src/app/chrome.rs`：折行改调 `push_wrapped_fit` 并统计 `fitted`；
+  `WRAP`/`SLOWWRAP` 日志增加「适配 N 次」。
+
+### 为什么
+
+二分每行要 `log₂(len)`（约 10–24）次 `GetTextExtentPoint32W`，是长段落滚动折行主成本。
+`GetTextExtentExPointW` 一次调用就返回"宽度内能放几个字符"，把它压到常数级。
+
+### 口径变化（重要）
+
+既有二分在个别 CJK 尾段会**少填一个字符**（如 width=120 时 6 字 96px 而非 7 字 112px）；
+加速通道按"能放下 ≤ width 的最长前缀"的线性口径填满，故与旧路径**不再逐行相等**——
+有意统一到线性口径。影响：长 CJK 段落每行最多多填 1 字符（更优），短行 / ASCII 不变。
+新增单测 `fit_path_matches_linear_reference` 以 `fit_prefix_linear` 为唯一 oracle 全程对拍。
+
+### 怎么验证的（数字）
+
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：零输出。
+- `cargo test`：**307 passed / 0 failed**；`scripts/verify-layers.ps1`：**12 PASS · 0 FAIL**。
+- 真窗口（`longlines.txt` 6648 行 / 宽 756px / 屏幕 29 行，滚 3 行，`QLRUST_LOG=debug`）：
+  每滚 **量宽 243 → 30 次 + 适配 24 次**，折行耗时 **5.1 → 3.3 ms**
+  （首帧冷启 9.4 ms 含首次选字体）。注：HANDOFF 原估 0.7 ms 偏乐观，实测 3.3 ms；
+  剩余成本主要是 GDI 对长 CJK 串本身逐字测量，**调用次数已降一个量级**（约 54 次/滚 vs 243）。
+
+### 下一步（未开工）
+
+- §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；后端契约第一刀（PreviewBackend，无 sidecar）。

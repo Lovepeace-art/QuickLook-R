@@ -16,11 +16,11 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, DEFAULT_PITCH, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
     EndPaint, FW_BOLD, FW_NORMAL, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextExtentPoint32W, HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_TT_PRECIS, PAINTSTRUCT,
-    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY, SelectObject,
-    SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt, StretchDIBits,
-    TRANSPARENT,
+    GetTextExtentExPointW, GetTextExtentPoint32W, HALFTONE, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_TT_PRECIS,
+    PAINTSTRUCT, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY,
+    SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
+    StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT, SND_SYSTEM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -3119,14 +3119,7 @@ impl Measurer {
         if text.is_empty() {
             return 0;
         }
-        let idx = style.as_index();
-        if self.current.get() != idx {
-            let font = FONTS.with(|cell| cell.borrow_mut().get(style));
-            unsafe {
-                SelectObject(self.hdc, font.into());
-            }
-            self.current.set(idx);
-        }
+        self.select_style(style);
         let wide = crate::wide::to_wide(text);
         let body = &wide[..wide.len() - 1]; // 去掉结尾的 NUL
         let mut size = SIZE::default();
@@ -3136,6 +3129,61 @@ impl Measurer {
             } else {
                 0
             }
+        }
+    }
+
+    /// 一次问 GDI："这段文字在 `width` 内能放下多少字节"（返回**最长可放前缀的 UTF-8 字节长度**）。
+    ///
+    /// `GetTextExtentExPointW` 一次调用就把能放下的字符数放进 `lpnFit`，省掉折行二分里
+    /// 那十几次 `GetTextExtentPoint32W`。口径与 [`Self::width_styled`] 完全一致
+    /// （同一个 HDC、同一套字体、同样的 `<=` 边界），否则折行会差一个字符。
+    pub fn fit_width_styled(&self, style: TextStyle, text: &str, width: u32) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        self.select_style(style);
+        let wide = crate::wide::to_wide(text);
+        let body = &wide[..wide.len() - 1]; // 去掉结尾的 NUL
+        let mut fit: i32 = 0;
+        let mut size = SIZE::default();
+        unsafe {
+            // `lpndx = NULL`：不要每字符宽度数组，只要"能放几个"。
+            if GetTextExtentExPointW(
+                self.hdc,
+                PCWSTR(body.as_ptr()),
+                body.len() as i32,
+                width as i32,
+                Some(&mut fit),
+                None,
+                &mut size,
+            )
+            .as_bool()
+            {
+                // `fit` 是 UTF-16 码元数，换算成 UTF-8 字节长度（emoji 是 2 码元 / 4 字节）。
+                let target = fit.max(0) as usize;
+                let mut units = 0usize;
+                for (idx, ch) in text.char_indices() {
+                    if units >= target {
+                        return idx as u32;
+                    }
+                    units += ch.len_utf16();
+                }
+                text.len() as u32
+            } else {
+                0
+            }
+        }
+    }
+
+    /// 把 DC 里选中的字体切成 `style`（换样式才 `SelectObject`，避免每行重选）。
+    fn select_style(&self, style: TextStyle) {
+        let idx = style.as_index();
+        if self.current.get() != idx {
+            let font = FONTS.with(|cell| cell.borrow_mut().get(style));
+            unsafe {
+                SelectObject(self.hdc, font.into());
+            }
+            self.current.set(idx);
         }
     }
 }

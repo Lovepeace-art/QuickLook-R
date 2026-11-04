@@ -1,5 +1,12 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **折行量宽改 GetTextExtentExPointW**（平台层完善，第 2 项）：长段落每滚
+> **量宽 243 → 30 次 + 适配 24 次**、折行 **5.1 → 3.3 ms**（真窗口实测，`longlines.txt` 6648 行 / 宽 756px）；
+> 用 `GetTextExtentExPointW` 一次问"能放几个字符"替代 `log₂` 二分（`Measurer::fit_width_styled`、
+> `wrap::push_wrapped_fit`）。**口径微调**：长 CJK 段落每行最多多填 1 字符（统一到线性口径，短行 / ASCII 不变），
+> 新增 `fit_path_matches_linear_reference` 对拍。回归 `cargo test` **307 passed / 0 failed**、fmt/clippy 零输出、
+> `verify-layers` **12 PASS**。明细见 §50。
+>
 > 更新时间：2026-11-04 · **§6-4 裸 Win32 收口（平台层完善）**（未发版）：app 层最后 6 处直接调用的
 > `KillTimer / SetTimer / PostQuitMessage / TerminateProcess / GetCurrentProcess / GetTickCount`
 > 全部收进 `qlr-platform::window`（新增 `stop_timers / post_quit / terminate_self / now_ms`），

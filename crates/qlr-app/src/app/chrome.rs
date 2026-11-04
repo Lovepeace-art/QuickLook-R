@@ -611,6 +611,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                 // "滚一下卡"很可能是折行里的 GDI 量宽，而不是 DrawText。
                 let wrap_started = Instant::now();
                 let measured = std::cell::Cell::new(0usize);
+                let fitted = std::cell::Cell::new(0usize);
                 // 换宽度（拖窗/缩放）会让所有折行结果失效，缓存自己会发现。
                 with_state(|s| s.wrap_cache.set_width(width));
                 if let Some(m) = &measurer {
@@ -636,10 +637,15 @@ pub(crate) fn repaint(hwnd: HWND) {
                                     measured.set(measured.get() + 1);
                                     m.width_styled(to_text_style(style), s)
                                 };
-                                qlr_render::wrap::push_wrapped(
+                                let fit = |s: &str, w: u32| {
+                                    fitted.set(fitted.get() + 1);
+                                    m.fit_width_styled(to_text_style(style), s, w) as usize
+                                };
+                                qlr_render::wrap::push_wrapped_fit(
                                     line,
                                     width,
                                     &measure,
+                                    &fit,
                                     &mut fresh,
                                     qlr_render::wrap::MAX_ROWS_PER_LINE,
                                 );
@@ -696,7 +702,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                     with_state(|s| s.wrap_cache.stats()).unwrap_or((0, 0, 0, 0));
                 log_debug!(
                     SCOPE,
-                    "WRAP 原文 {} 行 从 {} 起，屏幕 {} 行，宽 {}px -> 折成 {} 行（吃掉 {} 原始行）{} · 量宽 {} 次 / {:.1} ms · 缓存命中 {}/{}（存 {} 条）",
+                    "WRAP 原文 {} 行 从 {} 起，屏幕 {} 行，宽 {}px -> 折成 {} 行（吃掉 {} 原始行）{} · 量宽 {} 次 / 适配 {} 次 / {:.1} ms · 缓存命中 {}/{}（存 {} 条）",
                     t.lines.len(),
                     scroll,
                     rows,
@@ -709,6 +715,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                         ""
                     },
                     measured.get(),
+                    fitted.get(),
                     wrap_ms.as_secs_f64() * 1000.0,
                     hits,
                     hits + misses,
@@ -718,9 +725,10 @@ pub(crate) fn repaint(hwnd: HWND) {
                 if wrap_ms.as_millis() >= 4 {
                     log_warn!(
                         SCOPE,
-                        "SLOWWRAP text {}ms（量宽 {} 次，折出 {} 行 / 吃掉 {} 原始行，宽 {}px）",
+                        "SLOWWRAP text {}ms（量宽 {} 次 / 适配 {} 次，折出 {} 行 / 吃掉 {} 原始行，宽 {}px）",
                         wrap_ms.as_millis(),
                         measured.get(),
+                        fitted.get(),
                         body.len(),
                         consumed,
                         width

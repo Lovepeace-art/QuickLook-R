@@ -712,3 +712,18 @@ pwsh -NoProfile -File scripts\verify-pdf.ps1 -Pdf target\bench-fixtures\pdf_pad_
 1. §6-7 `PaintBuffer` 复用 + 每帧 GDI 计数（`bench.ps1` 已有 GDI 列，app 侧还没有每帧数）；
 2. `GetTextExtentExPointW` 折行量宽（长段落 5.1 ms → 约 0.7 ms，需"能放几个字符"口径的对拍测试）；
 3. 后端契约第一刀（`PreviewBackend` + 现有自研渲染接入，不含 sidecar）。
+
+## 折行量宽 GetTextExtentExPointW 接力说明（2026-11-04，平台层完善第 2 项）
+
+**这一批做了什么**：`Measurer` 新增 `fit_width_styled`（一次 `GetTextExtentExPointW` 返回可放字符数）；
+`wrap.rs` 增 `FitFn` / `push_wrapped_fit` / `fit_prefix(Option<FitFn>)`；`chrome.rs` 折行改走加速通道并记
+「适配 N 次」。改动文件：`crates/qlr-platform/src/window.rs`、`crates/qlr-render/src/wrap.rs`、
+`crates/qlr-app/src/app/chrome.rs`。
+
+**口径提醒（不是回归）**：加速通道与旧二分在个别 CJK 尾段差 1 字符（按线性口径填满，更优），
+短行 / ASCII 不变；对拍测试 `fit_path_matches_linear_reference`（以 `fit_prefix_linear` 为 oracle）。
+
+**回归**：`cargo test` **307 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **12 PASS**。
+真窗口 `longlines.txt`（6648 行 / 756px）每滚 量宽 243→30、适配 24、折行 5.1→3.3 ms。
+
+**下一步**：§6-7 `PaintBuffer` 复用 + 每帧 GDI 计数；后端契约第一刀（`PreviewBackend`，无 sidecar）。
