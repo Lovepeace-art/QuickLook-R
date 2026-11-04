@@ -1,5 +1,9 @@
 # QLRust 结构评审（v1.8.3，release/1.8.3 @ c956000）
 
+> **注（2026-11-04）**：本文是拆分前快照。此后已落地 §6-4 裸 Win32 收口、`window.rs` 纯搬家拆成
+> `window/` 子模块（单文件 ≤1600 行，verify-layers §3b 棘轮）、折行量宽、PaintBuffer 复用、
+> PreviewBackend 契约 + Surface 路由 + 四态会话状态机。下列"平台层反向膨胀/结构债"条目仅作历史依据。
+
 > 只读审计：未修改 `crates/` 下任何代码。行数以 `Get-Content .Count`（含空行）实测；
 > "生产代码"= 各文件 `#[cfg(test)]` 之前的行。证据格式 `file:line`，可在当前 HEAD 直接跳转。
 

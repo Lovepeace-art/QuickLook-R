@@ -32,6 +32,9 @@ qlr-app  ──►  qlr-platform  ──►  qlr-core
   **唯一入口**；`show`/`render`/`shell` 不再各自枚举 `Kind`，新增后端只改这一处。
   `resolve` 出的 `Surface` 记进 `State.surface`，`repaint` 顶层通道据此路由（List→压缩包、ChildWindow→
   系统处理器子窗口、Bitmap/Text→内置内容）；逐格式呈现特例（等比/去行号/进度条）仍留在 repaint。
+  `PreviewBackend` 另有 `isolation()`/`interactive()` 能力标注（Native/Archive/Plugin=`InProc`，
+  Shell=`SystemProcess`；v1 插件非交互）；渲染会话用 `SessionState{Idle,Active,Reclaiming,Crashed}`
+  记在 `RenderTrack` 上并打 `SESSION` 日志（ADR-0010：不做全面多进程、暂缓 pdfium sidecar）。
   存量例外：`layout.rs:35` 的 `RECT`、`settings.rs:23-24` 的 `HWND/LPARAM/LRESULT/WPARAM` 直接 `use windows::`；
   `app/mod.rs` 是给整个 `app` 模块用的 prelude 再导出。（§6-4 起 app 已不直接调计时 / 退出原语。）
 

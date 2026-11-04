@@ -827,3 +827,15 @@ media 15 / mediashape 13。
 **回归**：`cargo test` **316 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.38s；`smoke` 16 PASS·1 SKIP。
 
 **下一步**：仍是 ADR-0010 的两条——① 若批准，pdfium 单客户 sidecar 试点（常驻子进程 + 一条 IPC + 共享内存零拷贝 + 看门狗），把四态复用给进程外后端；② office 轻型 / html 改进优先进程内只读渲染或系统隔离。
+
+## pdfium sidecar 崩溃探测 → 暂缓 接力说明（2026-11-04）
+
+**做了什么**：按 ADR-0010「后续 2」做崩溃探测——临时 `examples/pdf_probe.rs`（跑完即删、不入库）对每个 PDF 单独起进程，走当前**进程内** pdfium 路径（`pdf_page_count` + 渲染第 0/1 页）。语料 4 个种子 × 6 类变异（截断 / 字节翻转 / 窗口清零 / startxref / /Length / 头部垃圾）。
+
+**结果**：第一轮 164 文件、扩大轮 1004 文件，两轮均 **0 次访问违例、0 非 0 退出**，能解出帧或优雅报错/拒绝 → **暂缓 pdfium sidecar**（ADR-0010 已补「已评估并暂缓」，保留 `Isolation::NeedsSidecar` 预留 + `QLRUST_PDF_INPROC` 回退；四态状态机保留作后端级可诊断底座）。
+
+**同批文档审计**：AGENTS 基线 / verify-layers 计数 / crate 体量按拆分后更新；STRUCTURE-REVIEW 标注为拆分前快照；README 与 COMPARE 对比表按本轮实机对比刷新。
+
+**回归**：`cargo test` **316 passed / 0 failed**；fmt/clippy 零输出；`verify-layers` **14 PASS**；`smoke` 16 PASS·1 SKIP。
+
+**下一步**：office 轻型 / html 改进（进程内只读或系统隔离）；Markdown `layout` 240ms 可作渲染层独立小项；之后重心转插件打磨。

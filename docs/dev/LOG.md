@@ -3202,3 +3202,16 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 
 ### 怎么验证
 `cargo test` **316 passed / 0 failed**（+1 四态单测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 24.38s；`smoke` 16 PASS·1 SKIP（tray UIPI）。
+
+## 2026-11-04 · 复测原版对比 + 暂缓 pdfium sidecar（平台层完善收尾）
+
+### 做了什么
+- **崩溃探测**：对当前**进程内** pdfium 跑 6 类变异（随机截断 / 字节翻转 / 窗口清零 / 坏 `startxref` / 坏 `/Length` / 头部垃圾）× 4 种子（1/3/8/200 页），每个文件单独子进程跑、按退出码判 AV。第一轮 164 文件、扩大轮 1004 文件，均 **0 次访问违例、0 非 0 退出**，能解出帧或优雅报错/拒绝 → **暂缓 pdfium sidecar**（ADR-0010 补「已评估并暂缓」，保留 `Isolation::NeedsSidecar` 预留 + `QLRUST_PDF_INPROC` 回退；四态状态机保留作后端级可诊断底座）。
+- **文档审计**：`AGENTS.md` 基线更新（316 passed / 10 ignored、qlr-app 19 文件 ~10.1k 行、qlr-platform ~22 文件含 `window/`、verify-layers 14 PASS）；`ARCH.md` platform 条目补 `window/` 拆分与后端四态；`STRUCTURE-REVIEW-1.8.3.md` 顶部加「拆分前快照、后已落地」注；`README.md` 对比表按 2026-11-04 复测刷新；新增 `docs/dev/COMPARE-live-1.8.3-fix.md`。
+- **原版对比复测**（同机 18 夹具、8 s 超时、IPC 触发）：QLRust 出窗 **17/18**、窗口出现均值 **58 ms**、首帧稳定 16/18 收敛均值 **241 ms**、预览内存均值 **37.5 MB**；原版 **14/18**、**190 ms**、仅 4/18 稳定、**722.4 MB**。冷启动中位 **31 vs 1085 ms**、就绪 **90 vs 1110 ms**、看 1280×720 图 **22.2 vs 163.1 MB**。
+
+### 为什么
+用户要求：暂缓 sidecar 并把项目文件（尤其 md）更新到位，再跑一遍原版对比。崩溃探测证明「没崩过」在 1004 例畸形输入下仍成立，sidecar 的成本不值得为此常驻；对比复测确认本轮平台层改动没有拖慢性能。
+
+### 怎么验证
+`cargo test` **316 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP、`verify-office` 23 / `verify-media` 15 / `verify-mediashape` 13 / `verify-archive` 11 全绿。对比明细见 `docs/dev/COMPARE-live-1.8.3-fix.md`。

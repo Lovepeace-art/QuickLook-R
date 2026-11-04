@@ -1,5 +1,11 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-04 · **原版对比复测 + 暂缓 pdfium sidecar（平台层收尾）**：崩溃探测 1004 例变异 PDF
+> **0 次访问违例** → 暂缓 sidecar（ADR-0010 补「已评估并暂缓」，保留 `QLRUST_PDF_INPROC` 回退与四态状态机）；
+> `README` 对比表按复测刷新、新增 `docs/dev/COMPARE-live-1.8.3-fix.md`。复测：QLRust 出窗 17/18、窗口出现均值 58 ms、
+> 预览内存均值 37.5 MB、冷启动窗口 31 ms；原版 14/18、190 ms、722.4 MB、1085 ms。回归 `cargo test` **316 passed / 0 failed**、
+> fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。明细见 LOG。
+>
 > 更新时间：2026-11-04 · **后端会话四态状态机（进程内）**：`SessionState{Idle/Active/Reclaiming/Crashed}`
 > 挂到现有 `RenderTrack`/`Lease` 生命周期（begin→Active、end/abort→Idle、mark_hung→Reclaiming、
 > heal_failed→Crashed、heal_succeeded→Active/Idle），只在真变化时打 `SESSION backend= state=` 日志；

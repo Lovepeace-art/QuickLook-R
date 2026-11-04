@@ -39,9 +39,9 @@
 
 | Crate | 规模 | 职责 | 硬约束 |
 |---|---|---|---|
-| `qlr-app` | 6 文件 / ~8.1k 行（`app.rs` 单文件 ~7.0k） | 编排：`show_preview` / `repaint` / 窗口过程 / CLI | 只做编排，不直接写 Win32 细节（走 `qlr_platform::window`） |
+| `qlr-app` | 19 文件 / ~10.1k 行（`app/` 子模块） | 编排：`show_preview` / `repaint` / 窗口过程 / CLI | 只做编排，不直接写 Win32 细节（走 `qlr_platform::window`） |
 | `qlr-core` | 10 文件 / ~2.4k 行 | 纯逻辑 + 纯数据 | **零 `windows` 依赖**，必须能跨平台编译与单测 |
-| `qlr-platform` | 13 文件 / ~5.9k 行 | 全部 Win32 / COM / MCI / MF / D2D | 新 FFI 只能落在这里 |
+| `qlr-platform` | ~22 文件 / ~6.8k 行（含 `window/` 子模块） | 全部 Win32 / COM / MCI / MF / D2D | 新 FFI 只能落在这里 |
 | `qlr-render` | 17 文件 / ~7.4k 行 | 解码 + 排版 + 产出 BGRA | 不碰窗口句柄；输入 path/bytes，输出像素与 `RenderInfo` |
 | `qlr-plugin-api` | 1 文件 / 185 行 | 插件契约 | 改动即破坏 ABI，必须升 `ABI_VERSION` 并同步 demo + office |
 | `qlr-plugin-demo` | 1 文件 / 241 行 | 示例 | 保持最小可读 |
@@ -159,7 +159,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-**当前基线（1.8.3-fix，2026-11-03）**：`cargo test` → **306 passed / 10 ignored**（app 67+1、core 54、platform 33+3、plugin-api 4、plugin-demo 7、plugin-office 11、render 120+6、fuzz 1、malformed 9）；fmt / clippy（含 `--features alloc-stats`）零输出。端到端：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话 UIPI 拒托盘 `0x80070005`）、`verify-archive.ps1` 11 PASS、`verify-layers.ps1` 11 PASS、`verify-media.ps1` 15 PASS、`verify-pdf.ps1` PASS。
+**当前基线（1.8.3-fix，2026-11-04）**：`cargo test` → **316 passed / 10 ignored**（app 75+1、core 54、platform 33+3、plugin-api 4、plugin-demo 7、plugin-office 11、render 122+6、fuzz 1、malformed 9）；fmt / clippy（含 `--features alloc-stats`）零输出。端到端：`smoke.ps1` **16 PASS · 1 SKIP · 0 FAIL**（SKIP=管理员会话 UIPI 拒托盘 `0x80070005`）、`verify-archive.ps1` 11 PASS、`verify-layers.ps1` 14 PASS、`verify-media.ps1` 15 PASS、`verify-pdf.ps1` PASS。
 
 端到端脚本（都会自己造便携目录、WMI 启动真进程、PrintWindow 截图、打印 PASS/SKIP 汇总）：
 
@@ -171,7 +171,7 @@ cargo test
 | `scripts/verify-media.ps1` | **15 PASS** | 音频/视频/SVG/HTML 四类预览 |
 | `scripts/verify-mediashape.ps1` | **13 PASS** | Excel 点选单元格、右缘无白边、图片/视频锁比例 |
 | `scripts/verify-pdf.ps1` | 全过 | PDF 渲染与翻页 |
-| `scripts/verify-layers.ps1` | **11 PASS** | 分层断言（**不用起窗口、不需要 exe**，纯静态扫描） |
+| `scripts/verify-layers.ps1` | **14 PASS** | 分层断言（**不用起窗口、不需要 exe**，纯静态扫描） |
 | `scripts/probe-selection.ps1` | 全过 | 选中项跟随（需要真实桌面会话） |
 | `scripts/bench.ps1` / `stress.ps1` | 预算内 | 性能与压力 |
 
