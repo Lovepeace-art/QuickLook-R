@@ -1,8 +1,12 @@
 //! 格式注册表：把路径映射到"用哪个查看器"。
 //!
-//! 内置查看器覆盖 8 类：图片 / PDF / 文本 / Markdown / SVG / HTML / 音频 / 视频。
+//! 内置查看器覆盖 9 类：图片 / PDF / 文本 / Markdown / SVG / HTML / 音频 / 视频 / 表格。
 //! 其余格式一律 `Kind::Unsupported`，由壳层给出"暂未支持，后续以插件形式提供"
 //! 的提示 —— 插件体系见 `crates/qlr-plugin-api` 与 `docs/dev/PLUGINS.md`。
+//!
+//! 1.9.0 新增的「表格」族（xlsx/xlsm/xltx/xltm）**不走插件也不走 Office**：
+//! `qlr-render::sheet` 自己解析 OOXML，`qlr-platform::window::sheet` 逐格画网格，
+//! 见 `docs/adr/0010-native-sheet-preview.md`。
 //!
 //! 判定顺序（先便宜后昂贵）：
 //! 1. 扩展名命中扩展名表之一 → 直接返回，不读文件；
@@ -20,7 +24,8 @@ use std::path::Path;
 const SNIFF_LEN: usize = 512;
 
 /// 支持的文件类别。**新增族请走插件，不要往这里加变体**
-/// —— 例外是 1.7.9 用户明确要求内置的 SVG / HTML / 音频 / 视频四类。
+/// —— 例外是 1.7.9 用户明确要求内置的 SVG / HTML / 音频 / 视频四类，
+/// 以及 1.9.0 同样明确要求内置的表格（xlsx 一族）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// 位图：png/jpg/gif/bmp/webp/tiff/ico 等（能解码的那些）
@@ -38,6 +43,8 @@ pub enum Kind {
     Audio,
     /// 视频：取首帧上屏（Media Foundation）
     Video,
+    /// 电子表格（xlsx/xlsm/xltx/xltm）：原生网格渲染，可滚动、看得到公式结果缓存值
+    Sheet,
     /// 扩展名表之外：壳层只出提示文字
     Unsupported,
 }
@@ -54,6 +61,7 @@ impl Kind {
             Kind::Html => "html",
             Kind::Audio => "audio",
             Kind::Video => "video",
+            Kind::Sheet => "sheet",
             Kind::Unsupported => "unsupported",
         }
     }
@@ -69,6 +77,7 @@ impl Kind {
             Kind::Html => "HTML",
             Kind::Audio => "音频",
             Kind::Video => "视频",
+            Kind::Sheet => "表格",
             Kind::Unsupported => "未知格式",
         }
     }
@@ -121,6 +130,11 @@ const AUDIO_EXTS: &[&str] = &[
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "avi", "wmv", "webm", "mkv", "mpg", "mpeg", "ts", "m2ts", "3gp",
 ];
+/// 电子表格（OOXML 的四种后缀，容器完全一样，只是宏/模板标记不同）。
+///
+/// 老式二进制 `.xls`/`.et` **不在**这里：它要 BIFF 解析器，本轮不做，
+/// 交回系统处理器/插件兜底（见 `docs/adr/0010-native-sheet-preview.md`）。
+const SHEET_EXTS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm"];
 const TEXT_EXTS: &[&str] = &[
     // 纯文本 / 日志 / 说明
     "txt",
@@ -244,6 +258,7 @@ pub fn extensions(kind: Kind) -> &'static [&'static str] {
         Kind::Html => HTML_EXTS,
         Kind::Audio => AUDIO_EXTS,
         Kind::Video => VIDEO_EXTS,
+        Kind::Sheet => SHEET_EXTS,
         Kind::Unsupported => &[],
     }
 }
@@ -258,6 +273,7 @@ pub const KINDS: &[Kind] = &[
     Kind::Html,
     Kind::Audio,
     Kind::Video,
+    Kind::Sheet,
 ];
 
 /// 内置能预览的全部扩展名（给文档 / 矩阵脚本 / 文件关联用）。
@@ -316,6 +332,9 @@ pub fn kind_for_ext(ext: &str) -> Option<Kind> {
     }
     if VIDEO_EXTS.contains(&ext.as_str()) {
         return Some(Kind::Video);
+    }
+    if SHEET_EXTS.contains(&ext.as_str()) {
+        return Some(Kind::Sheet);
     }
     if TEXT_EXTS.contains(&ext.as_str()) {
         return Some(Kind::Text);
@@ -462,6 +481,7 @@ mod tests {
             Kind::Html,
             Kind::Audio,
             Kind::Video,
+            Kind::Sheet,
         ] {
             assert!(k.is_renderable(), "{k} 应可渲染");
         }
@@ -471,7 +491,7 @@ mod tests {
         for k in KINDS {
             assert!(k.is_renderable(), "KINDS 里混进了不可渲染的 {k}");
         }
-        assert_eq!(KINDS.len(), 8, "内置类别数量变了：同步文档与矩阵脚本");
+        assert_eq!(KINDS.len(), 9, "内置类别数量变了：同步文档与矩阵脚本");
     }
 
     #[test]
@@ -479,7 +499,13 @@ mod tests {
         for k in [Kind::Image, Kind::Svg, Kind::Video, Kind::Pdf] {
             assert!(k.has_natural_size(), "{k} 应按原始尺寸开窗");
         }
-        for k in [Kind::Text, Kind::Markdown, Kind::Html, Kind::Audio] {
+        for k in [
+            Kind::Text,
+            Kind::Markdown,
+            Kind::Html,
+            Kind::Audio,
+            Kind::Sheet,
+        ] {
             assert!(!k.has_natural_size(), "{k} 不该按原始尺寸开窗");
         }
     }

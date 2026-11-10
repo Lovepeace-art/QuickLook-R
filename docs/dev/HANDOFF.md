@@ -2,7 +2,9 @@
 
 > 目标：一个没参与过本项目的人，**10 分钟内**能构建、运行、验证、并知道下一步做什么。
 >
-> **当前状态（1.0.0，2026-10-31）**：内置图片/PDF/文本/Markdown 四类 + 插件体系（C ABI v1）+ 每用户安装器，M1–M6 已收口。
+> **当前状态（1.9.0，2026-11-10）**：内置图片/PDF/文本/Markdown/SVG/HTML/音频/视频/**表格（xlsx）** 九类
+> + 插件体系（C ABI v1）+ 每用户安装器。表格走原生渲染（ADR-0011），**不再需要装 Office**；
+> docx/pptx 仍走系统预览处理器。
 > 想做新格式 → 读 [PLUGINS.md](PLUGINS.md)（十分钟模板）；想发版 → 读 [RELEASE.md](RELEASE.md)；
 > 想知道坑 → [CONVENTIONS.md](CONVENTIONS.md) 48 条；想知道做到哪了 → [STATUS.md](STATUS.md)。
 

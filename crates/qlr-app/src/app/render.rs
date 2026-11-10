@@ -850,6 +850,17 @@ pub(crate) fn canvas_bytes(canvas: &Canvas) -> usize {
         Canvas::Bitmap(b) => b.bgra.len(),
         // 文本帧是重排结果，量级只有几十 KB：按行估一个偏大的上限即可。
         Canvas::Text(t) => t.lines.len().saturating_mul(256),
+        // 表格帧只带数据（不带像素）：按"每格约 48 字节开销 + 文本长度"估算。
+        Canvas::Sheet(d) => d
+            .sheets
+            .iter()
+            .map(|sh| {
+                sh.cells.iter().map(|c| c.text.len() + 48).sum::<usize>()
+                    + sh.col_widths.len() * 4
+                    + sh.row_heights.len() * 4
+                    + sh.merges.len() * 16
+            })
+            .sum(),
     }
 }
 
@@ -942,6 +953,8 @@ pub(crate) fn frame_matches_size(canvas: &Canvas, width: u32, height: u32) -> bo
         Canvas::Bitmap(bitmap) => bitmap.width == width && bitmap.height == height,
         // 文本是无损重排的，尺寸无关（重新排版即可）。
         Canvas::Text(_) => true,
+        // 表格同理：数据到手后逐格现画，"渲出来的尺寸"没有意义。
+        Canvas::Sheet(_) => true,
     }
 }
 
@@ -949,6 +962,7 @@ pub(crate) fn canvas_size(canvas: &Canvas) -> (u32, u32) {
     match canvas {
         Canvas::Bitmap(bitmap) => (bitmap.width, bitmap.height),
         Canvas::Text(_) => (0, 0),
+        Canvas::Sheet(_) => (0, 0),
     }
 }
 
@@ -967,6 +981,8 @@ pub(crate) fn canvas_size(canvas: &Canvas) -> (u32, u32) {
 pub(crate) fn fits_render_box(canvas: &Canvas, width: u32, height: u32) -> bool {
     match canvas {
         Canvas::Text(_) => true,
+        // 表格永远是"按当前盒子的可见区域现画"，天生装得进盒子。
+        Canvas::Sheet(_) => true,
         Canvas::Bitmap(bitmap) => {
             let inside = bitmap.width <= width && bitmap.height <= height;
             let touches = bitmap.width.abs_diff(width) <= 2 || bitmap.height.abs_diff(height) <= 2;
@@ -1258,6 +1274,9 @@ pub(crate) fn prewarm_within_budget(path: &Path, kind: format::Kind) -> bool {
             .unwrap_or(false),
         // 音频：卡片内容只靠元信息，渲染本身极便宜；但"预渲染"对听声音没意义，不预。
         format::Kind::Audio => false,
+        // 表格：预渲染的是"数据"而不是画面（画面取决于窗口尺寸/滚动位置），
+        // 预热能省的只有解析那 1–20 ms，却要多驻留一份 SheetDoc，先不预。
+        format::Kind::Sheet => false,
         format::Kind::Unsupported => false,
     }
 }

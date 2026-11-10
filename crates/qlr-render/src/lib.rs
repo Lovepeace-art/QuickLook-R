@@ -28,6 +28,7 @@ pub mod markdown;
 pub mod media;
 pub mod pdf;
 pub mod scale;
+pub mod sheet;
 pub mod source_cache;
 pub mod svg;
 pub mod text;
@@ -255,10 +256,36 @@ impl Viewer for AudioViewer {
     }
 }
 
+/// 电子表格渲染器（1.9.0）：**只解析，不出像素**。
+///
+/// 与其它预览不同，表格要能滚动、要能换 sheet，所以这一层返回的是
+/// `Canvas::Sheet(SheetDoc)` 这种纯数据；真正画到窗口（列号行号表头、网格线、
+/// 合并单元格、数字右对齐）在 `qlr_platform::window::sheet`。
+///
+/// 这么切的两个理由：
+/// 1. `qlr-render` 不许依赖 `windows`，解析器因此能在 `cargo test` 里无窗口单测；
+/// 2. 滚动/缩放只是重画，不该每次重解析（20 万格要 130ms，而重画一屏只要 13ms）。
+pub struct SheetViewer;
+
+impl Viewer for SheetViewer {
+    fn kind(&self) -> Kind {
+        Kind::Sheet
+    }
+
+    fn render(&self, req: &RenderRequest<'_>) -> Result<Canvas> {
+        // 工作簿主战场是"看当前 sheet 的第一屏"，`page` 复用来选第几个工作表
+        // （壳层翻页键复用它，和第 0 页语义并不冲突：表格本来就没有"页"）。
+        Ok(Canvas::Sheet(Box::new(sheet::parse_sheet_at(
+            req.path, req.page,
+        )?)))
+    }
+}
+
 static SVG_VIEWER: SvgViewer = SvgViewer;
 static HTML_VIEWER: HtmlViewer = HtmlViewer;
 static VIDEO_VIEWER: VideoViewer = VideoViewer;
 static AUDIO_VIEWER: AudioViewer = AudioViewer;
+static SHEET_VIEWER: SheetViewer = SheetViewer;
 
 /// 拼一张媒体"元信息卡片"的文字行（音频卡片与视频降级共用）。
 ///
@@ -342,6 +369,7 @@ pub fn viewer_for(kind: Kind) -> Option<&'static dyn Viewer> {
         Kind::Html => Some(&HTML_VIEWER),
         Kind::Audio => Some(&AUDIO_VIEWER),
         Kind::Video => Some(&VIDEO_VIEWER),
+        Kind::Sheet => Some(&SHEET_VIEWER),
         Kind::Unsupported => None,
     }
 }
@@ -415,7 +443,12 @@ pub fn natural_size(path: &Path, kind: Kind) -> Option<(u32, u32)> {
             }
             Some((pw.round() as u32, ph.round() as u32))
         }),
-        Kind::Text | Kind::Markdown | Kind::Html | Kind::Audio | Kind::Unsupported => None,
+        Kind::Text
+        | Kind::Markdown
+        | Kind::Html
+        | Kind::Audio
+        | Kind::Sheet
+        | Kind::Unsupported => None,
     }
 }
 

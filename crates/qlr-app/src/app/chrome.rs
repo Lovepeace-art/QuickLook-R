@@ -144,6 +144,10 @@ pub(crate) fn scroll_info() -> Option<window::ScrollInfo> {
             let total = pages? as f32;
             window::ScrollInfo::new(page as f32, 1.0, total)
         }
+        // 表格（1.9.0）：这里是**二维**滚动（x/y 都是像素偏移），右侧那条竖条
+        // 表达不了"横向还剩多少"，硬塞进来只会误导；滚动条留给 `paint_sheet`
+        // 自己按内容范围画（P1.1）。所以这里返回 `None`，内容区不为此让宽。
+        Canvas::Sheet(_) => None,
     }
 }
 
@@ -579,6 +583,34 @@ pub(crate) fn repaint(hwnd: HWND) {
                         Some(&chrome),
                     );
                 }
+                paint_overlays(hwnd, &layout);
+                paint_lens_if_any(hwnd);
+                return;
+            }
+            // 表格（1.9.0）：帧里只有数据，每次重画都按当前滚动偏移逐格现画。
+            // 这样"滚一行"只花几毫秒，也不需要把整张表渲成一张大位图（2 万行的表
+            // 按像素铺开是几十万像素宽，位图路线根本走不通）。
+            Canvas::Sheet(doc) => {
+                let (sx, sy) = with_state(|s| s.sheet_scroll).unwrap_or((0, 0));
+                let fallback;
+                let sheet = match doc.sheet() {
+                    Some(s) => s,
+                    None => {
+                        fallback = qlr_core::sheet::Sheet::default();
+                        &fallback
+                    }
+                };
+                log_debug!(
+                    SCOPE,
+                    "PAINT sheet {}x{} scroll=({},{}) content={}x{}",
+                    sheet.cols,
+                    sheet.rows,
+                    sx,
+                    sy,
+                    layout.content.right - layout.content.left,
+                    layout.content.bottom - layout.content.top
+                );
+                window::paint_sheet(hwnd, Some(&chrome), Some(layout.content), sheet, sx, sy);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
                 return;

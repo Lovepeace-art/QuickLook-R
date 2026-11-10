@@ -10,7 +10,8 @@
  [文本](docs/screenshots/preview-text.png) |
  [源码](docs/screenshots/preview-code.png) |
  [Markdown](docs/screenshots/preview-markdown.png) |
- Office |
+ [表格（xlsx）](docs/screenshots/preview-sheet.png) |
+ Office（docx / pptx） |
  [zip](docs/screenshots/preview-archive.png) |
  [音频](docs/screenshots/preview-audio.png) |
  [视频](docs/screenshots/preview-video.png) |
@@ -36,7 +37,8 @@
 | 支持的扩展名 | 123 | **416（29 种语言）** |
 | 字体预览 | 不支持 | **支持（DirectWrite 样本页）** |
 | 视频声音 | 无 | **有** |
-| Office 三件（本机实测） | **内置接管系统预览处理器** | 未装 `OfficeViewer-Native` → 打不开 |
+| 表格 xlsx（本机实测） | **内置原生渲染，不需要装 Office**（23,167 格的真实表：解析 17.6 ms、首帧 23 ms、宿主 +6 MB） | 未装 `OfficeViewer-Native` → 打不开 |
+| Office 文档 docx / pptx | **内置接管系统预览处理器**（需本机装 Office） | 未装 `OfficeViewer-Native` → 打不开 |
 | 压缩包 | **内置目录树，129 ms** | 插件列表，488 ms |
 
 完整数据、逐夹具明细与测量口径：[docs/dev/COMPARE-live-1.8.3-fix.md](docs/dev/COMPARE-live-1.8.3-fix.md)（上一版：[COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md)）。
@@ -59,7 +61,7 @@ pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"   # 卸载�
 
 首次运行会有 SmartScreen 提示（无代码签名证书），选"更多信息 → 仍要运行"即可。
 
-**系统要求**：Windows 10 / Windows 11，x64。Office 三件预览需要本机装了 Microsoft Office（走系统 `IPreviewHandler`）；PDF 需要随包提供的 `pdfium.dll`。
+**系统要求**：Windows 10 / Windows 11，x64。表格（xlsx/xlsm/xltx/xltm）**不需要装 Office**（内置原生渲染，见 [ADR-0011](docs/adr/0011-native-sheet-preview.md)）；docx / pptx 预览仍走系统 `IPreviewHandler`，需要本机装了 Microsoft Office；PDF 需要随包提供的 `pdfium.dll`。
 
 ## 致谢
 

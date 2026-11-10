@@ -4,6 +4,8 @@
 //! 这么切的理由：渲染是唯一需要跨平台单测、也是最需要被基准脚本直接调用的部分；
 //! 把它和窗口解耦之后，`cargo test` 和 `scripts/bench` 都能在无窗口环境跑。
 
+use qlr_core::sheet::SheetDoc;
+
 /// 一张已就绪、可直接贴到窗口上的位图。像素格式固定 `BGRA8`（Windows 原生顺序，
 /// 省掉上屏前的一次 swizzle）。
 #[derive(Clone)]
@@ -179,6 +181,8 @@ pub struct TextDoc {
 pub enum Canvas {
     Bitmap(Bitmap),
     Text(TextDoc),
+    /// 电子表格：只带数据，不带像素（绘制在 qlr-platform::window::sheet，可滚动/可翻 sheet）。
+    Sheet(Box<SheetDoc>),
 }
 
 impl Canvas {
@@ -193,14 +197,15 @@ impl Canvas {
                 .filter(|px| px[0] < 200 || px[1] < 200 || px[2] < 200)
                 .count(),
             Canvas::Text(t) => t.lines.len(),
+            Canvas::Sheet(d) => d.sheet().map(|s| s.cells.len()).unwrap_or(0),
         }
     }
 
-    /// 像素尺寸（文本返回 0×0，日志里用）。
+    /// 像素尺寸（文本/表格返回 0×0，日志里用）。
     pub fn dimensions(&self) -> (u32, u32) {
         match self {
             Canvas::Bitmap(b) => (b.width, b.height),
-            Canvas::Text(_) => (0, 0),
+            Canvas::Text(_) | Canvas::Sheet(_) => (0, 0),
         }
     }
 
@@ -208,6 +213,7 @@ impl Canvas {
         match self {
             Canvas::Bitmap(_) => "bitmap",
             Canvas::Text(_) => "text",
+            Canvas::Sheet(_) => "sheet",
         }
     }
 
@@ -216,6 +222,16 @@ impl Canvas {
         match self {
             Canvas::Bitmap(b) => b.bytes(),
             Canvas::Text(t) => t.lines.iter().map(|l| l.len()).sum(),
+            Canvas::Sheet(d) => d
+                .sheets
+                .iter()
+                .map(|s| {
+                    s.cells.iter().map(|c| c.text.len() + 48).sum::<usize>()
+                        + s.col_widths.len() * 4
+                        + s.row_heights.len() * 4
+                        + s.merges.len() * 16
+                })
+                .sum(),
         }
     }
 }

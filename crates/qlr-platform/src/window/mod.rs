@@ -1367,6 +1367,7 @@ mod paint;
 mod scroll;
 mod settings;
 mod shadow;
+mod sheet;
 mod text;
 mod toc;
 
@@ -1377,5 +1378,6 @@ pub(crate) use paint::*;
 pub use scroll::*;
 pub use settings::*;
 pub use shadow::*;
+pub use sheet::*;
 pub use text::*;
 pub use toc::*;

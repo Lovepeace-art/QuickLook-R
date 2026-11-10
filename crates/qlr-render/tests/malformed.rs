@@ -61,6 +61,15 @@ fn render_quietly(path: &Path) -> Option<String> {
                         path.display()
                     );
                 }
+                // 表格帧（1.9.0）也是合法的：坏 xlsx 要么 Err、要么退化成空表，
+                // 但绝不能是"N 行 M 列却一个 Sheet 都没有"这种自相矛盾的样子。
+                qlr_render::Canvas::Sheet(d) => {
+                    assert!(
+                        !d.sheets.is_empty(),
+                        "表格帧至少要有 1 张表：{}",
+                        path.display()
+                    );
+                }
             }
             None
         }
@@ -311,6 +320,8 @@ fn broken_video_degrades_to_card_instead_of_error() {
             );
         }
         qlr_render::Canvas::Bitmap(b) => panic!("坏视频不该解出位图：{}x{}", b.width, b.height),
+        // 视频只能是卡片或位图；表格帧出现在这里就是类别串了。
+        qlr_render::Canvas::Sheet(_) => panic!("坏视频不该解出表格：{}", path.display()),
     }
 }
 

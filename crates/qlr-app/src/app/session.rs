@@ -156,6 +156,8 @@ pub(crate) struct State {
     pub(crate) zoom: f32,
     /// 文本内容的滚动位置（顶部显示第几行，0 基）。
     pub(crate) scroll: usize,
+    /// 表格的滚动偏移（像素，`(x, y)`）：表格是二维滚动，跟文本的"第几行"不是一套。
+    pub(crate) sheet_scroll: (i32, i32),
     /// 上次绘制时当前窗口吃掉了多少**原始行**（折行后一屏 ≠ 一屏原始行）。
     /// 翻页按它前进，否则折行会让 PageDown 漏掉大半屏内容。
     pub(crate) wrapped_consumed: usize,
@@ -340,6 +342,7 @@ impl State {
             pages: None,
             zoom: 1.0,
             scroll: 0,
+            sheet_scroll: (0, 0),
             wrapped_consumed: 0,
             natural: None,
             base: None,
@@ -685,6 +688,8 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.toc_active = None;
         // 1.8.3：目录的滚动位置也要跟着新文件归零（否则换文件后目录停在半截）。
         s.toc_scroll = 0;
+        // 1.9.0：表格是二维像素滚动，换文件同样归零（否则新表从上一张表滚到的位置开始）。
+        s.sheet_scroll = (0, 0);
         // 折行缓存是按"行号"存的，换内容必须整本作废（否则会拿旧文件的折行结果画新文件）。
         s.wrap_cache.clear();
         if let Some(surface) = surface {

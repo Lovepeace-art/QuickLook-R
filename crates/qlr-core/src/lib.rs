@@ -15,6 +15,7 @@ pub mod keymap;
 pub mod log;
 pub mod paths;
 pub mod plugins;
+pub mod sheet;
 pub mod version;
 
 pub use config::Config;

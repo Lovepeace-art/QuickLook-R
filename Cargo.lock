@@ -350,6 +350,7 @@ dependencies = [
  "png",
  "qlr-core",
  "windows",
+ "zip",
 ]
 
 [[package]]

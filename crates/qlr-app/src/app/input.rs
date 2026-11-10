@@ -277,6 +277,12 @@ pub(crate) fn on_wheel(delta: i32) {
     if with_state(|s| s.hover_toc).unwrap_or(false) && scroll_toc_by(notches) {
         return;
     }
+    // 表格（1.9.0）：滚轮 = 上下滚（一格 = 3 行高）；Shift+滚轮 = 左右滚。
+    // 必须放在 `scroll_text_by` 前面：表格内容不在 `CONTENT` 的行模型里，
+    // 落到文本分支只会被判成"滚不动"，然后去缩放/翻页（用户看到的是画面乱跳）。
+    if sheet_scroll_by_wheel(notches) {
+        return;
+    }
     // 文本：一格 3 行。滚得动就不缩放。
     if scroll_text_by(wheel_text_rows(notches)) {
         return;
@@ -294,6 +300,61 @@ pub(crate) fn on_wheel(delta: i32) {
     if !moved {
         wheel_zoom(notches);
     }
+}
+
+/// 表格滚动（1.9.0）：滚轮一格 = 3 行高；Shift + 滚轮 = 3 列宽。
+///
+/// 二维滚动，偏移是**像素**（`State::sheet_scroll`），不是"第几行"——表格的行高
+/// 逐行不同（Excel 允许单独调行高），按行号表达不了"滚到半行"。
+pub(crate) fn sheet_scroll_by_wheel(notches: isize) -> bool {
+    let (row_h, col_w) = (
+        qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32,
+        qlr_core::sheet::DEFAULT_COL_WIDTH as i32,
+    );
+    if window::shift_down() {
+        sheet_scroll_by(-(notches as i32) * col_w * 3, 0)
+    } else {
+        sheet_scroll_by(0, -(notches as i32) * row_h * 3)
+    }
+}
+
+/// 按像素滚动表格（1.9.0）。返回是否处理了（内容不是表格时 false）。
+///
+/// 上限由 `window::sheet_extent` 给出（它已保证"不小于视口"），所以这里
+/// 直接 `extent - view` 当 `max`，不需要再补表头宽高——两者都算在 extent 里了。
+pub(crate) fn sheet_scroll_by(dx: i32, dy: i32) -> bool {
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(sheet) = doc.sheet() else {
+        return false;
+    };
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let layout = frame(preview.raw());
+    let view_w = (layout.content.right - layout.content.left).max(1);
+    let view_h = (layout.content.bottom - layout.content.top).max(1);
+    let (extent_w, extent_h) = window::sheet_extent(sheet, view_w, view_h);
+    let max_x = (extent_w - view_w).max(0);
+    let max_y = (extent_h - view_h).max(0);
+    let (cur_x, cur_y) = with_state(|s| s.sheet_scroll).unwrap_or((0, 0));
+    let next_x = (cur_x + dx).clamp(0, max_x);
+    let next_y = (cur_y + dy).clamp(0, max_y);
+    if (next_x, next_y) == (cur_x, cur_y) {
+        // 已经到边了：仍然算"处理了"，否则会掉进下面的缩放/翻页分支。
+        return true;
+    }
+    with_state(|s| s.sheet_scroll = (next_x, next_y));
+    log_debug!(
+        SCOPE,
+        "SHEET-SCROLL ({cur_x},{cur_y}) -> ({next_x},{next_y}) 上限 ({max_x},{max_y})"
+    );
+    window::invalidate(preview.raw());
+    true
 }
 
 /// 滚动目录栏（1.8.3）。返回是否处理了这次滚轮。
@@ -1204,13 +1265,17 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
         0xBD | 0x6D => return set_zoom(0.8),
         0x30 | 0x60 => return zoom_reset(),
         0x28 => {
-            if !scroll_text_by(1) {
+            // 表格（1.9.0）：一行一行挪，和 Excel 的手感一致；不是表格时落到文本/位图分支。
+            if !sheet_scroll_by(0, qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32) && !scroll_text_by(1)
+            {
                 pan_by(0, 1);
             }
             return;
         }
         0x26 => {
-            if !scroll_text_by(-1) {
+            if !sheet_scroll_by(0, -(qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32))
+                && !scroll_text_by(-1)
+            {
                 pan_by(0, -1);
             }
             return;

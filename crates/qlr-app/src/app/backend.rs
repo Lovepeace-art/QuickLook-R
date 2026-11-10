@@ -20,6 +20,8 @@ pub(crate) enum Surface {
     Text,
     /// 系统预览处理器的子窗口自己画（我们只画顶栏）。
     ChildWindow,
+    /// 电子表格网格（内核算出可见行列，逐格 GDI 画，可滚动/可翻 sheet）。
+    Sheet,
     /// 壳层自绘列表（压缩包目录树）。
     List,
 }
@@ -34,6 +36,7 @@ impl Surface {
         match canvas {
             qlr_render::Canvas::Bitmap(_) => Surface::Bitmap,
             qlr_render::Canvas::Text(_) => Surface::Text,
+            qlr_render::Canvas::Sheet(_) => Surface::Sheet,
         }
     }
 }
@@ -104,6 +107,7 @@ impl PreviewBackend for NativeBackend {
             | format::Kind::Markdown
             | format::Kind::Html
             | format::Kind::Audio => Surface::Text,
+            format::Kind::Sheet => Surface::Sheet,
             _ => Surface::Bitmap,
         }
     }
@@ -253,6 +257,7 @@ mod tests {
             format::Kind::Html,
             format::Kind::Audio,
             format::Kind::Video,
+            format::Kind::Sheet,
         ] {
             let p = PathBuf::from(r"C:\x\a");
             let b = resolve(&p, kind).expect("内置类必须有后端");
@@ -269,6 +274,8 @@ mod tests {
         assert_eq!(NATIVE.surface(format::Kind::Image), Surface::Bitmap);
         assert_eq!(NATIVE.surface(format::Kind::Pdf), Surface::Bitmap);
         assert_eq!(NATIVE.surface(format::Kind::Video), Surface::Bitmap);
+        // 表格是第三种表面：数据到壳层，逐格 GDI 画（可滚动/翻 sheet）。
+        assert_eq!(NATIVE.surface(format::Kind::Sheet), Surface::Sheet);
     }
 
     #[test]

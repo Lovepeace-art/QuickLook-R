@@ -1,4 +1,13 @@
 # 进度（STATUS）
+> 更新时间：2026-11-10 · **表格（xlsx）改内置原生渲染，摆脱 Office 安装依赖**：新增 `Kind::Sheet`
+> + `qlr-core::sheet` 数据模型 + `qlr-render::sheet` 解析器（手写 OOXML，`zip 2` 只开 deflate）+
+> `qlr-platform::window::sheet` 绘制（灰底行列号表头随滚动、合并/冻结/边框/数字格式、只画可见行列）+
+> `Canvas::Sheet` 第三变体与二维像素滚动（滚轮 Shift=横向、上下键一行）。实测：真实月复盘 xlsx（23,167 格）
+> 解析 **17.6 ms**、`big-20k.xlsx`（160,008 格）**104.5 ms**、首帧 `SHOW 5ms`+`RENDER 18ms`、
+> 宿主 WS **16.0 MB**（空载 10.0 MB）；对比系统处理器路线 xlsx 冷启 1083 ms / 常驻 130–300 MB。
+> 回归 `cargo test` **357 passed / 0 failed / 11 ignored**、fmt/clippy 零输出、`verify-sheet` **10 PASS**、
+> `verify-office` 23 PASS、`verify-layers` 14 PASS、`smoke` 16 PASS·1 SKIP。决策见 ADR-0011，明细见 LOG。
+
 
 > 更新时间：2026-11-04 · **插件加载信任边界（安全加固第二刀）**：`plugins.rs` 的 `scan` 加“仅加载插件目录内真实文件（`canonicalize` 防符号链接越界）+ 单 DLL ≤ 64 MiB + 最多 64 个 + 文本输出 ≤ 64 MiB”边界，越界项记 `host.errors()` 不致命；新增 `oversized_dll_is_skipped` 单测。回归 `cargo test` **318 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。明细见 LOG。
 >

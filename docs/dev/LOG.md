@@ -3241,3 +3241,35 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 
 ### 怎么验证
 `cargo test` **318 passed / 0 failed**（+1 新测）；fmt/clippy 零输出；`verify-layers` **14 PASS**；`cargo build --release` 37.02s；`smoke` **16 PASS · 1 SKIP**。原有 7 个 plugins 单测（坏 dll 不致命 / 非 dll 忽略 / 空目录 / copy_out 校验等）保持绿。
+
+## 2026-11-10 · 1.9.0：表格（xlsx）改内置原生渲染，摆脱 Office 依赖
+
+### 做了什么
+
+用户最初问的是「Office 预览改成调 office2pdf 合适吗」——先用真实业务文件把候选方案全量测了一遍，结论是都不合适（数字见 ADR-0011 的对照表），于是改成自己画：
+
+- 新增 `Kind::Sheet`（`crates/qlr-core/src/format.rs`）：`SHEET_EXTS = ["xlsx","xlsm","xltx","xltm"]`，`KINDS` 9 类，`kind_for_ext` 在 TEXT 之前判；老式 `.xls`/`.et` 明确不做（仍落回系统处理器/插件）。
+- 新增纯数据模型 `crates/qlr-core/src/sheet.rs`（零 `windows` 依赖）：`SheetDoc/Sheet/Cell/CellStyle/Colors/Border/Merge`，几何与样式都只是数，可单测。
+- 新增解析器 `crates/qlr-render/src/sheet.rs`（约 2900 行，含 22 个单测）：手写 OOXML 扫描（`zip 2` 只开 deflate，不引 XML 库）→ workbook/rels → theme+indexed 调色板 → styles → 数字格式引擎 → sharedStrings → worksheet；内建 numFmtId 0–49 全映射 + 自定义格式串四段，日期含 1900 闰年补偿，边框 thin/medium/double，冻结窗格、合并单元格、富文本 run 拼接。
+- 新增绘制层 `crates/qlr-platform/src/window/sheet.rs`（1981 行，含 9 个单测）：灰底行列号表头随滚动、1px 网格 + 权重边框、合并区抑制内部线、冻结区覆盖、超宽文本按 Excel 规则溢出/硬裁、数字放不下画 `####`；离屏 DC 双缓冲 + 三层裁剪，**只遍历可见行列**。
+- 接线（`qlr-app`）：`Canvas::Sheet(Box<SheetDoc>)` 第三变体 → `Surface::Sheet` → `repaint` 新增 `Canvas::Sheet` 分支现画；`State.sheet_scroll: (i32, i32)` 二维像素滚动；滚轮（Shift = 横向）与上下方向键走 `sheet_scroll_by`；换文件归零。
+
+### 为什么
+
+现状走系统 `IPreviewHandler`：xlsx 冷启 **1083 ms**、热了也要 **812 ms**，且拉起 Office 常驻 **130–300 MB** 不回落，还要求本机装了 Office。用户的设计是"闲置回收"，不能靠常驻 Office 保热——所以要把渲染搬进自己进程。
+
+关键取舍是**数据与像素分离**：帧里只放单元格数据，像素按当前视口现算。否则 2 万行的表铺成位图是几十万像素宽，位图路线走不通；而"只画可见几十行"让滚动重画与表大小无关（23 k 格与 16 万格的表都是同一量级）。
+
+### 怎么验证
+
+- 解析：真实月复盘 xlsx（23,167 格 / 353×97）**17.6 ms**；`big-20k.xlsx`（160,008 格 / 20,001×8）**104.5 ms**。一次 4× 优化：原来每格 `find_tag` 从格首扫到行尾（97 列 × 40 KB 行），改成先把范围夹到本格再扫，112 → 17.6 ms。
+- 端到端：`SHOW … kind=sheet renderable=true plugin=- elapsed=5ms` + `RENDER gen=1 sheet … elapsed=18ms`（880×748 窗口）；新增 `scripts/verify-sheet.ps1` **10 PASS / 0 FAIL**，大表 `elapsed≈108 ms`（上限断言 1500 ms）。
+- 内存：看一张 2.3 万格的表，宿主 WS **16.0 MB**（空载 10.0 MB，即 +6 MB）；同场景 Office 路线 130–300 MB。
+- 回归：`cargo test --workspace --offline` **357 passed / 0 failed / 11 ignored**（1.8.3 基线 318/10，本轮新增 39 个）；`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --offline -- -D warnings` 零输出；`smoke` 16 PASS·1 SKIP、`verify-office` 23 PASS、`verify-layers` 14 PASS 保持。
+
+### 踩到的坑（已进 CONVENTIONS #162–#164）
+
+- **`looks_numeric` 把日期文本判成数字**：`plugin-demo.xlsx` 的日期列是 `t="inlineStr"` 文本（`2026-10-01`），旧启发式允许任意位置出现 `-`/`:`/`/`，于是走了 `####` 分支，用户看不到日期。改成 `-` 只许作前导符号、`:` `/` 一律判非数字 → 落回"文本溢出/硬裁"。**预览只读、拉不宽列，宁可给部分文本也不给 `####`**（与 Excel 故意不同，别改回去）。
+- **测试并行 + 固定文件名**：4 个单测共用 `sample.xlsx`，`cargo test` 并行时"一个读一个写"偶发失败 → 每个测试独立文件名。
+- **注入的键鼠事件被钩子按设计过滤**：`hotkey.rs` 丢弃 `LLMHF_INJECTED`/`LLKHF_INJECTED`，所以滚轮/方向键**无法用脚本验**，只能人手确认；`verify-sheet.ps1` 因此只验"出帧"不验"滚动"。
+
