@@ -274,8 +274,13 @@ impl Viewer for SheetViewer {
 
     fn render(&self, req: &RenderRequest<'_>) -> Result<Canvas> {
         // 工作簿主战场是"看当前 sheet 的第一屏"，`page` 复用来选第几个工作表
-        // （壳层翻页键复用它，和第 0 页语义并不冲突：表格本来就没有"页"）。
-        Ok(Canvas::Sheet(Box::new(sheet::parse_sheet_at(
+        // （表格本来就没有"页"，壳层翻页键就是切 sheet）。
+        //
+        // 这里用**显式下标**（`parse_sheet_index`）：壳层已经把 `page` 初始化成
+        // 工作簿的 `activeTab`（见 `sheet::sheet_layout`），所以 `page = 0` 该是
+        // "第 0 张"，不能又解释成"跟 activeTab 走"——否则用户在 Excel 里停在
+        // 第 3 张，预览按 PageUp 会从第 3 张跳回第 3 张（看起来像按键失灵）。
+        Ok(Canvas::Sheet(Box::new(sheet::parse_sheet_index(
             req.path, req.page,
         )?)))
     }

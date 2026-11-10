@@ -92,6 +92,35 @@ pub fn parse_sheet(path: &Path) -> qlr_core::Result<SheetDoc> {
 ///
 /// `doc.active` 是最终选中的下标（越界会夹到最后一张）。
 pub fn parse_sheet_at(path: &Path, sheet_index: usize) -> qlr_core::Result<SheetDoc> {
+    // `0` 表示跟着工作簿的 activeTab 走；`n` 表示第 n 张。
+    parse_sheet_impl(path, (sheet_index != 0).then_some(sheet_index))
+}
+
+/// 同上，但 `index` 是**显式下标**（`0` 就是第 0 张表，不看 activeTab）。
+///
+/// 壳层用"翻页键 ≡ 切工作表"时走这条：它先把 `page` 初始化成 `activeTab`
+/// （见 `sheet_layout`），之后每翻一次就传绝对下标，语义不跟 activeTab 纠缠。
+pub fn parse_sheet_index(path: &Path, index: usize) -> qlr_core::Result<SheetDoc> {
+    parse_sheet_impl(path, Some(index))
+}
+
+/// 只读工作簿骨架：返回 `(工作表数, activeTab 下标)`，不解样式、不读单元格。
+///
+/// 给壳层定翻页范围用（`s.pages` / `s.page`），代价是一次 workbook.xml 读取。
+pub fn sheet_layout(path: &Path) -> Option<(usize, usize)> {
+    let file = File::open(path).ok()?;
+    let zip = zip::ZipArchive::new(file).ok()?;
+    let mut pkg = Package { zip, used: 0 };
+    let workbook = pkg.read_optional("xl/workbook.xml").ok()??;
+    let (metas, active) = parse_workbook(&workbook);
+    if metas.is_empty() {
+        return None;
+    }
+    let count = metas.len().min(MAX_SHEETS);
+    Some((count, active.min(count - 1)))
+}
+
+fn parse_sheet_impl(path: &Path, explicit: Option<usize>) -> qlr_core::Result<SheetDoc> {
     let name = crate::display_name(path);
     let file =
         File::open(path).map_err(|e| Error::msg(format!("打开 xlsx 失败（{name}）：{e}")))?;
@@ -118,11 +147,10 @@ pub fn parse_sheet_at(path: &Path, sheet_index: usize) -> qlr_core::Result<Sheet
         None => Vec::new(),
     };
 
-    // `0` 表示跟着工作簿的 activeTab 走；`n` 表示第 n 张。
-    let selected = if sheet_index == 0 {
-        active.min(metas.len() - 1)
-    } else {
-        sheet_index.min(metas.len() - 1)
+    // 显式下标（`Some`）就按它走；`None` 表示跟着工作簿的 activeTab。
+    let selected = match explicit {
+        Some(index) => index.min(metas.len() - 1),
+        None => active.min(metas.len() - 1),
     };
 
     // ---- 主题色 / 样式 / 共享字符串 ----

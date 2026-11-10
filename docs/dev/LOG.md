@@ -3272,3 +3272,37 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 - **`looks_numeric` 把日期文本判成数字**：`plugin-demo.xlsx` 的日期列是 `t="inlineStr"` 文本（`2026-10-01`），旧启发式允许任意位置出现 `-`/`:`/`/`，于是走了 `####` 分支，用户看不到日期。改成 `-` 只许作前导符号、`:` `/` 一律判非数字 → 落回"文本溢出/硬裁"。**预览只读、拉不宽列，宁可给部分文本也不给 `####`**（与 Excel 故意不同，别改回去）。
 - **测试并行 + 固定文件名**：4 个单测共用 `sample.xlsx`，`cargo test` 并行时"一个读一个写"偶发失败 → 每个测试独立文件名。
 - **注入的键鼠事件被钩子按设计过滤**：`hotkey.rs` 丢弃 `LLMHF_INJECTED`/`LLKHF_INJECTED`，所以滚轮/方向键**无法用脚本验**，只能人手确认；`verify-sheet.ps1` 因此只验"出帧"不验"滚动"。
+
+## 2026-11-10 · 1.9.0 续：翻页键切工作表 + 页码框复用
+
+### 做了什么
+
+- `crates/qlr-render/src/sheet.rs`：拆出 `parse_sheet_impl(path, explicit: Option<usize>)`，新增
+  `pub fn parse_sheet_index(path, index)`（显式下标）与 `pub fn sheet_layout(path) -> Option<(usize, usize)>`
+  （只读 `xl/workbook.xml`，返回 `(工作表数, activeTab)`，0.1ms 级）。原来的 `parse_sheet_at(path, 0)`
+  保留"0 = 跟 activeTab"的老语义，但 `SheetViewer` 改走显式下标。
+- `crates/qlr-app/src/app/show.rs`：`pages` 从"只有 PDF 有"扩成 `(pages, first_page)`——PDF 走
+  `pdf_page_count` / 0，表格走 `sheet_layout` 的 `(count, active)`，其余 `(None, 0)`；`s.page = first_page`。
+- `crates/qlr-app/src/app/input.rs`：`step_page(delta)` 里 `s.pan = (0, 0)` 之后补 `s.sheet_scroll = (0, 0)`。
+- `crates/qlr-app/src/app/chrome.rs`：`scroll_info()` 取完 `(page, pages, …)` **先判** `Canvas::Sheet(_)` →
+  `None`（表格的 `pages` 是"工作表数"，当滚动条用会变成"滚一格换一张表"）。
+
+### 为什么
+
+用户在 Excel 里停在第 4 张表，打开预览却从第 1 张开始，得自己找——表格预览没有"页"的概念，
+**翻页键天然就是"上一张/下一张工作表"**，而顶栏那个 `4 / 5` 页码框正好能显示"第几张表"。
+这一改没引入任何新控件，只是把已有的 `page/pages` 借给表格用。
+
+### 怎么验证
+
+- `cargo check --workspace --all-targets --offline` 无输出；`cargo test --workspace --offline`
+  **357 passed / 11 ignored / 0 failed**；`cargo clippy --workspace --all-targets --offline -- -D warnings`
+  exit 0；`cargo fmt --all -- --check` 干净。
+- `scripts/verify-sheet.ps1` **10 PASS / 0 FAIL / 0 SKIP**（大表 `elapsed=120ms`，预算 1500ms）。
+- 真窗口截图：`real-monthly.xlsx` 首帧就是 `workbook.xml` 里 `activeTab="3"` 的第 4 张
+  「官旗商品明细-同比」，顶栏显示 `4 / 5`（`_bench\sheet\monthly-tab3.png`）。
+
+### 踩到的坑（已进 CONVENTIONS #165）
+
+改完 `sheet_layout`/`parse_sheet_index` 后截图仍是第 1 张表——`show.rs` 里两处**首帧渲染**都写死
+`request_render(p, w, h, 0)`，页号根本没传出去。改成传 `first_page` 才生效。

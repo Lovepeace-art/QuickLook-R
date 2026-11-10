@@ -1128,6 +1128,8 @@ pub(crate) fn step_page(delta: isize) {
         s.page = target;
         // 换页从页顶看起（滚轮滚到页底再往下滚就翻页，1.0.3）。
         s.pan = (0, 0);
+        // 表格（1.9.0）：这里的"翻页"就是切工作表，新表必须从左上角看起。
+        s.sheet_scroll = (0, 0);
     });
 
     let (width, height) = view_size(preview.raw());

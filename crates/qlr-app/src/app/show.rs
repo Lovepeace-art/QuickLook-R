@@ -456,10 +456,18 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     };
     with_state(|s| s.media_aspect = aspect);
     // PDF 先问总页数（同一把锁里再开文档，代价只有一次 read；页数拿不到不影响渲染）。
-    let pages = if kind == format::Kind::Pdf {
-        target.as_deref().and_then(qlr_render::pdf_page_count)
+    // 表格（1.9.0）把"翻页键"借给"切工作表"：`pages` = 工作表数，首屏定位到工作簿的
+    // `activeTab`（就是用户在 Excel 里最后停留的那张）。`sheet_layout` 只读
+    // workbook.xml，不看样式和单元格，代价 1ms 级；读不出来就当没有翻页。
+    let (pages, first_page) = if kind == format::Kind::Pdf {
+        (target.as_deref().and_then(qlr_render::pdf_page_count), 0)
+    } else if kind == format::Kind::Sheet {
+        match target.as_deref().and_then(qlr_render::sheet::sheet_layout) {
+            Some((count, active)) => (Some(count), active),
+            None => (None, 0),
+        }
     } else {
-        None
+        (None, 0)
     };
     // 尺寸规则（1.0.1 / 1.0.9 / 1.0.14 / 1.1.0）：集中到 `window_size_for`，
     // 预渲染用同一份算，两边才不会漂移。
@@ -555,7 +563,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     hotkey::set_capture_digits(false);
     let zoom = 1.0_f32;
     with_state(|s| {
-        s.page = 0;
+        s.page = first_page;
         s.pages = pages;
     });
 
@@ -696,7 +704,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
                 present_canvas(canvas);
                 presented = true;
             }
-            (None, None) => request_render(p, render_w, render_h, 0),
+            (None, None) => request_render(p, render_w, render_h, first_page),
         }
     }
 
@@ -731,7 +739,7 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     if shell_wanted && !open_shell_preview(target.as_deref()) && renderable {
         // 处理器没起来：立刻退回插件渲染（否则屏幕上只剩"正在渲染…"的占位文字）。
         if let Some(p) = target.as_deref() {
-            request_render(p, render_w, render_h, 0);
+            request_render(p, render_w, render_h, first_page);
         }
     }
     // 处理器没起来（或压根没要处理器）就别冻帧了，让占位/渲染帧正常上屏。

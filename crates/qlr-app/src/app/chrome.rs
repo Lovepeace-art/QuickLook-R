@@ -128,6 +128,11 @@ pub(crate) fn scroll_info() -> Option<window::ScrollInfo> {
     let content = get_content()?;
     let (page, pages, scroll, consumed) =
         with_state(|s| (s.page, s.pages, s.scroll, s.wrapped_consumed)).unwrap_or((0, None, 0, 1));
+    // 表格（1.9.0）：`pages` 在表格上表达的是"一共几张工作表"，**不能**当滚动条用
+    // ——用户滚一格就换了一张表，只会以为数据错了。二维滚动的滚动条留给 P1.1。
+    if matches!(&*content, Canvas::Sheet(_)) {
+        return None;
+    }
     // PDF：滚动条只看**页数**，和"现在上屏的是占位文字还是真页面"无关。
     // 这一条必须放在 match 之前：`view_size()` 要靠它算出"内容区宽不宽"，
     // 而算渲染尺寸时上屏的往往还是那句"正在渲染…"——按占位文字算出来的
