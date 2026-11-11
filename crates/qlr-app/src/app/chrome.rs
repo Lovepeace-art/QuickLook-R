@@ -174,6 +174,10 @@ pub(crate) fn frame(hwnd: HWND) -> Frame {
     // 所以这里单独问一次；命中测试和绘制都读同一个 `Frame`，两边才不会错位。
     let visible_bar = if has_archive_view() {
         archive_scroll_info(below).is_some()
+    } else if is_sheet_view() {
+        // 表格的滚动条按**像素**算（1.9.1）：竖直方向还能滚就要占一条宽度，
+        // 否则滑块会压在真正的内容上。
+        sheet_scroll_info(below).is_some()
     } else {
         scroll_info().is_some()
     };
@@ -302,6 +306,22 @@ pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
 /// 点/拖滚动条：把鼠标 y 换成"滚到哪儿"。
 pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
     let layout = frame(hwnd);
+    // 表格（1.9.1）：滑块走"像素"，比例 × 最大偏移就是目标 scroll_y。
+    if is_sheet_view() {
+        let Some(info) = sheet_scroll_info(layout.below_chrome) else {
+            return;
+        };
+        let Some((_, max_y)) = sheet_scroll_max(layout.below_chrome) else {
+            return;
+        };
+        let ratio = window::scroll_start_at(layout.below_chrome, y, info);
+        let target = (ratio * max_y as f32).round() as i32;
+        with_state(|s| {
+            s.sheet_scroll.1 = target.clamp(0, max_y);
+        });
+        window::invalidate(hwnd);
+        return;
+    }
     let (Some(_bar), Some(info)) = (layout.bar, scroll_info()) else {
         return;
     };
@@ -319,6 +339,52 @@ pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
         with_state(|s| s.scroll = scroll.min(max));
         window::invalidate(hwnd);
     }
+}
+
+/// 当前内容是表格吗（`frame`/滚动条走不同通道）。
+pub(crate) fn is_sheet_view() -> bool {
+    matches!(get_content().as_deref(), Some(Canvas::Sheet(_)))
+}
+
+/// 表格竖直方向的最大滚动像素（0 = 不用滚，1.9.1）。
+pub(crate) fn sheet_scroll_max(content: RECT) -> Option<(i32, i32)> {
+    let canvas = get_content()?;
+    let Canvas::Sheet(doc) = &*canvas else {
+        return None;
+    };
+    let sheet = doc.sheet()?;
+    let (col_extra, row_extra) =
+        with_state(|s| (s.sheet_col_w.clone(), s.sheet_row_h.clone())).unwrap_or_default();
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    let view_w = (content.right - content.left).max(1);
+    let view_h = (content.bottom - content.top).max(1);
+    let (extent_w, extent_h) = window::sheet_extent(sheet, &sizes, view_w, view_h);
+    Some(((extent_w - view_w).max(0), (extent_h - view_h).max(0)))
+}
+
+/// 表格的竖直滚动条信息（1.9.1）。
+///
+/// 单位是**像素**（不是行号）：表格的行高逐行不同，按行号画出来的滑块长度会骗人。
+/// `content` 传"顶栏以下"那块区域——滑块长度要跟可见高度成比例。
+pub(crate) fn sheet_scroll_info(content: RECT) -> Option<window::ScrollInfo> {
+    let canvas = get_content()?;
+    let Canvas::Sheet(doc) = &*canvas else {
+        return None;
+    };
+    let sheet = doc.sheet()?;
+    let (col_extra, row_extra) =
+        with_state(|s| (s.sheet_col_w.clone(), s.sheet_row_h.clone())).unwrap_or_default();
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    let view_h = (content.bottom - content.top).max(1);
+    let (_, extent_h) = window::sheet_extent(sheet, &sizes, content.right - content.left, view_h);
+    let (_, scroll_y) = with_state(|s| s.sheet_scroll).unwrap_or((0, 0));
+    window::ScrollInfo::new(scroll_y as f32, view_h as f32, extent_h as f32)
 }
 
 /// 鼠标是否落在某个矩形里。
@@ -597,6 +663,15 @@ pub(crate) fn repaint(hwnd: HWND) {
             // 按像素铺开是几十万像素宽，位图路线根本走不通）。
             Canvas::Sheet(doc) => {
                 let (sx, sy) = with_state(|s| s.sheet_scroll).unwrap_or((0, 0));
+                // 视图内列宽/行高调整（1.9.1）：每帧拷一份小 vec（正常是 0 条）。
+                // 绘制要跑几十毫秒，绝不能拿着 `STATE` 去画（CONVENTIONS #128/#139）。
+                let (col_extra, row_extra) =
+                    with_state(|s| (s.sheet_col_w.clone(), s.sheet_row_h.clone()))
+                        .unwrap_or_default();
+                let sizes = window::SheetSizes {
+                    col_extra: &col_extra,
+                    row_extra: &row_extra,
+                };
                 let fallback;
                 let sheet = match doc.sheet() {
                     Some(s) => s,
@@ -607,15 +682,30 @@ pub(crate) fn repaint(hwnd: HWND) {
                 };
                 log_debug!(
                     SCOPE,
-                    "PAINT sheet {}x{} scroll=({},{}) content={}x{}",
+                    "PAINT sheet {}x{} scroll=({},{}) resize=({}, {}) content={}x{}",
                     sheet.cols,
                     sheet.rows,
                     sx,
                     sy,
+                    col_extra.len(),
+                    row_extra.len(),
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
-                window::paint_sheet(hwnd, Some(&chrome), Some(layout.content), sheet, sx, sy);
+                window::paint_sheet(
+                    hwnd,
+                    Some(&chrome),
+                    Some(layout.content),
+                    sheet,
+                    &sizes,
+                    sx,
+                    sy,
+                );
+                // 竖直滚动条（1.9.1）：滑块按**像素**算，画在内容区右侧那条上。
+                // `paint_sheet` 内部已经 `EndPaint`，这里再用 `GetDC` 那版不冲突。
+                if let Some(info) = sheet_scroll_info(layout.below_chrome) {
+                    window::paint_scrollbar(hwnd, layout.below_chrome, info, false);
+                }
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
                 return;

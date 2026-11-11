@@ -2299,6 +2299,7 @@ fn prev_col_reset(
             col,
             text: text.unwrap_or_default(),
             style,
+            numeric,
         });
     }
 }

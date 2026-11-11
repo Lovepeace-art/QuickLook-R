@@ -715,7 +715,8 @@ workspace version 0.1.3 → **0.1.4**；`dist/qlrust-0.1.4-win64/`
 ## 2026-10-30 · 0.1.7 PDF 缩放 / 平移（A2.8 收尾）
 
 **做了什么**
-- crates/qlr-app/src/app.rs：State 增加 zoom: f32（默认 1.0）与 pan: (i32, i32)；ZOOM_MIN = 0.25、ZOOM_MAX = 8.0；scaled()（钳到 1..16384，避免 0 宽位图）、iew_size()、set_zoom()/zoom_reset()/set_zoom_to()、pan_by()（一步 = 1/12 屏）；epaint 改走 paint_bitmap_at(..., pan)；界面加"缩放：N%"一行。
+- crates/qlr-app/src/app.rs：State 增加 zoom: f32（默认 1.0）与 pan: (i32, i32)；ZOOM_MIN = 0.25、ZOOM_MAX = 8.0；scaled()（钳到 1..16384，避免 0 宽位图）、iew_size()、set_zoom()/zoom_reset()/set_zoom_to()、pan_by()（一步 = 1/12 屏）；
+epaint 改走 paint_bitmap_at(..., pan)；界面加"缩放：N%"一行。
 - crates/qlr-platform/src/window.rs：新增 paint_bitmap_at(hwnd, w, h, bgra, offset_x, offset_y)——位图比客户区大的那一维按 offset 裁剪，小的那一维居中；paint_bitmap 变成 paint_bitmap_at(..., 0, 0)；顺带删掉不再被使用的私有 it_within。
 - crates/qlr-platform/src/hotkey.rs：NAV_KEYS（PageDown/PageUp/四个方向键/+/-）只在预览窗打开时旁听且**不吞键**；0 故意不旁听（会干扰打字），复位走托盘/命令行。
 - crates/qlr-core/src/ipc.rs + cli.rs：Action 加 ZoomIn/ZoomOut/ZoomReset/Pan{dx,dy}，命令行加 --zoom-in/--zoom-out/--zoom-reset/--pan <dx> <dy>（自动化用）。
@@ -732,7 +733,8 @@ workspace version 0.1.3 → **0.1.4**；`dist/qlrust-0.1.4-win64/`
   - 原尺寸：itmap 529x748 ink=3075，屏幕上 深色=212；
   - 放大两档：itmap 826x1169 ink=7387，深色=471（内容确实更大更清楚）；
   - 放大后平移：深色降到 139/0（文字被滚出可视区，符合预期）。
-- 端到端（工作目录外的 <桌面>\qlrust-0.1.7\）：令牌完整性=high、托盘 ect=(1683,1040)-(1707,1080)、ZOOM 1.00 -> 1.25 -> 1.56、RENDER gen=3 bitmap 826x1169 elapsed=2ms、PAN (0, 62)、--quit 后进程 0。
+- 端到端（工作目录外的 <桌面>\qlrust-0.1.7\）：令牌完整性=high、托盘 
+ect=(1683,1040)-(1707,1080)、ZOOM 1.00 -> 1.25 -> 1.56、RENDER gen=3 bitmap 826x1169 elapsed=2ms、PAN (0, 62)、--quit 后进程 0。
 - release exe **1,662,464 B（1.66 MB）**，VERSIONINFO 0.1.7.0。
 
 **交付物**：dist/qlrust-0.1.7-win64/{qlrust.exe, pdfium.dll, portable.lock, README.txt}；README 新增「0.1.7 改了什么」（缩放/平移、纯白修复、导航键不吞键）。
@@ -3306,3 +3308,55 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 
 改完 `sheet_layout`/`parse_sheet_index` 后截图仍是第 1 张表——`show.rs` 里两处**首帧渲染**都写死
 `request_render(p, w, h, 0)`，页号根本没传出去。改成传 `first_page` 才生效。
+
+## 2026-11-11 · 1.9.1：表格列宽/行高可拖拽调整（视图内生效）、数值列不再误画 `####`、竖直滚动条
+
+### 做了什么
+
+- `crates/qlr-core/src/sheet.rs`：`Cell` 增 `pub numeric: bool`——只有 `t` 缺省或 `t="n"` 才是数值，
+  放不下才该画 `####`；文本放不下要溢出/硬裁（SKU 那种 14 位编号在文件里是 `t="s"` 文本）。
+- `crates/qlr-render/src/sheet.rs`：解析器给 `numeric` 赋值；`####` 判定改成 `cell.numeric && looks_numeric(text)`。
+- `crates/qlr-platform/src/window/sheet.rs`：新增 `SheetSizes<'a> { col_extra, row_extra }`
+  （按列号/行号存**额外像素**，只影响这次预览、**不写回文件**；换表/换文件清空即回文件原样）、
+  `SheetDivider { is_col, index }`、`pub fn sheet_divider_at(...)`（表头分隔线命中，±`DIVIDER_GRAB = 4` px）、
+  `pub fn sheet_header_size()`（给壳层诊断日志用）。几何换算 `col_x/row_y/col_width/row_height/col_at/row_at/
+  content_size` 全部改走 `SheetSizes`；`paint_sheet`/`sheet_extent`/`sheet_cell_at` 各多一个 `sizes` 形参；
+  `visible_cols`/`visible_rows`/`visible_merges` 同步（合并区右/下边界跟着用户拖过的尺寸走）。
+- `crates/qlr-app`：`State` 增 `sheet_col_w` / `sheet_row_h` / `sheet_resize`（`SheetResize { is_col, index,
+  anchor, start_extra, base }`）；`WM_LBUTTONDOWN` 在"顶栏家具"之后、压缩条之前插 `sheet_resize_start`
+  （按在表头中间仍是想挪窗口），`WM_MOUSEMOVE` / `WM_LBUTTONUP` 各插一条；`set_content` 清空这两份 vec；
+  `repaint` 每帧组 `SheetSizes` 传下去（绘制期间不持 `STATE`，CONVENTIONS #128/#139）。
+- 表格竖直滚动条：`chrome.rs` 新增 `is_sheet_view()` / `sheet_scroll_info(area)` / `sheet_scroll_max(area)`
+  （单位是**像素**，不是行号）；`frame()` 的 `visible_bar` 给表格让出一条宽度；`apply_scroll_y` 支持拖滑块；
+  `repaint` 在 `paint_sheet` 之后画滚动条。
+
+### 为什么
+
+`####` 满屏的根因是两件事叠加：① 把 `t="s"` 的 SKU 文本当数字（真 bug，已修）；
+② 绘制端字体比 Excel 宽——仓库 `FONTS` 只有 14 档固定 `TextStyle`，非粗体一律按 Normal 画、忽略
+`CellStyle.size_dpt`，宋体 11pt 的窄数字被画得更宽，于是同样的 63 px 列 Excel 放得下、我们放不下。
+
+②要治得给 `crates/qlr-platform/src/window/text.rs` 加"按 (family, px, bold, italic) 缓存的动态字体"，
+改动面很大；用户提出更轻的一条路：**让人自己把列拖宽**。于是选择"视图内可调"而不是"精确字号"——
+预览器不该悄悄改用户文件，也不该为了字体精确度去动整个绘制层的字体系统。
+
+### 怎么验证
+
+- `cargo test --workspace --offline` **357 passed / 11 ignored / 0 failed**；
+  `cargo clippy --workspace --all-targets --offline -- -D warnings` 零输出；`cargo fmt --all -- --check` 干净。
+- 真机（`_bench\office2pdf\postdrag.ps1`：`PostMessage(WM_LBUTTONDOWN/UP)` + 分 8 步 `SetCursorPos`，
+  因为钩子按设计丢弃注入事件，见 CONVENTIONS #162）：拖列 A 分隔线 90 px → 日志
+  `SHEET-RESIZE 开始 列宽 0 base=68 extra=0 anchor=108` / `SHEET-RESIZE 结束 列宽 0 额外 90 px（文件原样 68）`，
+  截图 `_bench\sheet\drag5.png` 里 A 列宽了 90 px、右侧多露出一列；用户本人手动拖列宽/行高确认可用。
+- 竖直滚动条：同一张表的内容区从 880 px 收窄到 868 px（让出一条），截图
+  `_bench\sheet\monthly-scroll.png` 右侧出现滑块。
+
+### 踩到的坑（已进 CONVENTIONS #165 之外的坑见下）
+
+第一版用 `cursor_pos()`（屏幕坐标）记 `anchor`、`lparam`（客户区坐标）算位移，在本机 DPI 缩放屏上
+`GetCursorPos` 与 `SetCursorPos` 走的不是同一套像素，拖 90 px 变成 **+268 px**。改成两处都用 `lparam`
+的客户区坐标（`SheetResize::anchor` 的注释已写明"别换成屏幕坐标"）。
+
+自动化验证还踩了一个坑：一开始把"拖行高"的抓取点放在内容区 y=50，一直命不中——因为
+`real-monthly.xlsx` 的**第 0 行高 141 px**（表头行），行分隔线根本不在那儿。**抓取点要按实际行列尺寸算**，
+别按默认 20 px 猜。

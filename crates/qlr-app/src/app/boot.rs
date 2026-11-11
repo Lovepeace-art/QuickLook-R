@@ -817,8 +817,12 @@ pub(crate) unsafe extern "system" fn wndproc(
                     begin_resize(hwnd, edges, lparam);
                     return LRESULT(0);
                 }
-                // 2) 顶栏 / 目录 / 滚动条（1.0.9）：这些是"窗口的家具"。
+                // 2) 表格表头的分隔线（1.9.1）：拖列宽/行高。放在"家具"之后、
+                //    "拖窗口"之前——按在表头中间仍然是想挪窗口。
                 if on_chrome_click(hwnd, lparam) {
+                    return LRESULT(0);
+                }
+                if sheet_resize_start(hwnd, lparam) {
                     LRESULT(0)
                 } else if archive_click(hwnd, lparam) {
                     // 3) 压缩包行（1.7.3）：选中 + 目录折叠，不吃掉的话会变成拖窗口。
@@ -829,12 +833,20 @@ pub(crate) unsafe extern "system" fn wndproc(
                 }
             }
             WM_MOUSEMOVE => {
+                // 表格列宽/行高拖拽（1.9.1）：在拖就只干这件事，别再走悬停/平移。
+                if sheet_resize_move(lparam) {
+                    return LRESULT(0);
+                }
                 // 悬停只影响顶栏按钮与目录高亮，先更新再走手势分派。
                 update_hover(hwnd, lparam);
                 on_mouse_move(lparam);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                // 表格列宽/行高拖拽结束（1.9.1）：尺寸已经写进 state，这里只收尾。
+                if sheet_resize_end() {
+                    return LRESULT(0);
+                }
                 if with_state(|s| std::mem::replace(&mut s.scroll_drag, false)).unwrap_or(false) {
                     window::release_capture();
                 }

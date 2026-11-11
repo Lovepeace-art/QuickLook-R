@@ -50,6 +50,15 @@ const SCOPE: &str = "sheet";
 /// 表头（行号列 / 列号行）的固定宽高，与 Excel 的观感一致（DIP，绘制时按 DPI 换算）。
 pub const HEADER_W: i32 = 44;
 pub const HEADER_H: i32 = 20;
+/// 拖列宽/行高时，鼠标距分隔线多少像素内算"按在线上"（1.9.1）。
+pub const DIVIDER_GRAB: i32 = 4;
+
+/// 表头宽高（随 DPI 缩放）。给壳层的诊断日志用：拖列宽/行高"点了没反应"时，
+/// 先看这个值，再看命中点是不是落进了表头条里。
+pub fn sheet_header_size() -> (i32, i32) {
+    let m = Metrics::current();
+    (m.header_w, m.header_h)
+}
 
 /// 单元格内边距（DIP）。Excel 是 2–3 px，取 3。
 const CELL_PADDING: i32 = 3;
@@ -147,30 +156,42 @@ fn column_label(col: u32) -> String {
 }
 
 /// 可见列范围（含两端）。`skip` = 冻结列数：普通区不该重画冻结列。
-fn visible_cols(sheet: &Sheet, scroll_x: i32, view_w: i32, skip: u32) -> (u32, u32) {
+fn visible_cols(
+    sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
+    scroll_x: i32,
+    view_w: i32,
+    skip: u32,
+) -> (u32, u32) {
     if sheet.cols == 0 {
         return (0, 0);
     }
     let last_possible = sheet.cols.saturating_sub(1);
     let left = i64::from(scroll_x.max(0));
     let width = i64::from(view_w.max(0));
-    let first = sheet.col_at(left).max(skip).min(last_possible);
+    let first = sizes.col_at(sheet, left).max(skip).min(last_possible);
     let right_edge = left.saturating_add(width).saturating_sub(1).max(left);
-    let last = sheet.col_at(right_edge).clamp(first, last_possible);
+    let last = sizes.col_at(sheet, right_edge).clamp(first, last_possible);
     (first, last)
 }
 
 /// 可见行范围（含两端）。语义同 [`visible_cols`]。
-fn visible_rows(sheet: &Sheet, scroll_y: i32, view_h: i32, skip: u32) -> (u32, u32) {
+fn visible_rows(
+    sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
+    scroll_y: i32,
+    view_h: i32,
+    skip: u32,
+) -> (u32, u32) {
     if sheet.rows == 0 {
         return (0, 0);
     }
     let last_possible = sheet.rows.saturating_sub(1);
     let top = i64::from(scroll_y.max(0));
     let height = i64::from(view_h.max(0));
-    let first = sheet.row_at(top).max(skip).min(last_possible);
+    let first = sizes.row_at(sheet, top).max(skip).min(last_possible);
     let bottom_edge = top.saturating_add(height).saturating_sub(1).max(top);
-    let last = sheet.row_at(bottom_edge).clamp(first, last_possible);
+    let last = sizes.row_at(sheet, bottom_edge).clamp(first, last_possible);
     (first, last)
 }
 
@@ -553,6 +574,119 @@ fn check_sheet_health(sheet: &Sheet) {
 /// 为什么要拆区域而不是"画一遍再补冻结区"：冻结行列把内容切成 4 块，每块的
 /// 滚动偏移不同（冻结方向偏移为 0），拆开之后"裁剪"这件事交给 GDI（`IntersectClipRect`），
 /// 代码里不用写任何"这一格是否被冻结区盖住"的判断。
+/// 视图内的行列尺寸调整（1.9.1）：拖表头分隔线把某列拉宽 / 某行拉高。
+///
+/// **只影响这次预览**，不写回文件（预览器不改用户文件是硬规矩）。存的是
+/// **额外像素**而不是"新宽度"，这样文件自己改过的列宽仍然是基准，用户拖出来的
+/// 只是在这个基准上加的偏移——换工作表/换文件时清空即可回到文件原样。
+#[derive(Clone, Copy, Default)]
+pub struct SheetSizes<'a> {
+    pub col_extra: &'a [(u32, i32)],
+    pub row_extra: &'a [(u32, i32)],
+}
+
+impl<'a> SheetSizes<'a> {
+    /// 没有任何调整（常态）。
+    pub const EMPTY: SheetSizes<'static> = SheetSizes {
+        col_extra: &[],
+        row_extra: &[],
+    };
+
+    fn extra(list: &[(u32, i32)], index: u32) -> i32 {
+        list.iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, d)| *d)
+            .unwrap_or(0)
+    }
+
+    /// 索引 `index` **之前**所有调整的累计（把"额外宽度"换成"坐标偏移"）。
+    fn before(list: &[(u32, i32)], index: u32) -> i32 {
+        list.iter()
+            .filter(|(i, _)| *i < index)
+            .map(|(_, d)| *d)
+            .sum()
+    }
+
+    pub fn col_x(&self, sheet: &Sheet, col: u32) -> i64 {
+        sheet
+            .col_x(col)
+            .saturating_add(i64::from(Self::before(self.col_extra, col)))
+    }
+
+    pub fn row_y(&self, sheet: &Sheet, row: u32) -> i64 {
+        sheet
+            .row_y(row)
+            .saturating_add(i64::from(Self::before(self.row_extra, row)))
+    }
+
+    pub fn col_width(&self, sheet: &Sheet, col: u32) -> i32 {
+        let base = sheet.col_x(col.saturating_add(1)) - sheet.col_x(col);
+        px_i32(base)
+            .saturating_add(Self::extra(self.col_extra, col))
+            .max(0)
+    }
+
+    pub fn row_height(&self, sheet: &Sheet, row: u32) -> i32 {
+        let base = sheet.row_y(row.saturating_add(1)) - sheet.row_y(row);
+        px_i32(base)
+            .saturating_add(Self::extra(self.row_extra, row))
+            .max(0)
+    }
+
+    /// 内容坐标 → 列号（考虑调整；越界给最后一列）。
+    pub fn col_at(&self, sheet: &Sheet, x: i64) -> u32 {
+        // 先把 x 折回"文件坐标"：减去落在它左边的所有额外宽度，再二分。
+        let mut base = x;
+        for (col, delta) in self.col_extra {
+            if sheet.col_x(*col) <= base {
+                base = base.saturating_sub(i64::from(*delta));
+            } else {
+                break;
+            }
+        }
+        sheet.col_at(base)
+    }
+
+    /// 内容坐标 → 行号（考虑调整；越界给最后一行）。
+    pub fn row_at(&self, sheet: &Sheet, y: i64) -> u32 {
+        let mut base = y;
+        for (row, delta) in self.row_extra {
+            if sheet.row_y(*row) <= base {
+                base = base.saturating_sub(i64::from(*delta));
+            } else {
+                break;
+            }
+        }
+        sheet.row_at(base)
+    }
+
+    /// 总宽/总高（含所有调整，**不含**表头）。
+    pub fn content_size(&self, sheet: &Sheet) -> (i32, i32) {
+        let w = px_i32(sheet.width()).saturating_add(
+            self.col_extra
+                .iter()
+                .filter(|(i, _)| *i < sheet.cols)
+                .map(|(_, d)| *d)
+                .sum::<i32>(),
+        );
+        let h = px_i32(sheet.height()).saturating_add(
+            self.row_extra
+                .iter()
+                .filter(|(i, _)| *i < sheet.rows)
+                .map(|(_, d)| *d)
+                .sum::<i32>(),
+        );
+        (w.max(0), h.max(0))
+    }
+}
+
+/// 拖拽命中的表头分隔线：`is_col` 为真表示拖的是第 `index` 列的**右边线**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SheetDivider {
+    pub is_col: bool,
+    pub index: u32,
+}
+
 struct Region {
     clip: RECT,
     /// 可见行范围（含两端）
@@ -570,6 +704,8 @@ struct Region {
 struct Painter<'a> {
     hdc: HDC,
     sheet: &'a Sheet,
+    /// 视图内的行列尺寸调整（用户拖过分隔线才有内容）。
+    sizes: SheetSizes<'a>,
     m: Metrics,
     content: RECT,
     scroll_x: i32,
@@ -579,12 +715,20 @@ struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
-    fn new(hdc: HDC, sheet: &'a Sheet, content: RECT, scroll_x: i32, scroll_y: i32) -> Self {
+    fn new(
+        hdc: HDC,
+        sheet: &'a Sheet,
+        sizes: SheetSizes<'a>,
+        content: RECT,
+        scroll_x: i32,
+        scroll_y: i32,
+    ) -> Self {
         let m = Metrics::current();
-        let merges = visible_merges(sheet, &m, content, scroll_x, scroll_y);
+        let merges = visible_merges(sheet, &sizes, &m, content, scroll_x, scroll_y);
         Self {
             hdc,
             sheet,
+            sizes,
             m,
             content,
             scroll_x,
@@ -604,11 +748,11 @@ impl<'a> Painter<'a> {
     }
 
     fn frozen_w(&self) -> i32 {
-        px_i32(self.sheet.col_x(self.frozen_cols())).max(0)
+        px_i32(self.sizes.col_x(self.sheet, self.frozen_cols())).max(0)
     }
 
     fn frozen_h(&self) -> i32 {
-        px_i32(self.sheet.row_y(self.frozen_rows())).max(0)
+        px_i32(self.sizes.row_y(self.sheet, self.frozen_rows())).max(0)
     }
 
     /// 内容区（扣掉左上表头）。
@@ -625,7 +769,7 @@ impl<'a> Painter<'a> {
 
     fn col_left_screen_at(&self, body_left: i32, offset_x: i32, col: u32) -> i32 {
         body_left
-            .saturating_add(px_i32(self.sheet.col_x(col)))
+            .saturating_add(px_i32(self.sizes.col_x(self.sheet, col)))
             .saturating_sub(offset_x)
     }
 
@@ -634,9 +778,7 @@ impl<'a> Painter<'a> {
     }
 
     fn col_width_of(&self, col: u32) -> i32 {
-        let x0 = self.sheet.col_x(col);
-        let x1 = self.sheet.col_x(col.saturating_add(1));
-        px_i32(x1.saturating_sub(x0)).max(0)
+        self.sizes.col_width(self.sheet, col)
     }
 
     fn col_right_screen(&self, region: &Region, col: u32) -> i32 {
@@ -646,7 +788,7 @@ impl<'a> Painter<'a> {
 
     fn row_top_screen_at(&self, body_top: i32, offset_y: i32, row: u32) -> i32 {
         body_top
-            .saturating_add(px_i32(self.sheet.row_y(row)))
+            .saturating_add(px_i32(self.sizes.row_y(self.sheet, row)))
             .saturating_sub(offset_y)
     }
 
@@ -655,9 +797,7 @@ impl<'a> Painter<'a> {
     }
 
     fn row_height_of(&self, row: u32) -> i32 {
-        let y0 = self.sheet.row_y(row);
-        let y1 = self.sheet.row_y(row.saturating_add(1));
-        px_i32(y1.saturating_sub(y0)).max(0)
+        self.sizes.row_height(self.sheet, row)
     }
 
     fn row_bottom_screen(&self, region: &Region, row: u32) -> i32 {
@@ -675,22 +815,31 @@ impl<'a> Painter<'a> {
     }
 
     fn merge_box(&self, region: &Region, merge: &Merge) -> RECT {
-        let (x, y, w, h) = self.sheet.merge_rect(merge);
+        // 合并区自己按尺寸换算（不能直接用 `Sheet::merge_rect`：它算的是文件坐标，
+        // 用户拖过列宽之后右/下边界要跟着走）。
         let left = self
             .m
             .body_left(self.content)
-            .saturating_add(px_i32(x))
+            .saturating_add(px_i32(self.sizes.col_x(self.sheet, merge.col)))
             .saturating_sub(region.offset_x);
         let top = self
             .m
             .body_top(self.content)
-            .saturating_add(px_i32(y))
+            .saturating_add(px_i32(self.sizes.row_y(self.sheet, merge.row)))
             .saturating_sub(region.offset_y);
+        let mut w = 0i32;
+        for col in merge.col..merge.col.saturating_add(merge.cols) {
+            w = w.saturating_add(self.sizes.col_width(self.sheet, col));
+        }
+        let mut h = 0i32;
+        for row in merge.row..merge.row.saturating_add(merge.rows) {
+            h = h.saturating_add(self.sizes.row_height(self.sheet, row));
+        }
         RECT {
             left,
             top,
-            right: left.saturating_add(px_i32(w).max(0)),
-            bottom: top.saturating_add(px_i32(h).max(0)),
+            right: left.saturating_add(w.max(0)),
+            bottom: top.saturating_add(h.max(0)),
         }
     }
 
@@ -739,12 +888,14 @@ impl<'a> Painter<'a> {
                 clip,
                 rows: visible_rows(
                     self.sheet,
+                    &self.sizes,
                     self.scroll_y,
                     clip.bottom - clip.top,
                     frozen_rows,
                 ),
                 cols: visible_cols(
                     self.sheet,
+                    &self.sizes,
                     self.scroll_x,
                     clip.right - clip.left,
                     frozen_cols,
@@ -766,6 +917,7 @@ impl<'a> Painter<'a> {
                 rows: (0, frozen_rows.saturating_sub(1)),
                 cols: visible_cols(
                     self.sheet,
+                    &self.sizes,
                     self.scroll_x,
                     clip.right - clip.left,
                     frozen_cols,
@@ -786,6 +938,7 @@ impl<'a> Painter<'a> {
                 clip,
                 rows: visible_rows(
                     self.sheet,
+                    &self.sizes,
                     self.scroll_y,
                     clip.bottom - clip.top,
                     frozen_rows,
@@ -915,7 +1068,13 @@ impl<'a> Painter<'a> {
                 right: strip.right,
                 bottom: strip.bottom,
             };
-            let cols = visible_cols(self.sheet, self.scroll_x, clip.right - clip.left, frozen);
+            let cols = visible_cols(
+                self.sheet,
+                &self.sizes,
+                self.scroll_x,
+                clip.right - clip.left,
+                frozen,
+            );
             self.draw_column_labels(cols, self.scroll_x, clip, body_left);
         }
         // 冻结列（不动），后画
@@ -946,7 +1105,13 @@ impl<'a> Painter<'a> {
                 right: strip.right,
                 bottom: strip.bottom,
             };
-            let rows = visible_rows(self.sheet, self.scroll_y, clip.bottom - clip.top, frozen);
+            let rows = visible_rows(
+                self.sheet,
+                &self.sizes,
+                self.scroll_y,
+                clip.bottom - clip.top,
+                frozen,
+            );
             self.draw_row_labels(rows, self.scroll_y, clip, body_top);
         }
         if fh > 0 && frozen > 0 {
@@ -1359,8 +1524,12 @@ impl<'a> Painter<'a> {
             draw_text_font(self.hdc, font, area, text, rgb, base);
             return;
         }
-        // 放不下：数字 → `####`（Excel 的语义是"这一格显示不了这个数"）
-        if looks_numeric(text) {
+        // 放不下：**数值**格才给 `####`（Excel 的语义是"这一列太窄，装不下这个数"）。
+        //
+        // 只按文字内容猜是不够的：SKU 那种 `10052953469532` 在文件里是**文本**
+        // （`t="s"`），Excel 对文本从不画 `####`（右侧空就溢出、右侧有内容就硬裁）。
+        // 1.9.0 实测：整列 SKU 被判成数字后全屏 `####`，用户等于看不到数据。
+        if cell.numeric && looks_numeric(text) {
             let fill = hash_fill(self.hdc, font, avail);
             draw_text_font(self.hdc, font, area, &fill, rgb, base);
             return;
@@ -1399,6 +1568,7 @@ impl<'a> Painter<'a> {
 /// 只有真正可能出现在屏幕上的合并区（进 `Painter` 前筛一遍）。
 fn visible_merges(
     sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
     m: &Metrics,
     content: RECT,
     scroll_x: i32,
@@ -1416,7 +1586,18 @@ fn visible_merges(
         .iter()
         .copied()
         .filter(|merge| {
-            let (x, y, w, h) = sheet.merge_rect(merge);
+            let x = sizes.col_x(sheet, merge.col);
+            let y = sizes.row_y(sheet, merge.row);
+            let mut w = 0i32;
+            for col in merge.col..merge.col.saturating_add(merge.cols) {
+                w = w.saturating_add(sizes.col_width(sheet, col));
+            }
+            let mut h = 0i32;
+            for row in merge.row..merge.row.saturating_add(merge.rows) {
+                h = h.saturating_add(sizes.row_height(sheet, row));
+            }
+            let w = i64::from(w);
+            let h = i64::from(h);
             w > 0 && h > 0 && x < x_max && x + w > 0 && y < y_max && y + h > 0
         })
         .collect()
@@ -1544,10 +1725,11 @@ fn hash_fill(hdc: HDC, font: HFONT, avail: i32) -> String {
 /// 返回值**不小于视口**：表比窗口小时没有可滚动的量（`extent - view <= 0`），
 /// 壳层可以直接拿差值当滚动上限。与 [`sheet_cell_at`] 用同一套
 /// [`Metrics`]，两者不会出现"滚动到最底还差几像素"的错位。
-pub fn sheet_extent(sheet: &Sheet, view_w: i32, view_h: i32) -> (i32, i32) {
+pub fn sheet_extent(sheet: &Sheet, sizes: &SheetSizes<'_>, view_w: i32, view_h: i32) -> (i32, i32) {
     let m = Metrics::current();
-    let w = i64::from(m.header_w).saturating_add(sheet.width());
-    let h = i64::from(m.header_h).saturating_add(sheet.height());
+    let (content_w, content_h) = sizes.content_size(sheet);
+    let w = i64::from(m.header_w).saturating_add(i64::from(content_w));
+    let h = i64::from(m.header_h).saturating_add(i64::from(content_h));
     (px_i32(w).max(view_w.max(0)), px_i32(h).max(view_h.max(0)))
 }
 
@@ -1559,6 +1741,7 @@ pub fn sheet_extent(sheet: &Sheet, view_w: i32, view_h: i32) -> (i32, i32) {
 ///   调用方要整块矩形可以用 `Sheet::merge_at` / `merge_rect`。
 pub fn sheet_cell_at(
     sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
     scroll_x: i32,
     scroll_y: i32,
     px: i32,
@@ -1573,8 +1756,8 @@ pub fn sheet_cell_at(
     }
     let body_x = i64::from(px).saturating_sub(i64::from(m.header_w));
     let body_y = i64::from(py).saturating_sub(i64::from(m.header_h));
-    let frozen_w = sheet.col_x(sheet.frozen_cols.min(sheet.cols));
-    let frozen_h = sheet.row_y(sheet.frozen_rows.min(sheet.rows));
+    let frozen_w = sizes.col_x(sheet, sheet.frozen_cols.min(sheet.cols));
+    let frozen_h = sizes.row_y(sheet, sheet.frozen_rows.min(sheet.rows));
     let content_x = if body_x < frozen_w {
         body_x
     } else {
@@ -1585,8 +1768,8 @@ pub fn sheet_cell_at(
     } else {
         body_y.saturating_add(i64::from(scroll_y.max(0)))
     };
-    let col = sheet.col_at(content_x);
-    let row = sheet.row_at(content_y);
+    let col = sizes.col_at(sheet, content_x);
+    let row = sizes.row_at(sheet, content_y);
     if row >= sheet.rows || col >= sheet.cols {
         return None;
     }
@@ -1600,6 +1783,62 @@ pub fn sheet_cell_at(
     Some((row as usize, col as usize))
 }
 
+/// 表头分隔线命中测试（1.9.1）：用户拖列宽/行高时，先问这里"按在哪条线上"。
+///
+/// - 只有按在**列号条**（顶部 `header_h` 高）或**行号条**（左侧 `header_w` 宽）上才算——
+///   内容区里按下去是选格子，不该改尺寸；
+/// - 容差 `DIVIDER_GRAB` 像素（线两侧各算），太窄了鼠标根本对不准；
+/// - `px`/`py` 是相对 content 左上角的坐标，与 [`sheet_cell_at`] 同一套口径；
+/// - 返回的 `index` 是"第 index 列的右边线"（`is_col = true`）或"第 index 行的下边线"。
+pub fn sheet_divider_at(
+    sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
+    scroll_x: i32,
+    scroll_y: i32,
+    px: i32,
+    py: i32,
+) -> Option<SheetDivider> {
+    if sheet.cols == 0 || sheet.rows == 0 || px < 0 || py < 0 {
+        return None;
+    }
+    let m = Metrics::current();
+    let grab = DIVIDER_GRAB;
+
+    // 列号条：找最近的列右边界
+    if py < m.header_h && px >= m.header_w {
+        let body_x = i64::from(px - m.header_w).saturating_add(i64::from(scroll_x.max(0)));
+        let near = sizes.col_at(sheet, body_x);
+        for col in near.saturating_sub(1)..=near.min(sheet.cols.saturating_sub(1)) {
+            let edge = sizes.col_x(sheet, col.saturating_add(1));
+            if (body_x - edge).unsigned_abs() as i32 <= grab {
+                return Some(SheetDivider {
+                    is_col: true,
+                    index: col,
+                });
+            }
+        }
+        return None;
+    }
+
+    // 行号条：找最近的行下边界
+    if px < m.header_w && py >= m.header_h {
+        let body_y = i64::from(py - m.header_h).saturating_add(i64::from(scroll_y.max(0)));
+        let near = sizes.row_at(sheet, body_y);
+        for row in near.saturating_sub(1)..=near.min(sheet.rows.saturating_sub(1)) {
+            let edge = sizes.row_y(sheet, row.saturating_add(1));
+            if (body_y - edge).unsigned_abs() as i32 <= grab {
+                return Some(SheetDivider {
+                    is_col: false,
+                    index: row,
+                });
+            }
+        }
+        return None;
+    }
+
+    None
+}
+
 /// 画一张工作表。
 ///
 /// `scroll_x`/`scroll_y` 是"内容已经滚走的像素"，由壳层维护；`content` 是扣除边框和
@@ -1611,6 +1850,7 @@ pub fn paint_sheet(
     chrome: Option<&Chrome<'_>>,
     content: Option<RECT>,
     sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
     scroll_x: i32,
     scroll_y: i32,
 ) {
@@ -1640,7 +1880,7 @@ pub fn paint_sheet(
     let content = intersect_rect(content.unwrap_or(after_chrome), rc);
     if content.right > content.left && content.bottom > content.top {
         check_sheet_health(sheet);
-        Painter::new(hdc, sheet, content, scroll_x, scroll_y).paint();
+        Painter::new(hdc, sheet, *sizes, content, scroll_x, scroll_y).paint();
     }
 
     if let Some(buf) = &buffer {
@@ -1683,6 +1923,9 @@ mod tests {
             col,
             text: text.to_string(),
             style: CellStyle::default(),
+            // 测试里的格子当"文本"用：真实解析器按 `t` 属性给这个位，
+            // 猜内容会出错（SKU 是长数字但属于文本）。
+            numeric: false,
         }
     }
 
@@ -1734,24 +1977,24 @@ mod tests {
     fn visible_window_tracks_scroll_and_frozen_skip() {
         let s = wide_sheet();
         // 300 px 宽 / 50 px 一列 → 第 0..=5 列（第 5 列右边界正好 300）
-        assert_eq!(visible_cols(&s, 0, 300, 0), (0, 5));
+        assert_eq!(visible_cols(&s, &SheetSizes::EMPTY, 0, 300, 0), (0, 5));
         // 滚走 125 px：从第 2 列开始；125+299=424 → 第 8 列
-        assert_eq!(visible_cols(&s, 125, 300, 0), (2, 8));
+        assert_eq!(visible_cols(&s, &SheetSizes::EMPTY, 125, 300, 0), (2, 8));
         // 冻结列不重复画
-        assert_eq!(visible_cols(&s, 0, 300, 3), (3, 5));
+        assert_eq!(visible_cols(&s, &SheetSizes::EMPTY, 0, 300, 3), (3, 5));
         // 100 px 高 / 20 px 一行 → 第 0..=4 行
-        assert_eq!(visible_rows(&s, 0, 100, 0), (0, 4));
-        assert_eq!(visible_rows(&s, 0, 100, 2), (2, 4));
+        assert_eq!(visible_rows(&s, &SheetSizes::EMPTY, 0, 100, 0), (0, 4));
+        assert_eq!(visible_rows(&s, &SheetSizes::EMPTY, 0, 100, 2), (2, 4));
         // 滚到底：不越界（1000 行 × 20 px = 20000，滚到上限 19900 时正好露出最后 5 行）
-        let (first, last) = visible_rows(&s, 19_900, 100, 0);
+        let (first, last) = visible_rows(&s, &SheetSizes::EMPTY, 19_900, 100, 0);
         assert_eq!((first, last), (995, 999));
         // 滚过头（壳层算大）：仍然夹在最后一行，不越界
-        let (first, last) = visible_rows(&s, 99_000, 100, 0);
+        let (first, last) = visible_rows(&s, &SheetSizes::EMPTY, 99_000, 100, 0);
         assert_eq!((first, last), (999, 999));
         // 空表不 panic
         let empty = Sheet::default();
-        assert_eq!(visible_cols(&empty, 0, 300, 0), (0, 0));
-        assert_eq!(visible_rows(&empty, 0, 100, 0), (0, 0));
+        assert_eq!(visible_cols(&empty, &SheetSizes::EMPTY, 0, 300, 0), (0, 0));
+        assert_eq!(visible_rows(&empty, &SheetSizes::EMPTY, 0, 100, 0), (0, 0));
     }
 
     #[test]
@@ -1815,19 +2058,22 @@ mod tests {
         let m = Metrics::current();
         // extent = 表头 + 内容，且不小于视口
         assert_eq!(
-            sheet_extent(&s, 0, 0),
+            sheet_extent(&s, &SheetSizes::EMPTY, 0, 0),
             (
                 m.header_w + px_i32(s.width()),
                 m.header_h + px_i32(s.height())
             )
         );
-        assert_eq!(sheet_extent(&s, 5_000, 5_000), (5_000, 5_000));
+        assert_eq!(
+            sheet_extent(&s, &SheetSizes::EMPTY, 5_000, 5_000),
+            (5_000, 5_000)
+        );
         // 每格中心都要能命中回自己
         for row in 0..s.rows {
             for col in 0..s.cols {
                 let px = m.header_w + px_i32(s.col_x(col)) + 1;
                 let py = m.header_h + px_i32(s.row_y(row)) + 1;
-                let hit = sheet_cell_at(&s, 0, 0, px, py);
+                let hit = sheet_cell_at(&s, &SheetSizes::EMPTY, 0, 0, px, py);
                 // 合并区会被换算到左上角（0,1）
                 let expected = if s.covered_by_merge(row, col) || (row, col) == (0, 1) {
                     (0usize, 1usize)
@@ -1839,11 +2085,11 @@ mod tests {
         }
         // 表头区域不命中
         assert_eq!(
-            sheet_cell_at(&s, 0, 0, m.header_w - 1, m.header_h + 3),
+            sheet_cell_at(&s, &SheetSizes::EMPTY, 0, 0, m.header_w - 1, m.header_h + 3),
             None
         );
         assert_eq!(
-            sheet_cell_at(&s, 0, 0, m.header_w + 3, m.header_h - 1),
+            sheet_cell_at(&s, &SheetSizes::EMPTY, 0, 0, m.header_w + 3, m.header_h - 1),
             None
         );
         // 滚动之后同一格仍然能命中（要按"冻结区不滚动"的规则反推坐标）
@@ -1851,12 +2097,19 @@ mod tests {
         let px = m.header_w + px_i32(s.col_x(2)) - scroll + 1;
         // (0,2) 被合并区 (0,1,2×2) 盖住 → 命中换算成左上角 (0,1)
         assert_eq!(
-            sheet_cell_at(&s, scroll, 0, px, m.header_h + 1),
+            sheet_cell_at(&s, &SheetSizes::EMPTY, scroll, 0, px, m.header_h + 1),
             Some((0, 1))
         );
         // 滚到最后一格：不越界（2×2 的合并区把整表右下角都吃掉了 → 仍回到左上角）
         assert_eq!(
-            sheet_cell_at(&s, 10_000, 10_000, m.header_w + 1, m.header_h + 1),
+            sheet_cell_at(
+                &s,
+                &SheetSizes::EMPTY,
+                10_000,
+                10_000,
+                m.header_w + 1,
+                m.header_h + 1
+            ),
             Some((0, 1))
         );
     }
@@ -1901,9 +2154,18 @@ mod tests {
     fn degenerate_sheets_degrade_instead_of_panicking() {
         let empty = Sheet::default();
         let m = Metrics::current();
-        assert_eq!(sheet_extent(&empty, 0, 0), (m.header_w, m.header_h));
-        assert_eq!(sheet_cell_at(&empty, 0, 0, 100, 100), None);
-        assert_eq!(sheet_cell_at(&empty, 0, 0, -5, -5), None);
+        assert_eq!(
+            sheet_extent(&empty, &SheetSizes::EMPTY, 0, 0),
+            (m.header_w, m.header_h)
+        );
+        assert_eq!(
+            sheet_cell_at(&empty, &SheetSizes::EMPTY, 0, 0, 100, 100),
+            None
+        );
+        assert_eq!(
+            sheet_cell_at(&empty, &SheetSizes::EMPTY, 0, 0, -5, -5),
+            None
+        );
         // 冻结数与行列数不一致（坏解析）：不会 panic
         let mut odd = Sheet {
             cols: 2,
@@ -1915,18 +2177,28 @@ mod tests {
             ..Default::default()
         };
         odd.cells = vec![cell(99, 99, "越界")];
-        assert!(sheet_extent(&odd, 0, 0).0 >= 0);
+        assert!(sheet_extent(&odd, &SheetSizes::EMPTY, 0, 0).0 >= 0);
         // 落在表头里 → None（表头不是内容）
-        assert_eq!(sheet_cell_at(&odd, 0, 0, 3, 3), None);
+        assert_eq!(sheet_cell_at(&odd, &SheetSizes::EMPTY, 0, 0, 3, 3), None);
         // 内容区里点第一格：行高表是空的 → 所有行都是 0 高，`row_at` 只能夹到最后一行
         // （数据模型的既定行为；绘制不 panic，`check_sheet_health` 会告警"行高数目不一致"）
         assert_eq!(
-            sheet_cell_at(&odd, 0, 0, m.header_w + 1, m.header_h + 1),
+            sheet_cell_at(
+                &odd,
+                &SheetSizes::EMPTY,
+                0,
+                0,
+                m.header_w + 1,
+                m.header_h + 1
+            ),
             Some((1, 0))
         );
         // 极端滚动偏移（壳层算错）也只是不命中，不能 panic
-        assert!(sheet_cell_at(&odd, i32::MAX, i32::MAX, 100, 100).is_some());
-        assert_eq!(sheet_cell_at(&odd, i32::MIN, i32::MIN, 0, 0), None);
+        assert!(sheet_cell_at(&odd, &SheetSizes::EMPTY, i32::MAX, i32::MAX, 100, 100).is_some());
+        assert_eq!(
+            sheet_cell_at(&odd, &SheetSizes::EMPTY, i32::MIN, i32::MIN, 0, 0),
+            None
+        );
     }
 
     #[test]

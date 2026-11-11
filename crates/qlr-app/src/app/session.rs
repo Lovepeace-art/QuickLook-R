@@ -126,6 +126,25 @@ impl Hwnd {
     }
 }
 
+/// 正在拖的表格分隔线（1.9.1）。
+///
+/// `extra` 存的是"比文件原样多出多少像素"，所以拖动过程只需要
+/// `start_extra + 鼠标位移`；抬起来就停在那个值上，换文件/换表清空即回原样。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SheetResize {
+    /// `true` = 拖列宽（列号条上的竖线），`false` = 拖行高（行号条上的横线）。
+    pub(crate) is_col: bool,
+    /// 列的序号（`is_col` 为真）或行的序号。
+    pub(crate) index: u32,
+    /// 拖动起点（**客户区**坐标，列取 x、行取 y）：和 `WM_MOUSEMOVE` 的
+    /// `lparam` 同一套坐标系，差值就是真实位移（别换成屏幕坐标，DPI 缩放下会翻倍）。
+    pub(crate) anchor: i32,
+    /// 起点时刻的额外像素（上次拖完留下的值，可能非 0）。
+    pub(crate) start_extra: i32,
+    /// 文件原样的宽度/高度，用来兜住"别拖成负数"。
+    pub(crate) base: i32,
+}
+
 pub(crate) struct State {
     pub(crate) config: Config,
     pub(crate) host: Hwnd,
@@ -158,6 +177,13 @@ pub(crate) struct State {
     pub(crate) scroll: usize,
     /// 表格的滚动偏移（像素，`(x, y)`）：表格是二维滚动，跟文本的"第几行"不是一套。
     pub(crate) sheet_scroll: (i32, i32),
+    /// 表格的视图内列宽调整（1.9.1）：`(列号, 额外像素)`。只影响这次预览，
+    /// **不写回文件**——预览器不该悄悄改用户的东西。
+    pub(crate) sheet_col_w: Vec<(u32, i32)>,
+    /// 表格的视图内行高调整（1.9.1），语义同 `sheet_col_w`。
+    pub(crate) sheet_row_h: Vec<(u32, i32)>,
+    /// 正在拖的表格分隔线（1.9.1）：`None` = 没在拖。
+    pub(crate) sheet_resize: Option<SheetResize>,
     /// 上次绘制时当前窗口吃掉了多少**原始行**（折行后一屏 ≠ 一屏原始行）。
     /// 翻页按它前进，否则折行会让 PageDown 漏掉大半屏内容。
     pub(crate) wrapped_consumed: usize,
@@ -343,6 +369,9 @@ impl State {
             zoom: 1.0,
             scroll: 0,
             sheet_scroll: (0, 0),
+            sheet_col_w: Vec::new(),
+            sheet_row_h: Vec::new(),
+            sheet_resize: None,
             wrapped_consumed: 0,
             natural: None,
             base: None,
@@ -690,6 +719,10 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.toc_scroll = 0;
         // 1.9.0：表格是二维像素滚动，换文件同样归零（否则新表从上一张表滚到的位置开始）。
         s.sheet_scroll = (0, 0);
+        // 1.9.1：视图内拖过的列宽/行高只属于上一个文件，换文件一律回原样。
+        s.sheet_col_w.clear();
+        s.sheet_row_h.clear();
+        s.sheet_resize = None;
         // 折行缓存是按"行号"存的，换内容必须整本作废（否则会拿旧文件的折行结果画新文件）。
         s.wrap_cache.clear();
         if let Some(surface) = surface {

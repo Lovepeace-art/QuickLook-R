@@ -130,6 +130,15 @@ pub struct Cell {
     pub col: u32,
     pub text: String,
     pub style: CellStyle,
+    /// 这一格在文件里是**数值**（`t` 缺省或 `t="n"`），而不是文本。
+    ///
+    /// 绘制端靠它决定"放不下时怎么办"，这条区别和 Excel 一致：
+    /// - 数值放不下 → 显示 `####`（Excel 的"这一列太窄，装不下这个数"）；
+    /// - 文本放不下 → 溢出到右侧空格，或硬裁（Excel 从不给文本画 `####`）。
+    ///
+    /// 光看字符串内容猜不出来：SKU 那种 `10052953469532` 是**文本**，
+    /// 猜成数值就会把一列 SKU 全画成 `####`（1.9.0 实测踩过）。
+    pub numeric: bool,
 }
 
 /// 合并区域：`(row, col)` 是左上角，`rows`/`cols` 是跨度（≥1）。
@@ -310,12 +319,14 @@ mod tests {
                     col: 0,
                     text: "A1".into(),
                     style: CellStyle::default(),
+                    numeric: false,
                 },
                 Cell {
                     row: 1,
                     col: 2,
                     text: "C2".into(),
                     style: CellStyle::default(),
+                    numeric: false,
                 },
             ],
             merges: vec![Merge {

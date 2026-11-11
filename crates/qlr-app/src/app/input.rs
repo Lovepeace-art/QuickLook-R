@@ -338,7 +338,14 @@ pub(crate) fn sheet_scroll_by(dx: i32, dy: i32) -> bool {
     let layout = frame(preview.raw());
     let view_w = (layout.content.right - layout.content.left).max(1);
     let view_h = (layout.content.bottom - layout.content.top).max(1);
-    let (extent_w, extent_h) = window::sheet_extent(sheet, view_w, view_h);
+    // 视图内拖过列宽/行高之后，内容范围跟着变（1.9.1）：拷一份小 vec 再算上限。
+    let (col_extra, row_extra) =
+        with_state(|s| (s.sheet_col_w.clone(), s.sheet_row_h.clone())).unwrap_or_default();
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    let (extent_w, extent_h) = window::sheet_extent(sheet, &sizes, view_w, view_h);
     let max_x = (extent_w - view_w).max(0);
     let max_y = (extent_h - view_h).max(0);
     let (cur_x, cur_y) = with_state(|s| s.sheet_scroll).unwrap_or((0, 0));
@@ -361,6 +368,171 @@ pub(crate) fn sheet_scroll_by(dx: i32, dy: i32) -> bool {
 ///
 /// 目录一屏放不下时，滚轮在目录上就滚目录；放得下就返回 false，让给正文
 /// （否则"目录只有 5 条"的文件滚轮会失效，看起来像坏了）。
+/// 表格列宽/行高拖拽（1.9.1）：按下时先看有没有落在表头分隔线上。
+///
+/// 只有真落在分隔线（`window::DIVIDER_GRAB` 像素内）才接管，否则返回 `false`，
+/// 让上层继续走"拖动整窗"——用户按在表头中间是想挪窗口，不是想改列宽。
+pub(crate) fn sheet_resize_start(hwnd: HWND, lparam: LPARAM) -> bool {
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(sheet) = doc.sheet() else {
+        return false;
+    };
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let (mx, my) = client_xy(lparam);
+    let (sx, sy, col_extra, row_extra) = with_state(|s| {
+        (
+            s.sheet_scroll.0,
+            s.sheet_scroll.1,
+            s.sheet_col_w.clone(),
+            s.sheet_row_h.clone(),
+        )
+    })
+    .unwrap_or((0, 0, Vec::new(), Vec::new()));
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    // 命中测试用的是**客户区坐标**，而 `paint_sheet` 画的是内容区：内容区左上
+    // 就是客户区左上（顶栏在内容区之上，`layout.content.top` 已经是顶栏下沿），
+    // 所以这里只需减掉内容区原点。
+    let layout = frame(preview.raw());
+    let px = mx - layout.content.left;
+    let py = my - layout.content.top;
+    // 1.9.1 埋点：拖列宽/行高"点了没反应"时看这一条——是坐标算错了还是没命中分隔线。
+    let (hw, hh) = window::sheet_header_size();
+    log_debug!(
+        SCOPE,
+        "SHEET-RESIZE 候选 客户区 ({},{}) 内容 ({},{}) 表头 {w}x{h} 行0高 {} 行0底 {} 滚动 ({},{})",
+        mx,
+        my,
+        px,
+        py,
+        sizes.row_height(sheet, 0),
+        sheet.row_y(1),
+        sx,
+        sy,
+        w = hw,
+        h = hh
+    );
+    let Some(divider) = window::sheet_divider_at(sheet, &sizes, sx, sy, px, py) else {
+        return false;
+    };
+    // 文件原样的宽/高（不含用户拖出来的额外像素）：拖拽下限要用它。
+    let base = if divider.is_col {
+        px_of(sheet.col_x(divider.index + 1) - sheet.col_x(divider.index))
+    } else {
+        px_of(sheet.row_y(divider.index + 1) - sheet.row_y(divider.index))
+    };
+    let current = if divider.is_col {
+        sizes.col_width(sheet, divider.index)
+    } else {
+        sizes.row_height(sheet, divider.index)
+    };
+    let start_extra = current - base;
+    // 起点与后续位移都用**客户区坐标**（`lparam`）：两处同一套坐标系，
+    // 差值才是真实位移。1.9.1 曾用 `cursor_pos()` 取屏幕坐标，碰上 DPI 缩放
+    // 屏（GetCursorPos 与 SetCursorPos 走的不是同一套物理/逻辑像素）差出 3 倍，
+    // 拖 90 px 会变成 +268 px。
+    let anchor = if divider.is_col { mx } else { my };
+    with_state(|s| {
+        s.sheet_resize = Some(crate::app::session::SheetResize {
+            is_col: divider.is_col,
+            index: divider.index,
+            anchor,
+            start_extra,
+            base,
+        });
+    });
+    window::set_capture(hwnd);
+    log_debug!(
+        SCOPE,
+        "SHEET-RESIZE 开始 {} {} base={} extra={} anchor={}",
+        if divider.is_col { "列宽" } else { "行高" },
+        divider.index,
+        base,
+        start_extra,
+        anchor
+    );
+    true
+}
+
+/// 拖动中：按鼠标位移改 `(列号, 额外像素)`。返回是否在拖表格分隔线。
+pub(crate) fn sheet_resize_move(lparam: LPARAM) -> bool {
+    let Some(resize) = with_state(|s| s.sheet_resize).flatten() else {
+        return false;
+    };
+    // 与 `sheet_resize_start` 同一套坐标系（客户区），别换成 `cursor_pos()`。
+    let (mx, my) = client_xy(lparam);
+    let pos = if resize.is_col { mx } else { my };
+    // 下限：留 `MIN_SHEET_SIZE` 像素，否则列被拖到 0 之后就再也点不到分隔线了。
+    let extra = (resize.start_extra + (pos - resize.anchor)).max(MIN_SHEET_SIZE - resize.base);
+    with_state(|s| {
+        let list = if resize.is_col {
+            &mut s.sheet_col_w
+        } else {
+            &mut s.sheet_row_h
+        };
+        set_extra(list, resize.index, extra);
+    });
+    if let Some(preview) = with_state(|s| s.preview) {
+        window::invalidate(preview.raw());
+    }
+    true
+}
+
+/// 拖动结束：记住最终尺寸（已经在 state 里），松开鼠标捕获。
+pub(crate) fn sheet_resize_end() -> bool {
+    let resize = with_state(|s| s.sheet_resize.take()).flatten();
+    let Some(resize) = resize else {
+        return false;
+    };
+    window::release_capture();
+    let extra = with_state(|s| {
+        let list = if resize.is_col {
+            &s.sheet_col_w
+        } else {
+            &s.sheet_row_h
+        };
+        list.iter()
+            .find(|(index, _)| *index == resize.index)
+            .map(|(_, extra)| *extra)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0);
+    log_debug!(
+        SCOPE,
+        "SHEET-RESIZE 结束 {} {} 额外 {} px（文件原样 {}）",
+        if resize.is_col { "列宽" } else { "行高" },
+        resize.index,
+        extra,
+        resize.base
+    );
+    true
+}
+
+/// 写入一条 `(索引, 额外像素)`：有就改、没有就按索引插到合适位置（保持升序）。
+/// `i64` 像素差 → `i32`（越界按 0 处理，表头的宽高不可能是负的）。
+fn px_of(v: i64) -> i32 {
+    v.clamp(0, i32::MAX as i64) as i32
+}
+
+/// 列宽/行高的下限：拖到 0 就再也点不到分隔线了，留一条缝。
+const MIN_SHEET_SIZE: i32 = 12;
+
+fn set_extra(list: &mut Vec<(u32, i32)>, index: u32, extra: i32) {
+    match list.binary_search_by_key(&index, |(i, _)| *i) {
+        Ok(at) => list[at].1 = extra,
+        Err(at) => list.insert(at, (index, extra)),
+    }
+}
+
 pub(crate) fn scroll_toc_by(notches: isize) -> bool {
     let Some(preview) = with_state(|s| s.preview) else {
         return false;

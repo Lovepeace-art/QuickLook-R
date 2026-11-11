@@ -1,5 +1,8 @@
 # 进度（STATUS）
-> 更新时间：2026-11-10 · **表格（xlsx）改内置原生渲染，摆脱 Office 安装依赖**：新增 `Kind::Sheet`
+
+> 更新时间：2026-11-11 · **表格列宽/行高可拖拽调整（视图内生效）+ 数值列不再误画 `####` + 竖直滚动条**：`qlr-core::sheet::Cell` 增 `numeric`（只有 `t` 缺省/`t="n"` 才是数值，文本放不下走溢出/硬裁）；`qlr-platform::window::sheet` 新增 `SheetSizes`（按列号/行号存**额外像素**，只影响本次预览、**不写回文件**）、`sheet_divider_at`（表头分隔线 ±4 px）、`sheet_header_size()`，几何换算与命中测试全部改走它；`qlr-app` 在 `WM_LBUTTONDOWN` 插 `sheet_resize_start`、`WM_MOUSEMOVE`/`WM_LBUTTONUP` 各插一条，`set_content` 清空；表格竖直滚动条按**像素**画（`sheet_scroll_info`/`sheet_scroll_max`，`frame()` 为其让宽）。回归 `cargo test` **357 passed / 0 failed**、fmt/clippy 零输出、`verify-sheet` **10 PASS**、`verify-office` **23 PASS**、`smoke` 16 PASS·1 SKIP。明细见 LOG。
+
+> 更新时间：2026-11-10 · **表格（xlsx）改内置原生渲染，摆脱 Office 安装依赖**：新增 `Kind::Sheet`
 > + `qlr-core::sheet` 数据模型 + `qlr-render::sheet` 解析器（手写 OOXML，`zip 2` 只开 deflate）+
 > `qlr-platform::window::sheet` 绘制（灰底行列号表头随滚动、合并/冻结/边框/数字格式、只画可见行列）+
 > `Canvas::Sheet` 第三变体与二维像素滚动（滚轮 Shift=横向、上下键一行）。实测：真实月复盘 xlsx（23,167 格）
