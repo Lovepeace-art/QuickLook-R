@@ -262,6 +262,35 @@ $text = ((Get-Log | Select-Object -Skip $before) -join "`n")
 Check ".xls 不走原生表格（没有 kind=sheet）" (-not ($text -match "kind=sheet"))
 Get-Process qlrust -ErrorAction SilentlyContinue | Stop-Process -Force
 
+# ---------- 5) 条件格式（1.9.3）：数据条 / cellIs 红字 / 色阶 ----------
+$cf = Join-Path $Fixtures "condfmt-demo.xlsx"
+if (-not (Test-Path $cf)) { $cf = Join-Path (Split-Path -Parent $root) "_bench\condfmt\condfmt-demo.xlsx" }
+if (-not (Test-Path $cf)) {
+    Skip "条件格式出帧" "缺 condfmt-demo.xlsx（跑 _bench\condfmt\make_condfmt.py）"
+} else {
+    $before = (Get-Log).Count
+    if (-not (Start-Host)) { throw "宿主没起来（条件格式轮）" }
+    [void](Send-File $cf)
+    $deadline = (Get-Date).AddSeconds(20)
+    $ok = $false
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-Log | Select-Object -Skip $before | Select-String -SimpleMatch "RENDER gen=1 sheet" -Quiet)) { $ok = $true; break }
+        Start-Sleep -Milliseconds 100
+    }
+    $text = ((Get-Log | Select-Object -Skip $before) -join "`n")
+    Check "条件格式文件出帧（kind=sheet）" (($text -match "kind=sheet") -and $ok)
+    $hwnd = Find-Preview
+    if ($hwnd -ne [IntPtr]::Zero) {
+        $shot = Join-Path $OutDir "condfmt.png"
+        $ink = Get-InkRatio $hwnd $shot
+        Check "条件格式画面非空白" ($ink -gt 0.02) ("ink={0:N3} → {1}" -f $ink, $shot)
+    } else {
+        Skip "条件格式画面" "没拿到窗口句柄"
+    }
+    Check "条件格式没有 panic" (-not ($text -match "panic"))
+    Get-Process qlrust -ErrorAction SilentlyContinue | Stop-Process -Force
+}
+
 Write-Host ""
 Write-Host ("== 结果：{0} PASS / {1} FAIL / {2} SKIP ==" -f $script:pass, $script:fail, $script:skip) -ForegroundColor Cyan
 if ($script:fail -gt 0) { exit 1 }

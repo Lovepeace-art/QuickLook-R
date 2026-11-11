@@ -3400,3 +3400,45 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
   所以点标签请点中间。这是有意的（底部边缘改大小是更常用的手势），不做特例。
 - 第一次点标签点到了 y=740（窗口高 748），直接触发"改大小"、内容区从 694 变成 765——排查时看
   `PAINT sheet … content=863x765` 这个异常值就能立刻分辨。
+
+## 2026-11-11 · 1.9.3：表格支持条件格式（色阶 / 数据条 / 条件红字）
+
+### 做了什么
+
+- `crates/qlr-render/src/sheet.rs`：解析 `xl/styles.xml` 的 `<dxfs>`（`parse_dxfs`/`parse_dxf`，
+  取 `font/color@rgb` 与 `fill/patternFill/{bgColor|fgColor}@rgb`，空 `<dxf/>` 也占位保证 `dxfId` 不错位），
+  以及 worksheet 的 `<conditionalFormatting>`（`apply_conditional_formatting` / `apply_cf_rule` /
+  `apply_color_scale` / `apply_data_bar` / `apply_cell_is` / `parse_sqref` / `each_in_range` / `gradient_color`）。
+- `crates/qlr-core/src/sheet.rs`：`Cell` 增 `data_bar: Option<f32>`（0.0–1.0 填充比例）；
+  因为 `f32` 不实现 `Eq`，`Cell`/`Sheet` 的 derive 去掉 `Eq`。
+- `crates/qlr-platform/src/window/sheet.rs`：`paint_data_bars()` 按格宽 × 比例画纯色条
+  （`DATA_BAR_RGB = 0x0063_8EC6`），插在 `paint_backgrounds` 之后、`paint_grid` 之前——
+  网格线压在数据条上，否则长条会把竖线整片盖掉。
+- `scripts/verify-sheet.ps1`：新增第 5 组「条件格式出帧 / 画面非空白 / 不 panic」，13 PASS 起。
+- 夹具 `_bench/condfmt/make_condfmt.py`（幂等重写 `condfmt-demo.xlsx`：`C2:C5` 数据条、
+  `C2:C5` cellIs lessThan 100 + dxf、`D2:D5` 三色色阶、`styles.xml` 补红字粉底 dxf）。
+
+### 为什么
+
+Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**，不是装饰：丢了条件格式，
+用户看到的就是一张没有重点的表，容易误判成"预览坏了/数据不对"。而这三类只用格子的
+底色/字色和一个宽度比例就能表达，不需要完整规则引擎。
+
+### 怎么验证
+
+- `cargo test -p qlr-render --offline` **150 passed / 8 ignored**（+5 个 CF 用例，其中 1 个读真实夹具的 `#[ignore]`）；
+  `cargo test --workspace --offline` **362 passed / 0 failed / 12 ignored**；clippy `-D warnings` 零输出、fmt 干净。
+- `scripts/verify-sheet.ps1` **13 PASS / 0 FAIL / 0 SKIP**（大表 109 ms，条件格式 ink=0.067）。
+- 真机截图 `_bench/sheet/condfmt2.png`：C 列蓝色数据条 + C3「98」红字粉底、D 列红→绿色阶，
+  与解析输出逐格一致（C2 0.0837 / C3 0.0 / C4 0.1711 / C5 1.0；D3 `0xF8696B` min、D5 `0x63BE7B` max）。
+
+### 踩到的坑
+
+- **同名夹具互相覆盖，把"文件不同"误诊成"代码 bug"**：我和 teammate 各写了一个
+  `condfmt-demo.xlsx` 生成脚本、产物同路径，最后一次覆盖决定了磁盘内容；我按"色阶应在 D 列"
+  去报了一个不存在的"列号差一"，实际那份文件的 `sqref` 本来就是 `C2:C5`。→ CONVENTIONS #166。
+- **`cells` 行优先有序 ≠ 矩形区域连续**：`C2:C5` 这种单列区域，按"起点二分 + 连续扫描"
+  会把隔壁列算进 min/max（数据条比例被带偏），必须逐格判列边界。→ CONVENTIONS #167。
+- **`<colorScale>` 的 `<color>` 与 `<cfvo>` 是按下标一一对应**（第 i 个 color 对第 i 个 cfvo），
+  不是按"红=最小"约定。按预期反转插值会让真实 Excel 文件的色阶全画反。→ CONVENTIONS #168。
+- clippy `digits of hex … not in groups of equal size`：`0x00_638E_C6` 要写成 `0x0063_8EC6`（等长分组）。

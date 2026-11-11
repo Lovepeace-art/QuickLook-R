@@ -18,6 +18,8 @@
 //!   `xl/theme/theme1.xml` 的 `clrScheme`（带 tint 与 Excel 的 dk1/lt1 对调）；
 //! - `xl/worksheets/sheet*.xml`：`<cols>` 列宽、`<row ht>` 行高、`<c r s t>` 的
 //!   `<v>`/`<is>`、`<mergeCells>`、`<sheetView><pane>` 冻结；
+//! - **条件格式**（1.9.3）：色阶（2/3 色标线性插值）、数据条比例（`Cell::data_bar`）、
+//!   `cellIs` + `<dxfs>` 差分样式（红字/底色）。实现见下文「条件格式」一节；
 //! - 数字格式：内建 numFmtId 0–49 的常见项 + 自定义格式串的**最小可用子集**
 //!   （整数 / 固定小数 / 千分位 / 百分比 / 会计括号 / 科学计数 / 日期时间）。
 //!
@@ -25,7 +27,9 @@
 //! - 分数格式（`# ?/?`）→ 按 General 输出小数；
 //! - `[h]`/`[m]` 这类**累计**时间 → 当普通时分秒（36 小时会显示成 12:00:00）；
 //! - 日期里的中文/本地化月名（`mmm` 一律英文缩写 Jan/Mar…）、佛历/民国历 `[$-404]`；
-//! - 条件格式、数据条/色阶、图标集、单元格内图片/批注、超链接、公式（只取 `<v>` 缓存值）；
+//! - 条件格式里的 `iconSet`/`expression`/`top10`/`duplicateValues`/`containsText` 等
+//!   （见「条件格式」一节的 type 分派表），以及图标集、单元格内图片/批注、超链接、
+//!   公式（只取 `<v>` 缓存值）；
 //! - 富文本**段内**样式（一个单元格里红黑混排）→ 取该格的 `cellXfs` 字体，忽略 `<r>` 上的字体；
 //! - 旋转文字、缩进、文本方向、自定义 `indexedColors` 调色板（用内建 56 色调色板）。
 //!
@@ -75,6 +79,11 @@ const MAX_NUM_FMTS: usize = 512;
 /// `<cols>` 的条数上限 / 合并区域条数上限。
 const MAX_COL_BANDS: usize = 4_096;
 const MAX_MERGES: usize = 4_096;
+/// 条件格式的兜底上限：单表最多认多少条 `<cfRule>`、一个 `sqref` 最多认多少个区域、
+/// 单个区域最多扫多少格（正常文件都在个位数；畸形文件不许把解析拖进秒级）。
+const MAX_CF_RULES: usize = 256;
+const MAX_CF_RANGES: usize = 512;
+const MAX_CF_CELLS: usize = 100_000;
 
 /// 解析一个 xlsx/xlsm/xltx/xltm 文件（取工作簿里 `activeTab` 那张表）。
 pub fn parse_sheet(path: &Path) -> qlr_core::Result<SheetDoc> {
@@ -836,6 +845,11 @@ impl Default for XfCell {
 struct StyleSheet {
     xfs: Vec<XfCell>,
     fallback: XfCell,
+    /// 条件格式的差分样式（`<dxfs><dxf>…</dxf></dxfs>`），`<cfRule dxfId="…">` 索引到这里。
+    ///
+    /// 和 `cellXfs` 是**两套东西**：`xf` 是"整格完整样式"，`dxf` 只描述"相对格子原有样式
+    /// 的差异"，条件格式命中时才叠上去。绝大多数文件没有 `<dxfs>`，所以是空 `Vec`。
+    dxfs: Vec<Dxf>,
 }
 
 impl Default for StyleSheet {
@@ -843,6 +857,7 @@ impl Default for StyleSheet {
         Self {
             xfs: vec![XfCell::default()],
             fallback: XfCell::default(),
+            dxfs: Vec::new(),
         }
     }
 }
@@ -895,6 +910,7 @@ fn parse_styles(xml: &str, theme: &Theme) -> StyleSheet {
     StyleSheet {
         xfs,
         fallback: XfCell::default(),
+        dxfs: parse_dxfs(xml, theme),
     }
 }
 
@@ -1092,6 +1108,77 @@ fn parse_fills(xml: &str, theme: &Theme) -> Vec<Option<u32>> {
         out.push(fill);
     });
     out
+}
+
+/// 条件格式用的差分样式（`<dxfs>` 里的一个 `<dxf>`）。
+#[derive(Clone, Copy, Debug, Default)]
+struct Dxf {
+    /// `<dxf><font><color rgb="FF9C0006"/></font>` → 字色。
+    font_rgb: Option<u32>,
+    /// `<dxf><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill>` → 底色。
+    fill_rgb: Option<u32>,
+}
+
+/// `<dxfs count="N"><dxf>…</dxf>…</dxfs>`：条件格式专用差分样式表。
+///
+/// **索引用处**：`<cfRule dxfId="2">` 指的是这里第 2 个 `<dxf>`，不是 `cellXfs`。
+/// 所以自闭合/空 `<dxf/>` 也必须占位（否则后面所有下标都错位）。
+fn parse_dxfs(xml: &str, theme: &Theme) -> Vec<Dxf> {
+    let mut out: Vec<Dxf> = Vec::new();
+    let Some(at) = find_tag(xml, 0, "dxfs") else {
+        return out;
+    };
+    let Some((_, _, start)) = open_tag(xml, at) else {
+        return out;
+    };
+    let body = child_region(xml, start, "</dxfs>");
+    let mut i = 0;
+    while let Some(d_at) = find_tag(body, i, "dxf") {
+        let Some((_inner, self_closing, after)) = open_tag(body, d_at) else {
+            break;
+        };
+        i = after.max(d_at + 1);
+        if out.len() >= MAX_XFS {
+            qlr_core::log_warn!(SCOPE, "条件格式 dxfs 超过 {MAX_XFS} 条，已截断");
+            break;
+        }
+        let content = if self_closing {
+            ""
+        } else {
+            let end = body
+                .get(after..)
+                .and_then(|r| r.find("</dxf>"))
+                .map(|p| after + p)
+                .unwrap_or(body.len());
+            i = end.max(i);
+            body.get(after..end).unwrap_or("")
+        };
+        out.push(parse_dxf(content, theme));
+    }
+    out
+}
+
+/// 一个 `<dxf>`：只取 `font/color` 与 `fill/patternFill/{bgColor|fgColor}` 两样。
+///
+/// Excel 写条件格式底色时用的是 `bgColor`（和普通 `<fill>` 的 `fgColor` 相反），
+/// 但别的写文件工具两种都有，所以两个都认，`bgColor` 优先。
+fn parse_dxf(content: &str, theme: &Theme) -> Dxf {
+    let mut dxf = Dxf::default();
+    if let Some(at) = find_tag(content, 0, "font") {
+        if let Some((_, _, start)) = open_tag(content, at) {
+            let font = child_region(content, start, "</font>");
+            dxf.font_rgb = first_tag_attrs(font, "color").and_then(|a| resolve_color(a, theme));
+        }
+    }
+    if let Some(at) = find_tag(content, 0, "fill") {
+        if let Some((_, _, start)) = open_tag(content, at) {
+            let fill = child_region(content, start, "</fill>");
+            dxf.fill_rgb = first_tag_attrs(fill, "bgColor")
+                .and_then(|a| resolve_color(a, theme))
+                .or_else(|| first_tag_attrs(fill, "fgColor").and_then(|a| resolve_color(a, theme)));
+        }
+    }
+    dxf
 }
 
 fn parse_borders(xml: &str) -> Vec<Border> {
@@ -2156,6 +2243,13 @@ fn parse_worksheet(xml: &str, shared: &[String], styles: &StyleSheet) -> Sheet {
         qlr_core::log_warn!(SCOPE, "工作表单元格超过 {MAX_CELLS} 个，已截断");
     }
 
+    // 条件格式：必须等 cells 排好序（色阶/数据条要先按区域收齐数值算 min/max，
+    // `cellIs` 要改命中格的样式）。绝大多数文件根本没有这个块，所以先做一次廉价子串
+    // 判断再进解析——没有条件格式的路径（含 real-monthly 的 5 张表）开销是 μs 级。
+    if xml.contains("conditionalFormatting") {
+        apply_conditional_formatting(xml, &mut cells, styles);
+    }
+
     // 列数：以**实际用到的**列为准。Excel 的滚动范围也是"用到的范围"，不是整张表的
     // 16384 列；而 `<cols>` 里 `<col min="98" max="16384" width="…"/>` 这种"剩余整表"
     // band 只该用来定宽，不能拿来撑列数——实测 `real-monthly.xlsx` 的「销售数据分天」
@@ -2300,6 +2394,7 @@ fn prev_col_reset(
             text: text.unwrap_or_default(),
             style,
             numeric,
+            data_bar: None,
         });
     }
 }
@@ -2470,6 +2565,516 @@ fn parse_merges(xml: &str) -> Vec<Merge> {
         });
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 条件格式（`<conditionalFormatting sqref="…"><cfRule …>`）
+// ---------------------------------------------------------------------------
+//
+// 支持到什么程度（1.9.3 的验收面）：
+//
+// | `cfRule@type` | 做什么 |
+// |---|---|
+// | `colorScale` | 2/3 色标按数值线性插值，写 `cell.style.colors.bg` |
+// | `dataBar`    | 算比例写 `cell.data_bar`（颜色不画，绘制端只要比例） |
+// | `cellIs`     | 比较数值，命中后把 `dxfId` 指向的字色/底色叠上去 |
+// | 其它（`expression` / `iconSet` / `top10` / `duplicateValues` / `containsText` / …） | 跳过 |
+//
+// 跳过是有意的：图标集画不出来、表达式需要公式求值器、top10 要整列排序——"猜一个
+// 近似"只会把格子涂成错色，比不涂更误导。
+//
+// 反过来的近似（都在函数注释里标了）：
+// - `percent`/`percentile` 一律按"在 min..max 上线性插值"算（Excel 的 percentile 是
+//   排序后取分位点，我们不做排序）；
+// - `<color theme="…"/>` 拿不到 theme（这一层只有 styles），整条规则跳过；
+// - 条件格式与格子自身底色的优先级：**条件格式赢**（写 `colors.bg` 覆盖 `fillId` 的底色），
+//   因为 Excel 里条件格式就是画在填充之上的那一层。
+
+/// 色阶/数据条的一个取值端点（`<cfvo>`）。
+#[derive(Clone, Copy, Debug)]
+enum CfValue {
+    /// 目标区域数值的最小值（`autoMin` 同义）。
+    Min,
+    /// 目标区域数值的最大值（`autoMax` 同义）。
+    Max,
+    /// 字面量（`type="num"`）。
+    Num(f64),
+    /// `type="percent"`：`val` 是 0–100，按 `min + (max - min) × val/100` 取。
+    Percent(f64),
+    /// `type="percentile"`：**近似**成 `Percent`（见上方小节说明，不做排序）。
+    Percentile(f64),
+}
+
+impl CfValue {
+    /// 端点 → 具体数值。`lo`/`hi` 是目标区域的数值 min/max。
+    fn resolve(self, lo: f64, hi: f64) -> f64 {
+        match self {
+            Self::Min => lo,
+            Self::Max => hi,
+            Self::Num(v) => v,
+            Self::Percent(p) | Self::Percentile(p) => lo + (hi - lo) * (p / 100.0),
+        }
+    }
+}
+
+/// 把本表的条件格式叠到已经解析好的单元格上。
+///
+/// **调用点**：`parse_worksheet` 里 cells 已排序之后、构造 `Sheet` 之前——
+/// 色阶/数据条必须先把整片区域的数值收齐才能算 min/max（一边遍历一边算会算错）。
+fn apply_conditional_formatting(xml: &str, cells: &mut [Cell], styles: &StyleSheet) {
+    let mut i = 0;
+    let mut rules = 0usize;
+    let mut overflow = false;
+    while let Some(block_at) = find_tag(xml, i, "conditionalFormatting") {
+        let Some((block_inner, block_self_closing, block_after)) = open_tag(xml, block_at) else {
+            break;
+        };
+        i = block_after.max(block_at + 1);
+        if block_self_closing {
+            continue;
+        }
+        let body = child_region(xml, block_after, "</conditionalFormatting>");
+        i = block_after.saturating_add(body.len()).max(i);
+        let Some(sqref) = attr(block_inner, "sqref") else {
+            continue;
+        };
+        let ranges = parse_sqref(sqref);
+        if ranges.is_empty() {
+            continue;
+        }
+        let mut j = 0;
+        while let Some(rule_at) = find_tag(body, j, "cfRule") {
+            let Some((rule_inner, rule_self_closing, rule_after)) = open_tag(body, rule_at) else {
+                break;
+            };
+            j = rule_after.max(rule_at + 1);
+            if rules >= MAX_CF_RULES {
+                overflow = true;
+                break;
+            }
+            let content = if rule_self_closing {
+                ""
+            } else {
+                let end = body
+                    .get(rule_after..)
+                    .and_then(|r| r.find("</cfRule>"))
+                    .map(|p| rule_after + p)
+                    .unwrap_or(body.len());
+                j = end.max(j);
+                body.get(rule_after..end).unwrap_or("")
+            };
+            rules += 1;
+            apply_cf_rule(rule_inner, content, &ranges, cells, styles);
+        }
+        if overflow {
+            break;
+        }
+    }
+    if overflow {
+        qlr_core::log_warn!(SCOPE, "条件格式规则超过 {MAX_CF_RULES} 条，已截断");
+    }
+}
+
+/// 一条 `<cfRule>`：按 `type` 分派，只做三种，其它一律跳过（不 panic、不猜）。
+fn apply_cf_rule(
+    rule_inner: &str,
+    content: &str,
+    ranges: &[(u32, u32, u32, u32)],
+    cells: &mut [Cell],
+    styles: &StyleSheet,
+) {
+    match attr(rule_inner, "type").unwrap_or("") {
+        "colorScale" => apply_color_scale(content, ranges, cells),
+        "dataBar" => apply_data_bar(content, ranges, cells),
+        "cellIs" => apply_cell_is(rule_inner, content, ranges, cells, styles),
+        _ => {}
+    }
+}
+
+/// 色阶：按区域 min/max 与色标数值插值，结果写 `colors.bg`（不动原字色）。
+fn apply_color_scale(content: &str, ranges: &[(u32, u32, u32, u32)], cells: &mut [Cell]) {
+    let (Some(points), Some(colors)) = (parse_cfvo_list(content), parse_cf_colors(content)) else {
+        return;
+    };
+    // 色标数与颜色数不一致（坏文件）时按少的那个截断；不足两个色标就不是色阶。
+    let stops: Vec<(CfValue, u32)> = points.iter().copied().zip(colors).collect();
+    if stops.len() < 2 {
+        return;
+    }
+    for &range in ranges {
+        let hits = collect_numbers(cells, range);
+        let Some((lo, hi)) = min_max(&hits) else {
+            continue;
+        };
+        let resolved: Vec<(f64, u32)> = stops
+            .iter()
+            .map(|(point, rgb)| (point.resolve(lo, hi), *rgb))
+            .collect();
+        for (idx, value) in hits {
+            let rgb = gradient_color(&resolved, value);
+            if let Some(cell) = cells.get_mut(idx) {
+                cell.style.colors.bg = Some(rgb);
+            }
+        }
+    }
+}
+
+/// 数据条：只算比例（`0.0`–`1.0`）写 `data_bar`，颜色这次不画。
+fn apply_data_bar(content: &str, ranges: &[(u32, u32, u32, u32)], cells: &mut [Cell]) {
+    let Some(points) = parse_cfvo_list(content) else {
+        return;
+    };
+    let (Some(first), Some(last)) = (points.first().copied(), points.last().copied()) else {
+        return;
+    };
+    if points.len() < 2 {
+        return;
+    }
+    for &range in ranges {
+        let hits = collect_numbers(cells, range);
+        let Some((lo, hi)) = min_max(&hits) else {
+            continue;
+        };
+        let bar_lo = first.resolve(lo, hi);
+        let bar_hi = last.resolve(lo, hi);
+        for (idx, value) in hits {
+            let ratio = if bar_hi > bar_lo {
+                ((value - bar_lo) / (bar_hi - bar_lo)).clamp(0.0, 1.0)
+            } else {
+                // 整片区域同一个值：Excel 画满条，这里给满条（不与色阶的"中间色"混淆）。
+                1.0
+            };
+            if let Some(cell) = cells.get_mut(idx) {
+                cell.data_bar = Some(ratio as f32);
+            }
+        }
+    }
+}
+
+/// `cellIs`：比数值，命中就把 `dxf` 的字色/底色叠上去。
+///
+/// 只认 `<formula>` 里的**数字字面量**：`$D$2`、`TODAY()`、`"文本"` 都丢掉整条规则
+/// （没有求值器，猜只会误标）。
+fn apply_cell_is(
+    rule_inner: &str,
+    content: &str,
+    ranges: &[(u32, u32, u32, u32)],
+    cells: &mut [Cell],
+    styles: &StyleSheet,
+) {
+    let Some(dxf) = attr(rule_inner, "dxfId")
+        .and_then(parse_u32)
+        .and_then(|idx| styles.dxfs.get(idx as usize))
+        .copied()
+    else {
+        return;
+    };
+    if dxf.font_rgb.is_none() && dxf.fill_rgb.is_none() {
+        return;
+    }
+    let operator = attr(rule_inner, "operator").unwrap_or("");
+    let args = parse_cf_formulas(content);
+    if args.is_empty() {
+        return;
+    }
+    for &range in ranges {
+        // 先只读地记下命中格下标，再统一改样式：cells 不能同时被两种借用。
+        let mut hits: Vec<usize> = Vec::new();
+        each_in_range(cells, range, |idx, cell| {
+            if let Some(value) = cell_value(cell) {
+                if cell_is_hit(operator, value, &args) {
+                    hits.push(idx);
+                }
+            }
+        });
+        for idx in hits {
+            if let Some(cell) = cells.get_mut(idx) {
+                if let Some(fg) = dxf.font_rgb {
+                    cell.style.colors.fg = fg;
+                }
+                if let Some(bg) = dxf.fill_rgb {
+                    cell.style.colors.bg = Some(bg);
+                }
+            }
+        }
+    }
+}
+
+/// `cellIs` 的比较语义。`args` 是 `<formula>` 里的数字（1 个或 2 个）。
+fn cell_is_hit(operator: &str, value: f64, args: &[f64]) -> bool {
+    let a = args.first().copied();
+    let b = args.get(1).copied();
+    // `text` 是格式化后的显示串，`equal` 用个小容差比较（`0.1+0.2` 那种毛刺不误判）。
+    let close = |target: f64| (value - target).abs() <= target.abs().max(1.0) * 1e-9;
+    match operator {
+        "lessThan" => a.is_some_and(|a| value < a),
+        "lessThanOrEqual" => a.is_some_and(|a| value <= a),
+        "greaterThan" => a.is_some_and(|a| value > a),
+        "greaterThanOrEqual" => a.is_some_and(|a| value >= a),
+        "equal" => a.is_some_and(close),
+        "notEqual" => a.is_some_and(|a| !close(a)),
+        "between" => match (a, b) {
+            (Some(a), Some(b)) => value >= a.min(b) && value <= a.max(b),
+            _ => false,
+        },
+        "notBetween" => match (a, b) {
+            (Some(a), Some(b)) => value < a.min(b) || value > a.max(b),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `<cfvo type="…" val="…"/>` 列表（最多 3 个）。
+///
+/// **认不出的 type 直接整体返回 `None`**：端点序列错一位，色阶就会整体错色，
+/// 宁可不画。
+fn parse_cfvo_list(content: &str) -> Option<Vec<CfValue>> {
+    let mut out: Vec<CfValue> = Vec::new();
+    let mut i = 0;
+    while let Some(at) = find_tag(content, i, "cfvo") {
+        let (inner, _, after) = open_tag(content, at)?;
+        i = after.max(at + 1);
+        if out.len() >= 3 {
+            break;
+        }
+        let val = attr(inner, "val").and_then(parse_f64).unwrap_or(0.0);
+        out.push(match attr(inner, "type").unwrap_or("") {
+            "min" | "autoMin" => CfValue::Min,
+            "max" | "autoMax" => CfValue::Max,
+            "num" => CfValue::Num(val),
+            "percent" => CfValue::Percent(val),
+            "percentile" => CfValue::Percentile(val),
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+/// 色阶里的 `<color rgb="…"/>` 列表（最多 3 个）。
+///
+/// 只认 `rgb`/`indexed`：`theme=` 这一层拿不到主题色表，按需求整条规则跳过（返回 `None`）。
+fn parse_cf_colors(content: &str) -> Option<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0;
+    while let Some(at) = find_tag(content, i, "color") {
+        let (inner, _, after) = open_tag(content, at)?;
+        i = after.max(at + 1);
+        if out.len() >= 3 {
+            break;
+        }
+        out.push(color_attr(inner)?);
+    }
+    Some(out)
+}
+
+/// `<color …>` → `0xRRGGBB`（只要 `rgb` / `indexed`，`theme` 不认）。
+fn color_attr(inner: &str) -> Option<u32> {
+    if let Some(rgb) = attr(inner, "rgb").and_then(parse_hex_color) {
+        return Some(rgb);
+    }
+    let idx = attr(inner, "indexed").and_then(parse_u32)?;
+    INDEXED_COLORS.get(idx as usize).copied()
+}
+
+/// `<formula>10</formula>` → 数字（最多 2 个）。
+fn parse_cf_formulas(content: &str) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    let mut i = 0;
+    while let Some(at) = find_tag(content, i, "formula") {
+        let Some((_, self_closing, after)) = open_tag(content, at) else {
+            break;
+        };
+        i = after.max(at + 1);
+        if out.len() >= 2 {
+            break;
+        }
+        if self_closing {
+            continue;
+        }
+        let (raw, next) = text_until_tag(content, after);
+        i = next.max(i);
+        if let Some(v) = literal_number(raw) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// 纯数字字面量（`10` / `-1.5` / `1E3`）。`$D$2`、`"文本"`、`TODAY()` 都不算。
+fn literal_number(raw: &str) -> Option<f64> {
+    let v = raw.trim().parse::<f64>().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// 条件格式用的数值：**只有数值格参与**（`numeric == true`）。
+///
+/// 文本格一律不参与——`10052953469532` 这种 SKU 也是"看起来像数字的文本"，
+/// 让它进色阶就会把整列 SKU 涂上颜色（1.9.0 的 `####` 是同一个坑）。
+///
+/// `text` 已经是格式化后的显示串，所以两种写法要能认：
+/// 千分位 `1,234.5` 去掉逗号；百分号 `12.3%` 按 **12.3** 取（不除 100）——
+/// 同一列的口径一致，色阶只关心相对大小。
+fn cell_value(cell: &Cell) -> Option<f64> {
+    if !cell.numeric {
+        return None;
+    }
+    if let Ok(v) = cell.text.parse::<f64>() {
+        return v.is_finite().then_some(v);
+    }
+    let mut cleaned = String::with_capacity(cell.text.len());
+    for ch in cell.text.chars() {
+        if ch != ',' && ch != '%' && ch != '\u{a0}' && !ch.is_whitespace() {
+            cleaned.push(ch);
+        }
+    }
+    let v = cleaned.parse::<f64>().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// 区域命中的（cells 下标，数值）。文本格、解析不出数值的格子不进来。
+fn collect_numbers(cells: &[Cell], range: (u32, u32, u32, u32)) -> Vec<(usize, f64)> {
+    let mut out: Vec<(usize, f64)> = Vec::new();
+    each_in_range(cells, range, |idx, cell| {
+        if let Some(v) = cell_value(cell) {
+            out.push((idx, v));
+        }
+    });
+    out
+}
+
+/// 遍历矩形区域里的格子（cells 按 `(row, col)` 升序，见 `parse_worksheet`）。
+///
+/// 注意**不能**用"起点二分 + 一段连续切片"来近似：行优先排序下，`C2:C5` 这种单列
+/// 区域是不连续的（每行后面都跟着 D/E 列），切出来会把隔壁列也算进去。所以按行窗口
+/// 二分定位起点，再逐格判列。命中数上限 `MAX_CF_CELLS`。
+fn each_in_range(
+    cells: &[Cell],
+    (row0, col0, row1, col1): (u32, u32, u32, u32),
+    mut visit: impl FnMut(usize, &Cell),
+) {
+    let start = cells.partition_point(|c| c.row < row0);
+    let mut hits = 0usize;
+    for (offset, cell) in cells.get(start..).unwrap_or(&[]).iter().enumerate() {
+        if cell.row > row1 {
+            break;
+        }
+        if cell.col < col0 || cell.col > col1 {
+            continue;
+        }
+        hits += 1;
+        if hits > MAX_CF_CELLS {
+            qlr_core::log_warn!(SCOPE, "条件格式单个区域超过 {MAX_CF_CELLS} 格，已截断");
+            break;
+        }
+        visit(start + offset, cell);
+    }
+}
+
+/// 一堆 `(下标, 数值)` 的 min/max；空集合返回 `None`。
+fn min_max(values: &[(usize, f64)]) -> Option<(f64, f64)> {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (_, v) in values {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// 在色标之间按数值线性插值出 `0xRRGGBB`。
+///
+/// `stops` 已按声明顺序给出（2 或 3 个），第 0 项是 `CfValue` 换算后的数值：
+/// - 落在第一个色标左侧 → 第一个颜色；落在最后一个右侧 → 最后一个颜色；
+/// - 中间 → 找它落在哪两个相邻色标之间，按该段内的比例插值（这就是 Excel 的观感）；
+/// - 所有色标数值相同（`hi == lo`）→ 整体取中间色（3 色标取中间那支，2 色标各半）。
+fn gradient_color(stops: &[(f64, u32)], value: f64) -> u32 {
+    let Some(&(first_value, first_rgb)) = stops.first() else {
+        return 0;
+    };
+    let Some(&(last_value, last_rgb)) = stops.last() else {
+        return first_rgb;
+    };
+    if stops.len() < 2 || !value.is_finite() {
+        return first_rgb;
+    }
+    if last_value <= first_value {
+        let mixed = lerp_rgb(first_rgb, last_rgb, 0.5);
+        return if stops.len() >= 3 {
+            stops.get(stops.len() / 2).map_or(mixed, |s| s.1)
+        } else {
+            mixed
+        };
+    }
+    if value <= first_value {
+        return first_rgb;
+    }
+    if value >= last_value {
+        return last_rgb;
+    }
+    for pair in stops.windows(2) {
+        let (Some(&(lo, lo_rgb)), Some(&(hi, hi_rgb))) = (pair.first(), pair.get(1)) else {
+            continue;
+        };
+        if value < lo || value > hi {
+            continue;
+        }
+        if hi <= lo {
+            return hi_rgb;
+        }
+        let t = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        return lerp_rgb(lo_rgb, hi_rgb, t);
+    }
+    last_rgb
+}
+
+/// 两色按 `t`（0–1）线性插值（每通道四舍五入）。
+fn lerp_rgb(from: u32, to: u32, t: f64) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |shift: u32| -> u32 {
+        let a = f64::from((from >> shift) & 0xFF);
+        let b = f64::from((to >> shift) & 0xFF);
+        (a + (b - a) * t).round().clamp(0.0, 255.0) as u32
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// `sqref`（空格分隔的区域列表）→ 0 基、含两端的 `(行起, 列起, 行止, 列止)`。
+///
+/// 语法只有 `A1` 与 `A1:C10` 两种；`$` 前缀、大小写、反序区域都容忍，认不出的片段
+/// 直接丢（`sqref="!!!"` 就是空列表 = 这条规则不生效，不是错误）。区域数上限
+/// `MAX_CF_RANGES`，超了截断并 `log_warn!`。
+fn parse_sqref(sqref: &str) -> Vec<(u32, u32, u32, u32)> {
+    let mut out: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for part in sqref.split_whitespace() {
+        if out.len() >= MAX_CF_RANGES {
+            qlr_core::log_warn!(SCOPE, "条件格式 sqref 区域超过 {MAX_CF_RANGES} 个，已截断");
+            break;
+        }
+        let Some((from, to)) = split_ref_range(part) else {
+            continue;
+        };
+        out.push(normalize_range(from, to));
+    }
+    out
+}
+
+/// `"A1:C10"` → `((0,0),(9,2))`；`"A1"` → 同一个点。
+fn split_ref_range(part: &str) -> Option<((u32, u32), (u32, u32))> {
+    match part.split_once(':') {
+        Some((from, to)) => Some((parse_ref(from)?, parse_ref(to)?)),
+        None => parse_ref(part).map(|p| (p, p)),
+    }
+}
+
+/// 反序/越界的区域夹成合法矩形（行 < `MAX_ROWS`、列 < `MAX_COLS`）。
+fn normalize_range((r1, c1): (u32, u32), (r2, c2): (u32, u32)) -> (u32, u32, u32, u32) {
+    (
+        r1.min(r2).min(MAX_ROWS - 1),
+        c1.min(c2).min(MAX_COLS - 1),
+        r1.max(r2).min(MAX_ROWS - 1),
+        c1.max(c2).min(MAX_COLS - 1),
+    )
 }
 
 #[cfg(test)]
@@ -2888,7 +3493,287 @@ mod tests {
         assert_eq!(sheet.rows, 0);
     }
 
-    /// 性能取样（默认不跑）：
+    // ---- 条件格式（1.9.3） -------------------------------------------------
+
+    /// 带一个配色条件格式 `dxf` 的最小 styles.xml（`dxfId="0"` 指向红字 + 粉底）。
+    const CF_STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/></border></borders><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><dxfs count="2"><dxf><font><color rgb="FF9C0006"/></font><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf><dxf/></dxfs></styleSheet>"#;
+
+    #[test]
+    fn sqref_expands_multi_area_and_cross_column_ranges() {
+        // 空格分隔的多区域 + 跨列区域，都要展开成 0 基含两端的矩形
+        assert_eq!(
+            parse_sqref("A1:C10 D5 E7:E9"),
+            vec![(0, 0, 9, 2), (4, 3, 4, 3), (6, 4, 8, 4)]
+        );
+        // 绝对引用 / 大小写 / 反序区域都容忍
+        assert_eq!(parse_sqref("$B$2:$AA$3"), vec![(1, 1, 2, 26)]);
+        assert_eq!(parse_sqref("c5:a1"), vec![(0, 0, 4, 2)]);
+        // 列号是 0 基：D2:D5 → 行 1..=4、列 3（不是 2、也不是 4）——这条钉住
+        // "色阶落到隔壁列"那类差一错误
+        assert_eq!(parse_sqref("D2:D5"), vec![(1, 3, 4, 3)]);
+        assert_eq!(parse_sqref("C2:C5"), vec![(1, 2, 4, 2)]);
+        // 坏输入：认不出的片段直接丢（不报错、不 panic）
+        assert!(parse_sqref("!!!").is_empty());
+        assert!(parse_sqref("").is_empty());
+        assert!(parse_sqref("A1::B2").is_empty());
+        assert_eq!(parse_sqref("A1 !!! B2"), vec![(0, 0, 0, 0), (1, 1, 1, 1)]);
+    }
+
+    #[test]
+    fn color_scale_interpolates_two_and_three_stops() {
+        // 2 色标（min 红 → max 黄）：0 / 50 / 100 → 两端原色、中间各半；文本格不参与
+        let two = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>0</v></c><c r="B1" t="inlineStr"><is><t>50</t></is></c></row><row r="2"><c r="A2"><v>50</v></c></row><row r="3"><c r="A3"><v>100</v></c></row></sheetData><conditionalFormatting sqref="A1:B3"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFFF0000"/><color rgb="FFFFFF00"/></colorScale></cfRule></conditionalFormatting></worksheet>"#;
+        let sheet = parse_worksheet(two, &[], &StyleSheet::default());
+        let bg = |row: u32, col: u32| sheet.cell(row, col).and_then(|c| c.style.colors.bg);
+        assert_eq!(bg(0, 0), Some(0x00_FF_00_00));
+        assert_eq!(bg(1, 0), Some(0x00_FF_80_00));
+        assert_eq!(bg(2, 0), Some(0x00_FF_FF_00));
+        // 字色不被色阶动
+        assert_eq!(
+            sheet.cell(1, 0).map(|c| c.style.colors.fg),
+            Some(0x00_00_00)
+        );
+        // 文本格（B1 = "50"）不涂色
+        assert_eq!(bg(0, 1), None);
+
+        // 3 色标（0 红 / 50 黄 / 100 绿）：中间格正好是中间色，两段内部再插值
+        let three = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>0</v></c></row><row r="2"><c r="A2"><v>25</v></c></row><row r="3"><c r="A3"><v>50</v></c></row><row r="4"><c r="A4"><v>75</v></c></row><row r="5"><c r="A5"><v>100</v></c></row></sheetData><conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="num" val="0"/><cfvo type="num" val="50"/><cfvo type="num" val="100"/><color rgb="FFFF0000"/><color rgb="FFFFFF00"/><color rgb="FF00FF00"/></colorScale></cfRule></conditionalFormatting></worksheet>"#;
+        let sheet = parse_worksheet(three, &[], &StyleSheet::default());
+        let bg = |row: u32| sheet.cell(row, 0).and_then(|c| c.style.colors.bg);
+        assert_eq!(bg(0), Some(0x00_FF_00_00));
+        assert_eq!(bg(1), Some(0x00_FF_80_00)); // 红→黄 中点：G 0→255 走一半
+        assert_eq!(bg(2), Some(0x00_FF_FF_00));
+        assert_eq!(bg(3), Some(0x00_80_FF_00)); // 黄→绿 中点：R 255→0 走一半
+        assert_eq!(bg(4), Some(0x00_00_FF_00));
+
+        // 所有格同值（hi == lo）：整体取中间色，不能除零
+        let flat = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>7</v></c></row><row r="2"><c r="A2"><v>7</v></c></row></sheetData><conditionalFormatting sqref="A1:A2"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFFF0000"/><color rgb="FFFFFF00"/></colorScale></cfRule></conditionalFormatting></worksheet>"#;
+        let sheet = parse_worksheet(flat, &[], &StyleSheet::default());
+        assert_eq!(
+            sheet.cell(0, 0).and_then(|c| c.style.colors.bg),
+            Some(0x00_FF_80_00)
+        );
+    }
+
+    #[test]
+    fn data_bar_ratio_spans_zero_to_one() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>-10</v></c></row><row r="2"><c r="A2"><v>10</v></c></row><row r="3"><c r="A3"><v>30</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>30</t></is></c></row><row r="5"><c r="A5" t="s"><v>0</v></c></row></sheetData><conditionalFormatting sqref="A1:A5"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting></worksheet>"#;
+        let shared = vec!["文本".to_string()];
+        let sheet = parse_worksheet(xml, &shared, &StyleSheet::default());
+        let bar = |row: u32| sheet.cell(row, 0).and_then(|c| c.data_bar);
+        // min = -10、max = 30 → -10→0.0、10→0.5、30→1.0
+        assert_eq!(bar(0), Some(0.0));
+        assert!((bar(1).unwrap_or(f32::NAN) - 0.5).abs() < 0.02);
+        assert_eq!(bar(2), Some(1.0));
+        // 文本格（一个 inlineStr、一个共享字符串）不参与
+        assert!(sheet.cell(3, 0).is_some());
+        assert_eq!(bar(3), None);
+        assert!(sheet.cell(4, 0).is_some());
+        assert_eq!(bar(4), None);
+        // 数据条不动底色
+        assert_eq!(sheet.cell(2, 0).and_then(|c| c.style.colors.bg), None);
+
+        // 回归：单列区域不能把隔壁列吃进来。行优先排序下 `A1:A3` 在 cells 里是
+        // 不连续的（每行后面都跟着 B 列），按"连续切片"扫会把 1000/2000/3000 也算进
+        // min/max，比例就全错了。
+        let neighbor = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>0</v></c><c r="B1"><v>1000</v></c></row><row r="2"><c r="A2"><v>50</v></c><c r="B2"><v>2000</v></c></row><row r="3"><c r="A3"><v>100</v></c><c r="B3"><v>3000</v></c></row></sheetData><conditionalFormatting sqref="A1:A3"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting></worksheet>"#;
+        let sheet = parse_worksheet(neighbor, &[], &StyleSheet::default());
+        assert_eq!(sheet.cell(0, 0).and_then(|c| c.data_bar), Some(0.0));
+        let mid_bar = sheet
+            .cell(1, 0)
+            .and_then(|c| c.data_bar)
+            .unwrap_or(f32::NAN);
+        assert!((mid_bar - 0.5).abs() < 0.02);
+        assert_eq!(sheet.cell(2, 0).and_then(|c| c.data_bar), Some(1.0));
+        // 隔壁列一格都不许被标
+        assert!((0..3).all(|row| sheet.cell(row, 1).and_then(|c| c.data_bar).is_none()));
+    }
+
+    #[test]
+    fn cell_is_less_than_colors_only_matching_numeric_cells() {
+        let styles = parse_styles(CF_STYLES, &Theme::default());
+        assert_eq!(styles.dxfs.len(), 2);
+        assert_eq!(
+            styles.dxfs.first().and_then(|d| d.font_rgb),
+            Some(0x00_9C_00_06)
+        );
+        assert_eq!(
+            styles.dxfs.first().and_then(|d| d.fill_rgb),
+            Some(0x00_FF_C7_CE)
+        );
+        // 空 `<dxf/>` 也占位，别把后面的下标挤错
+        assert_eq!(styles.dxfs.get(1).and_then(|d| d.font_rgb), None);
+
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>5</v></c><c r="B1"><v>50</v></c><c r="C1" t="inlineStr"><is><t>5</t></is></c></row><row r="2"><c r="A2"><v>500</v></c><c r="B2" t="s"><v>0</v></c></row></sheetData><conditionalFormatting sqref="A1:C2"><cfRule type="cellIs" dxfId="0" priority="1" operator="lessThan"><formula>10</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let shared = vec!["5".to_string()];
+        let sheet = parse_worksheet(xml, &shared, &styles);
+        // A1 = 5 < 10 → 命中：红字 + 粉底
+        let hit = sheet.cell(0, 0).expect("A1");
+        assert_eq!(hit.style.colors.fg, 0x00_9C_00_06);
+        assert_eq!(hit.style.colors.bg, Some(0x00_FF_C7_CE));
+        // B1 = 50 不命中：样式原封不动
+        let miss = sheet.cell(0, 1).expect("B1");
+        assert_eq!(miss.style.colors.fg, 0x00_00_00);
+        assert_eq!(miss.style.colors.bg, None);
+        // C1 是文本 "5"：看着像数字也不参与比较
+        let text = sheet.cell(0, 2).expect("C1");
+        assert_eq!(text.style.colors.fg, 0x00_00_00);
+        assert_eq!(text.style.colors.bg, None);
+        // A2 = 500 不命中；B2 是共享字符串文本，同样不命中
+        assert_eq!(
+            sheet.cell(1, 0).map(|c| c.style.colors.fg),
+            Some(0x00_00_00)
+        );
+        assert_eq!(
+            sheet.cell(1, 1).map(|c| c.style.colors.fg),
+            Some(0x00_00_00)
+        );
+        // 文本/数值口径不许被条件格式改动
+        assert_eq!(sheet.cell(0, 2).map(|c| c.numeric), Some(false));
+        assert_eq!(sheet.cell(0, 0).map(|c| c.numeric), Some(true));
+
+        // 其余 operator：between（只有 15 落在 10..20 里）
+        let range_xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>5</v></c></row><row r="2"><c r="A2"><v>15</v></c></row><row r="3"><c r="A3"><v>25</v></c></row></sheetData><conditionalFormatting sqref="A1:A3"><cfRule type="cellIs" dxfId="0" priority="1" operator="between"><formula>10</formula><formula>20</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let sheet = parse_worksheet(range_xml, &[], &styles);
+        assert_eq!(
+            sheet.cell(0, 0).map(|c| c.style.colors.fg),
+            Some(0x00_00_00)
+        );
+        assert_eq!(
+            sheet.cell(1, 0).map(|c| c.style.colors.fg),
+            Some(0x00_9C_00_06)
+        );
+        assert_eq!(
+            sheet.cell(2, 0).map(|c| c.style.colors.fg),
+            Some(0x00_00_00)
+        );
+    }
+
+    #[test]
+    fn malformed_conditional_formatting_is_skipped_without_panic() {
+        let styles = parse_styles(CF_STYLES, &Theme::default());
+        let cases = [
+            // sqref 是垃圾
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="!!!"><cfRule type="cellIs" dxfId="0" operator="lessThan"><formula>10</formula></cfRule></conditionalFormatting></worksheet>"#,
+            // 缺子元素 / 缺 type / dxfId 越界 / 未知 type / 空规则
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="colorScale"/><cfRule type="dataBar"/><cfRule type="cellIs" dxfId="99" operator="lessThan"><formula>10</formula></cfRule><cfRule type="expression"><formula>A1&gt;1</formula></cfRule><cfRule type="iconSet" dxfId="0"/><cfRule/></conditionalFormatting></worksheet>"#,
+            // 色标只有 1 个 / 颜色只有 theme（拿不到 → 整条跳过）
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="colorScale"><colorScale><cfvo type="min"/><color rgb="FFFF0000"/></colorScale></cfRule><cfRule type="colorScale" priority="2"><colorScale><cfvo type="min"/><cfvo type="max"/><color theme="4"/><color theme="5"/></colorScale></cfRule></conditionalFormatting></worksheet>"#,
+            // 认不出的 cfvo type / 没有 cfvo / 没有 formula / formula 不是字面量
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="colorScale"><colorScale><cfvo type="formula" val="A1"/><cfvo type="max"/><color rgb="FFFF0000"/><color rgb="FF00FF00"/></colorScale></cfRule><cfRule type="dataBar"><dataBar><color rgb="FF638EC6"/></dataBar></cfRule><cfRule type="cellIs" dxfId="0" operator="lessThan"/><cfRule type="cellIs" dxfId="0" operator="lessThan"><formula>$D$2</formula></cfRule></conditionalFormatting></worksheet>"#,
+            // 块没闭合 / 标签截断
+            r#"<worksheet><conditionalFormatting sqref="A1:A2"><cfRule type="colorScale"><colorScale><cfvo type="min"/>"#,
+            r#"<worksheet><conditionalFormatting"#,
+            // 区域越界（XFD1048577 超过我们自己的行上限）
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1:XFD1048577"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting></worksheet>"#,
+        ];
+        for (index, xml) in cases.iter().enumerate() {
+            let sheet = parse_worksheet(xml, &[], &styles);
+            // 坏输入 = "没有条件格式"：一个格子都不许被涂色
+            assert!(
+                sheet.cells.iter().all(|c| c.style.colors.bg.is_none()),
+                "case {index} 不该涂底色"
+            );
+            assert!(
+                sheet.cells.iter().all(|c| c.style.colors.fg == 0x00_00_00),
+                "case {index} 不该改字色"
+            );
+        }
+        // 越界那条规则仍然合法（区域被夹进上限），数据条算得出来
+        let last = parse_worksheet(cases[6], &[], &styles);
+        assert_eq!(last.cell(0, 0).and_then(|c| c.data_bar), Some(1.0));
+
+        // dxfs 的数量上限复用 MAX_XFS：超了截断，不能把整份文件撑进内存
+        let mut huge = String::from("<styleSheet><dxfs count=\"9999\">");
+        for _ in 0..(MAX_XFS + 16) {
+            huge.push_str("<dxf><font><color rgb=\"FF9C0006\"/></font></dxf>");
+        }
+        huge.push_str("</dxfs></styleSheet>");
+        assert_eq!(parse_dxfs(&huge, &Theme::default()).len(), MAX_XFS);
+    }
+
+    /// 条件格式夹具（默认不跑，夹具在仓外，见 `_bench/condfmt/`）：
+    ///
+    /// 夹具版式（`_bench/condfmt/make_condfmt.py` 产出，5,824 字节）：
+    /// - `C2:C5` dataBar（min/max）——C2:C5 = 120 / 98 / 143 / 361
+    /// - `C2:C5` cellIs `lessThan 100` + `dxfId="0"`（红字 `0x9C0006` / 粉底 `0xFFC7CE`）
+    /// - `D2:D5` colorScale min/percentile50/max，颜色按声明顺序 `F8696B → FFEB84 → 63BE7B`
+    ///   （即 min=红、max=绿，和 Excel 存的顺序一致：**第 i 个 `<color>` 对应第 i 个 `<cfvo>`**）
+    ///
+    /// ```powershell
+    /// $env:QLR_COND_SAMPLE = "<夹具>\condfmt-demo.xlsx"
+    /// $env:PATH = "D:\Ruanjian\Rust\cargo\bin;$env:PATH"
+    /// cargo test -p qlr-render --offline sheet::tests::conditional_formatting_fixture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn conditional_formatting_fixture() {
+        let Ok(sample) = std::env::var("QLR_COND_SAMPLE") else {
+            println!("跳过：未设置 QLR_COND_SAMPLE");
+            return;
+        };
+        let doc = parse_sheet(&std::path::PathBuf::from(&sample)).expect("解析夹具失败");
+        let sheet = doc.sheet().expect("夹具里没有工作表");
+        // 先把 C/D 两列原样打出来，肉眼核对"谁被涂了"
+        for cell in sheet.cells.iter().filter(|c| c.col == 2 || c.col == 3) {
+            println!(
+                "  ({},{}) text={:?} numeric={} bar={:?} fg={:#08X} bg={:?}",
+                cell.row,
+                cell.col,
+                cell.text,
+                cell.numeric,
+                cell.data_bar,
+                cell.style.colors.fg,
+                cell.style.colors.bg.map(|v| format!("{v:#08X}"))
+            );
+        }
+
+        let bar = |row: u32| sheet.cell(row, 2).and_then(|c| c.data_bar);
+        // 数据条只落在 C 列：98(min)→0.0、120→0.0837、143→0.1711、361(max)→1.0
+        assert!(
+            (bar(1).unwrap_or(f32::NAN) - 0.0837).abs() < 0.02,
+            "C2 数据条"
+        );
+        assert!((bar(2).unwrap_or(f32::NAN) - 0.0).abs() < 0.02, "C3 数据条");
+        assert!(
+            (bar(3).unwrap_or(f32::NAN) - 0.1711).abs() < 0.02,
+            "C4 数据条"
+        );
+        assert!((bar(4).unwrap_or(f32::NAN) - 1.0).abs() < 0.02, "C5 数据条");
+
+        // cellIs：只有 C3(98 < 100) 命中，红字 + 粉底；其它 C 格不许有底色
+        let hit = sheet.cell(2, 2).expect("C3");
+        assert_eq!(hit.style.colors.fg, 0x00_9C_00_06, "C3 字色");
+        assert_eq!(hit.style.colors.bg, Some(0x00_FF_C7_CE), "C3 底色");
+        for row in [1u32, 3, 4] {
+            let cell = sheet.cell(row, 2).expect("C 列");
+            assert_eq!(cell.style.colors.fg, 0x00_00_00, "C{row}^ 不该被 cellIs 标");
+            assert_eq!(cell.style.colors.bg, None, "C{row}^ 不该有底色");
+        }
+
+        // 色阶只在 D 列，且顺序为"小 → F8696B(第一个色标)、大 → 63BE7B(最后一个色标)"。
+        // 注意 min 在 **D3**(2760)，不是 D2：D2:D5 = 3480.5 / 2760 / 4102.25 / 10342.75。
+        let bg = |row: u32| sheet.cell(row, 3).and_then(|c| c.style.colors.bg);
+        let d_bgs: Vec<Option<u32>> = (1..=4).map(bg).collect();
+        assert!(d_bgs.iter().all(Option::is_some), "D2:D5 都该有色阶底色");
+        assert_eq!(bg(2), Some(0x00_F8_69_6B), "D3(2760, min) 应取第一个色标");
+        assert_eq!(
+            bg(4),
+            Some(0x00_63_BE_7B),
+            "D5(10342.75, max) 应取最后一个色标"
+        );
+        assert_ne!(bg(1), bg(2), "D2 与最小格应落在渐变的不同位置");
+        assert_ne!(bg(3), bg(4), "D4 与最大格应落在渐变的不同位置");
+        // D 列不参与数据条/cellIs（那两条规则的 sqref 是 C2:C5）
+        for row in 1..=4 {
+            let cell = sheet.cell(row, 3).expect("D 列");
+            assert_eq!(cell.data_bar, None, "D{row}^ 不该有数据条");
+            assert_eq!(cell.style.colors.fg, 0x00_00_00, "D{row}^ 不该被 cellIs 标");
+        }
+        println!("condfmt fixture ok: cells={}", sheet.cells.len());
+    }
+
     ///
     /// ```powershell
     /// $env:QLR_SHEET_SAMPLE = "<夹具>\real-monthly.xlsx"

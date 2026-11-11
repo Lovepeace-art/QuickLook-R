@@ -124,7 +124,7 @@ impl CellStyle {
 
 /// 一个非空单元格。`text` 是**已经算好数字格式的显示字符串**（日期、百分比、千分位都在
 /// 解析阶段定稿）——绘制端不再考虑数字格式，避免"渲染层也要懂 Excel 格式码"。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Cell {
     pub row: u32,
     pub col: u32,
@@ -139,6 +139,12 @@ pub struct Cell {
     /// 光看字符串内容猜不出来：SKU 那种 `10052953469532` 是**文本**，
     /// 猜成数值就会把一列 SKU 全画成 `####`（1.9.0 实测踩过）。
     pub numeric: bool,
+    /// 条件格式的**数据条**比例（1.9.3）：`Some(f)` = 在格子里从左往右填 `f`
+    /// （0.0–1.0）那么宽的条，`None` = 没有数据条。
+    ///
+    /// 为什么不单独存一张表：数据条的几何只跟"这一格的宽度"有关，绘制时按
+    /// 当前列宽乘比例就够；存成区间再查一遍反而要在热路径上做区间搜索。
+    pub data_bar: Option<f32>,
 }
 
 /// 合并区域：`(row, col)` 是左上角，`rows`/`cols` 是跨度（≥1）。
@@ -165,7 +171,7 @@ impl Merge {
 }
 
 /// 一张工作表。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sheet {
     pub name: String,
     /// 列数 / 行数（`col_widths` / `row_heights` 的长度就是它们）。
@@ -272,7 +278,7 @@ impl Sheet {
 /// 一个工作簿：多张表 + 当前表。
 ///
 /// 预览只画**当前一张**（`active`），切换由壳层改索引后重画——不在这里做跨表联动。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SheetDoc {
     pub sheets: Vec<Sheet>,
     /// 初始显示哪一张（一般是 workbook 里的第一个可见表）。
@@ -320,6 +326,7 @@ mod tests {
                     text: "A1".into(),
                     style: CellStyle::default(),
                     numeric: false,
+                    data_bar: None,
                 },
                 Cell {
                     row: 1,
@@ -327,6 +334,7 @@ mod tests {
                     text: "C2".into(),
                     style: CellStyle::default(),
                     numeric: false,
+                    data_bar: None,
                 },
             ],
             merges: vec![Merge {

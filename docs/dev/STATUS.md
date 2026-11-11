@@ -1,5 +1,7 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-11 · **表格条件格式（色阶 / 数据条 / 条件红字）**：解析 `<dxfs>` 与 `<conditionalFormatting>`（`colorScale` 2/3 色线性插值写 `colors.bg`、`dataBar` 写 `Cell.data_bar` 比例、`cellIs` 8 个 operator + `dxf` 写 `colors.fg/bg`；跳过 expression/iconSet/top10），绘制端按格宽 × 比例画蓝色数据条并压在网格线之下。`verify-sheet` 新增条件格式三项，**13 PASS**。回归 `cargo test` **362 passed / 0 failed / 12 ignored**、fmt/clippy 零输出。明细见 LOG。
+
 > 更新时间：2026-11-11 · **底部工作表标签栏（点标签切表）**：新增 `crates/qlr-platform/src/window/sheet_tabs.rs`（`sheet_tabs_height` / `paint_sheet_tabs` / `sheet_tab_at`，标签宽度按名字估、绘制与命中共用 `tab_rects()`）；`layout::Opts` 增 `tabs`、`Layout` 增 `tabs: RECT`，`from_below()` 从下边先切标签栏；`chrome.rs` 新增 `sheet_area()`（滚动条与滚动上限按“顶栏以下扣标签栏”算）；`input.rs` 新增 `sheet_tab_click` / `goto_sheet` 并接到 `WM_LBUTTONDOWN`。滚轮取舍按用户口径：上下滚 + Shift 左右滚。回归 `cargo test` **357 passed / 0 failed**、fmt/clippy 零输出。明细见 LOG。
 
 > 更新时间：2026-11-11 · **表格列宽/行高可拖拽调整（视图内生效）+ 数值列不再误画 `####` + 竖直滚动条**：`qlr-core::sheet::Cell` 增 `numeric`（只有 `t` 缺省/`t="n"` 才是数值，文本放不下走溢出/硬裁）；`qlr-platform::window::sheet` 新增 `SheetSizes`（按列号/行号存**额外像素**，只影响本次预览、**不写回文件**）、`sheet_divider_at`（表头分隔线 ±4 px）、`sheet_header_size()`，几何换算与命中测试全部改走它；`qlr-app` 在 `WM_LBUTTONDOWN` 插 `sheet_resize_start`、`WM_MOUSEMOVE`/`WM_LBUTTONUP` 各插一条，`set_content` 清空；表格竖直滚动条按**像素**画（`sheet_scroll_info`/`sheet_scroll_max`，`frame()` 为其让宽）。回归 `cargo test` **357 passed / 0 failed**、fmt/clippy 零输出、`verify-sheet` **10 PASS**、`verify-office` **23 PASS**、`smoke` 16 PASS·1 SKIP。明细见 LOG。

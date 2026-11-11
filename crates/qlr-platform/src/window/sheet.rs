@@ -79,6 +79,11 @@ const HEADER_FG_RGB: u32 = 0x0055_5555;
 const HEADER_SEP_RGB: u32 = 0x00B4_B4B4;
 /// 网格线（浅灰 1 px）。
 const GRID_RGB: u32 = 0x00D9_D9D9;
+/// 条件格式数据条的填充色（1.9.3）：取 Excel 默认"浅蓝条"的中间色。
+///
+/// 真 Excel 用渐变（左深右浅），这里用纯色——预览窗一格里也就几十像素宽，
+/// 渐变看不出来，反而多一次 `GradientFill` 的开销。
+const DATA_BAR_RGB: u32 = 0x0063_8EC6;
 /// 单元格边框（深灰）：与网格线拉开层次，否则 MEDIUM 边框看起来和网格一样。
 const BORDER_RGB: u32 = 0x0040_4040;
 
@@ -1249,6 +1254,7 @@ impl<'a> Painter<'a> {
             );
         }
         self.paint_backgrounds(region);
+        self.paint_data_bars(region);
         self.paint_grid(region);
         self.paint_merge_fills(region);
         self.paint_borders(region);
@@ -1278,6 +1284,46 @@ impl<'a> Painter<'a> {
                     continue;
                 }
                 fill_solid(self.hdc, box_, rgb_to_colorref(bg));
+            }
+        }
+    }
+
+    /// 条件格式的数据条（1.9.3）：按 `cell.data_bar` 的比例从左边填一段。
+    ///
+    /// 画在**网格线之前**：Excel 里网格线压在数据条上面，否则长条会把竖线
+    /// 整片盖掉、表面看起来少了一堆格子。合并区内的从属格不画（由左上格代表）。
+    fn paint_data_bars(&self, region: &Region) {
+        for row in region.rows.0..=region.rows.1 {
+            for col in region.cols.0..=region.cols.1 {
+                if merge_covering(&self.merges, row, col).is_some() {
+                    continue;
+                }
+                let Some(cell) = self.sheet.cell(row, col) else {
+                    continue;
+                };
+                let Some(ratio) = cell.data_bar else {
+                    continue;
+                };
+                let ratio = ratio.clamp(0.0, 1.0);
+                if ratio <= 0.0 {
+                    continue;
+                }
+                let box_ = self.cell_box(region, row, col);
+                if !intersects(box_, region.clip) {
+                    continue;
+                }
+                let full = (box_.right - box_.left).max(0);
+                let w = (full as f32 * ratio).round() as i32;
+                if w <= 0 {
+                    continue;
+                }
+                let bar = RECT {
+                    left: box_.left,
+                    top: box_.top,
+                    right: box_.left.saturating_add(w),
+                    bottom: box_.bottom,
+                };
+                fill_solid(self.hdc, bar, rgb_to_colorref(DATA_BAR_RGB));
             }
         }
     }
@@ -1926,6 +1972,7 @@ mod tests {
             // 测试里的格子当"文本"用：真实解析器按 `t` 属性给这个位，
             // 猜内容会出错（SKU 是长数字但属于文本）。
             numeric: false,
+            data_bar: None,
         }
     }
 
