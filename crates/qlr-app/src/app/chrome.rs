@@ -176,8 +176,10 @@ pub(crate) fn frame(hwnd: HWND) -> Frame {
         archive_scroll_info(below).is_some()
     } else if is_sheet_view() {
         // 表格的滚动条按**像素**算（1.9.1）：竖直方向还能滚就要占一条宽度，
-        // 否则滑块会压在真正的内容上。
-        sheet_scroll_info(below).is_some()
+        // 否则滑块会压在真正的内容上。可见高度要扣掉底部标签栏（1.9.2）。
+        let mut area = below;
+        area.bottom -= window::sheet_tabs_height();
+        sheet_scroll_info(area).is_some()
     } else {
         scroll_info().is_some()
     };
@@ -189,6 +191,8 @@ pub(crate) fn frame(hwnd: HWND) -> Frame {
             zoom,
             toc: has_toc,
             bar: layout::Bar::from_visible(visible_bar),
+            // 表格预览有底部工作表标签栏（1.9.2）：内容区要为它让出高度。
+            tabs: is_sheet_view(),
         },
     )
 }
@@ -308,10 +312,10 @@ pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
     let layout = frame(hwnd);
     // 表格（1.9.1）：滑块走"像素"，比例 × 最大偏移就是目标 scroll_y。
     if is_sheet_view() {
-        let Some(info) = sheet_scroll_info(layout.below_chrome) else {
+        let Some(info) = sheet_scroll_info(sheet_area(&layout)) else {
             return;
         };
-        let Some((_, max_y)) = sheet_scroll_max(layout.below_chrome) else {
+        let Some((_, max_y)) = sheet_scroll_max(sheet_area(&layout)) else {
             return;
         };
         let ratio = window::scroll_start_at(layout.below_chrome, y, info);
@@ -339,6 +343,18 @@ pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
         with_state(|s| s.scroll = scroll.min(max));
         window::invalidate(hwnd);
     }
+}
+
+/// 表格"内容 + 滚动条"那片区域：顶栏以下，但要扣掉底部标签栏（1.9.2）。
+///
+/// 滚动条与滚动上限都按这块算——直接用 `below_chrome` 会让滑块长度按 718 px 算，
+/// 而真正能看内容的地方只有 682 px，滑块会偏长、拖到底还会差一截。
+pub(crate) fn sheet_area(layout: &Frame) -> RECT {
+    let mut area = layout.below_chrome;
+    if let Some(tabs) = layout.tabs {
+        area.bottom = tabs.top;
+    }
+    area
 }
 
 /// 当前内容是表格吗（`frame`/滚动条走不同通道）。
@@ -703,8 +719,13 @@ pub(crate) fn repaint(hwnd: HWND) {
                 );
                 // 竖直滚动条（1.9.1）：滑块按**像素**算，画在内容区右侧那条上。
                 // `paint_sheet` 内部已经 `EndPaint`，这里再用 `GetDC` 那版不冲突。
-                if let Some(info) = sheet_scroll_info(layout.below_chrome) {
-                    window::paint_scrollbar(hwnd, layout.below_chrome, info, false);
+                if let Some(info) = sheet_scroll_info(sheet_area(&layout)) {
+                    window::paint_scrollbar(hwnd, sheet_area(&layout), info, false);
+                }
+                // 底部工作表标签栏（1.9.2）：点标签切表，当前页高亮。
+                if let Some(tabs) = layout.tabs {
+                    let active = with_state(|s| s.page).unwrap_or(0);
+                    window::paint_sheet_tabs(hwnd, tabs, doc, active);
                 }
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
@@ -1030,6 +1051,8 @@ pub(crate) fn paint_overlays(hwnd: HWND, layout: &Frame) {
     if layout.bar.is_some()
         && let Some(info) = scroll_info()
     {
+        // 这条是文本/PDF 的通用路径：表格有自己的分支（`Canvas::Sheet` 里早早 return），
+        // 走不到这里，所以直接用 `below_chrome`。
         window::paint_scrollbar(hwnd, layout.below_chrome, info, false);
     }
     // 音频/视频进度条（1.7.9）：位图通道（图片/视频/SVG）走的是这里而不是 `_dc` 版本，

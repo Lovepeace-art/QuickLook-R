@@ -1368,6 +1368,7 @@ mod scroll;
 mod settings;
 mod shadow;
 mod sheet;
+mod sheet_tabs;
 mod text;
 mod toc;
 
@@ -1379,5 +1380,6 @@ pub use scroll::*;
 pub use settings::*;
 pub use shadow::*;
 pub use sheet::*;
+pub use sheet_tabs::*;
 pub use text::*;
 pub use toc::*;

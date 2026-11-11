@@ -94,6 +94,8 @@ pub struct Opts {
     pub toc: bool,
     /// 滚动条从哪来。
     pub bar: Bar,
+    /// 底部工作表标签栏（1.9.2，只有表格预览才有）：内容区要为它让出一条高度。
+    pub tabs: bool,
 }
 
 /// 算好的几何。绘制、命中、渲染请求、开窗前推尺寸都只读它。
@@ -107,6 +109,8 @@ pub struct Layout {
     pub toc: Option<RECT>,
     /// 滚动条（内容放不下才有）。
     pub bar: Option<RECT>,
+    /// 底部工作表标签栏（1.9.2，表格预览才有）。
+    pub tabs: Option<RECT>,
     /// 渲染盒：`content × zoom`。上屏时位图尺寸必须等于它，否则每帧拉伸。
     pub render_box: (u32, u32),
 }
@@ -140,6 +144,20 @@ pub fn from_below(below: RECT, opts: Opts) -> Layout {
         content.left += window::toc_width();
     }
     let toc = want_toc.then(|| window::toc_rect(below));
+    // 底部标签栏（1.9.2）：从下边切一条，再切目录/滚动条——顺序与"可见顺序"一致。
+    let tabs = if opts.tabs {
+        let h = window::sheet_tabs_height();
+        let top = (content.bottom - h).max(content.top);
+        content.bottom = top;
+        Some(RECT {
+            left: below.left,
+            top,
+            right: below.right,
+            bottom: below.bottom,
+        })
+    } else {
+        None
+    };
     let bar = if opts.bar.shown(opts.kind, opts.pages) {
         content.right -= window::scrollbar_w();
         Some(window::scrollbar_rect(below))
@@ -152,6 +170,7 @@ pub fn from_below(below: RECT, opts: Opts) -> Layout {
         content,
         toc,
         bar,
+        tabs,
         render_box: (scaled(w, opts.zoom), scaled(h, opts.zoom)),
     }
 }
@@ -213,6 +232,7 @@ mod tests {
             zoom,
             toc,
             bar,
+            tabs: false,
         }
     }
 

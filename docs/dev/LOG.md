@@ -3360,3 +3360,43 @@ ADR-0010 定的下一步：把线程级租约推广出"后端会话"维度、给
 自动化验证还踩了一个坑：一开始把"拖行高"的抓取点放在内容区 y=50，一直命不中——因为
 `real-monthly.xlsx` 的**第 0 行高 141 px**（表头行），行分隔线根本不在那儿。**抓取点要按实际行列尺寸算**，
 别按默认 20 px 猜。
+
+## 2026-11-11 · 1.9.2：底部工作表标签栏（点标签切表）
+
+### 做了什么
+
+- 新模块 `crates/qlr-platform/src/window/sheet_tabs.rs`：
+  - `pub fn sheet_tabs_height() -> i32`（DIP 24，随 DPI）；
+  - `pub fn paint_sheet_tabs(hwnd, area, doc: &SheetDoc, active: usize)`——灰底条 + 每个标签白底/分隔线，
+    活动标签顶部 2 px 强调线（绿），文字居中 `DT_END_ELLIPSIS`；
+  - `pub fn sheet_tab_at(doc, area, x, y) -> Option<usize>`——命中测试；
+  - 标签宽度按名字估（中文 15、ASCII 8，两侧各 10 内边距，夹 56–200 DIP），**绘制与命中用同一个
+    `tab_rects()`**，不依赖 HDC，所以"看到的位置"和"点到的位置"不会错位。放不下就少画几个（不搞标签横向滚动）。
+- `crates/qlr-app/src/layout.rs`：`Opts` 增 `tabs: bool`、`Layout` 增 `tabs: Option<RECT>`；`from_below()`
+  在切目录/滚动条**之前**先从下边切一条标签栏（顺序与"可见顺序"一致）。
+- `crates/qlr-app/src/app/chrome.rs`：`frame()` 传 `tabs: is_sheet_view()`；新增 `sheet_area(&layout)`
+  （顶栏以下、扣掉标签栏）——滚动条与滚动上限都按它算，否则滑块按 718 px 算而实际可见只有 682 px；
+  `repaint` 的表格分支在滚动条之后画标签栏。
+- `crates/qlr-app/src/app/input.rs`：新增 `sheet_tab_click(lparam)`（命中标签 → 切表）与
+  `goto_sheet(index)`（写 `s.page`、清 `sheet_scroll`、`request_render(..., index)`）；`boot.rs` 的
+  `WM_LBUTTONDOWN` 在"表头分隔线"之后、"压缩包行"之前接上。
+
+### 为什么
+
+用户明确要求（「底部标签栏是必须的，方便切换表格」）。在此之前切表只有两条路：翻页键（PageUp/PageDown）
+和顶栏 `4 / 5` 页码框手动输入——都不如"看见名字点一下"。滚动这边按用户口径做取舍：滚轮上下滚、
+**Shift+滚轮左右滚**（`sheet_scroll_by_wheel` 里已有），不再另做横向滚动条。
+
+### 怎么验证
+
+- `cargo test --workspace --offline` **357 passed / 11 ignored / 0 failed**；clippy 与 fmt 干净。
+- 真机点标签（`_bench\office2pdf\postdrag.ps1 -GrabX 60 -GrabY 725 -DragPx 0`，直接 `PostMessage`）：
+  日志 `SHEET-TAB 切到第 1 张：销售总览` → `PAGE 1/5` → `RENDER gen=2 sheet … elapsed=2ms`；
+  截图 `_bench\sheet\tabs2.png`（默认停在第 4 张，活动标签高亮）与 `tabs-click1.png`（点完切到第 1 张）。
+
+### 踩到的坑
+
+- **标签栏最下面 8 px 会被"拖边框改大小"抢走**：`boot.rs` 的 `WM_LBUTTONDOWN` 先判 `edges_at`，
+  所以点标签请点中间。这是有意的（底部边缘改大小是更常用的手势），不做特例。
+- 第一次点标签点到了 y=740（窗口高 748），直接触发"改大小"、内容区从 694 变成 765——排查时看
+  `PAINT sheet … content=863x765` 这个异常值就能立刻分辨。

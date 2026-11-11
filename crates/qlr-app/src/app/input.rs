@@ -306,6 +306,61 @@ pub(crate) fn on_wheel(delta: i32) {
 ///
 /// 二维滚动，偏移是**像素**（`State::sheet_scroll`），不是"第几行"——表格的行高
 /// 逐行不同（Excel 允许单独调行高），按行号表达不了"滚到半行"。
+/// 点底部工作表标签（1.9.2）。返回是否处理了这次点击。
+pub(crate) fn sheet_tab_click(lparam: LPARAM) -> bool {
+    let (mx, my) = client_xy(lparam);
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let layout = frame(preview.raw());
+    let Some(area) = layout.tabs else {
+        return false;
+    };
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(index) = window::sheet_tab_at(doc, area, mx, my) else {
+        return false;
+    };
+    let name = doc
+        .sheets
+        .get(index)
+        .map(|s| s.name.as_str())
+        .unwrap_or("?")
+        .to_string();
+    log_info!(SCOPE, "SHEET-TAB 切到第 {} 张：{}", index + 1, name);
+    goto_sheet(index);
+    true
+}
+
+/// 切到第 `index` 张工作表（0 基，1.9.2）。与翻页键共用同一条"重解析整包"的路径。
+pub(crate) fn goto_sheet(index: usize) {
+    let Some((preview, path, pages, page)) =
+        with_state(|s| (s.preview, s.last_path.clone(), s.pages, s.page))
+    else {
+        return;
+    };
+    let Some(path) = path else { return };
+    let target = match pages {
+        Some(n) if n > 0 => index.min(n - 1),
+        _ => index,
+    };
+    if target == page {
+        return;
+    }
+    with_state(|s| {
+        s.page = target;
+        // 换表从左上角看起（跟翻页键一致）。
+        s.sheet_scroll = (0, 0);
+    });
+    let (width, height) = view_size(preview.raw());
+    request_render(&path, width, height, target);
+    log_info!(SCOPE, "PAGE {}/{}", target + 1, pages.unwrap_or(target + 1));
+}
+
 pub(crate) fn sheet_scroll_by_wheel(notches: isize) -> bool {
     let (row_h, col_w) = (
         qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32,
@@ -967,6 +1022,7 @@ pub(crate) fn render_box(
             zoom,
             toc: false,
             bar: layout::Bar::Auto,
+            tabs: false,
         },
     )
     .render_box

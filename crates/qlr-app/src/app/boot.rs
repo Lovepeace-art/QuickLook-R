@@ -824,6 +824,9 @@ pub(crate) unsafe extern "system" fn wndproc(
                 }
                 if sheet_resize_start(hwnd, lparam) {
                     LRESULT(0)
+                } else if sheet_tab_click(lparam) {
+                    // 3) 底部工作表标签（1.9.2）：点了就切表，不吃掉会变成拖窗口。
+                    LRESULT(0)
                 } else if archive_click(hwnd, lparam) {
                     // 3) 压缩包行（1.7.3）：选中 + 目录折叠，不吃掉的话会变成拖窗口。
                     LRESULT(0)
