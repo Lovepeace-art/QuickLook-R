@@ -84,6 +84,8 @@ const GRID_RGB: u32 = 0x00D9_D9D9;
 /// 真 Excel 用渐变（左深右浅），这里用纯色——预览窗一格里也就几十像素宽，
 /// 渐变看不出来，反而多一次 `GradientFill` 的开销。
 const DATA_BAR_RGB: u32 = 0x0063_8EC6;
+/// 选中框颜色（1.9.4）：Excel 用深绿；这里跟标签栏强调色统一。
+const SELECT_RGB: u32 = 0x00_1E6B3A;
 /// 单元格边框（深灰）：与网格线拉开层次，否则 MEDIUM 边框看起来和网格一样。
 const BORDER_RGB: u32 = 0x0040_4040;
 
@@ -717,6 +719,8 @@ struct Painter<'a> {
     scroll_y: i32,
     /// 可能出现在屏幕上的合并区（进 paint 前筛一次，逐格再查就只扫这一小撮）。
     merges: Vec<Merge>,
+    /// 选中单元格（1.9.4）：画在最后，随双缓冲一起上屏。
+    sel: Option<(u32, u32, u32, u32)>,
 }
 
 impl<'a> Painter<'a> {
@@ -727,6 +731,7 @@ impl<'a> Painter<'a> {
         content: RECT,
         scroll_x: i32,
         scroll_y: i32,
+        sel: Option<(u32, u32, u32, u32)>,
     ) -> Self {
         let m = Metrics::current();
         let merges = visible_merges(sheet, &sizes, &m, content, scroll_x, scroll_y);
@@ -739,6 +744,7 @@ impl<'a> Painter<'a> {
             scroll_x,
             scroll_y,
             merges,
+            sel,
         }
     }
 
@@ -990,10 +996,66 @@ impl<'a> Painter<'a> {
         for region in self.regions() {
             self.paint_region(&region);
         }
+        self.paint_selection();
         if saved != 0 {
             unsafe {
                 let _ = RestoreDC(self.hdc, saved);
             }
+        }
+    }
+
+    /// 选中框（1.9.4）：画在所有格子和网格线之上，跟着双缓冲一起上屏。
+    /// 单独一趟 GetDC 画不行——PrintWindow 与系统重绘都看不到它（CONVENTIONS #169）。
+    fn paint_selection(&self) {
+        // 选区用"锚点 + 焦点"两个格子表达；单格时两者相同。
+        let Some((r0, c0, r1, c1)) = self.sel else {
+            return;
+        };
+        let a = sheet_cell_rect(
+            self.sheet,
+            &self.sizes,
+            self.scroll_x,
+            self.scroll_y,
+            r0 as usize,
+            c0 as usize,
+        );
+        let b = sheet_cell_rect(
+            self.sheet,
+            &self.sizes,
+            self.scroll_x,
+            self.scroll_y,
+            r1 as usize,
+            c1 as usize,
+        );
+        let (Some(a), Some(b)) = (a, b) else {
+            return;
+        };
+        // 两个角格的并集就是矩形选区（拖动方向不影响）。
+        let rect = RECT {
+            left: a.left.min(b.left),
+            top: a.top.min(b.top),
+            right: a.right.max(b.right),
+            bottom: a.bottom.max(b.bottom),
+        };
+        let screen = RECT {
+            left: rect.left.saturating_add(self.content.left),
+            top: rect.top.saturating_add(self.content.top),
+            right: rect.right.saturating_add(self.content.left),
+            bottom: rect.bottom.saturating_add(self.content.top),
+        };
+        let clipped = intersect_rect(screen, self.body_rect());
+        if clipped.right - clipped.left <= 1 || clipped.bottom - clipped.top <= 1 {
+            return;
+        }
+        frame_solid(self.hdc, clipped, SELECT_RGB);
+        let inner = RECT {
+            left: clipped.left + 1,
+            top: clipped.top + 1,
+            right: clipped.right - 1,
+            bottom: clipped.bottom - 1,
+        };
+        if inner.right - inner.left > 1 && inner.bottom - inner.top > 1 {
+            frame_solid(self.hdc, inner, SELECT_RGB);
         }
     }
 
@@ -1829,6 +1891,69 @@ pub fn sheet_cell_at(
     Some((row as usize, col as usize))
 }
 
+/// 某个格子在屏幕上的矩形（相对 content 左上角，1.9.4 选中框用）。
+///
+/// 与 [`sheet_cell_at`] 同一套口径（表头偏移、冻结区不滚动、合并区扩到整块），
+/// 是它的逆运算。返回 `None` 表示格子在表外或尺寸退化（宽度/高度为 0）。
+pub fn sheet_cell_rect(
+    sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
+    scroll_x: i32,
+    scroll_y: i32,
+    row: usize,
+    col: usize,
+) -> Option<RECT> {
+    if row as u32 >= sheet.rows || col as u32 >= sheet.cols {
+        return None;
+    }
+    let m = Metrics::current();
+    let frozen_cols = sheet.frozen_cols.min(sheet.cols);
+    let frozen_rows = sheet.frozen_rows.min(sheet.rows);
+    let offset_x = if (col as u32) < frozen_cols {
+        0
+    } else {
+        scroll_x.max(0)
+    };
+    let offset_y = if (row as u32) < frozen_rows {
+        0
+    } else {
+        scroll_y.max(0)
+    };
+
+    // 合并区要扩成整块：起点取合并区左上，宽高按合并行列数累加。
+    let (mut cols, mut rows) = (1u32, 1u32);
+    if let Some(merge) = sheet.merge_at(row as u32, col as u32) {
+        if merge.row == row as u32 && merge.col == col as u32 {
+            cols = merge.cols.max(1);
+            rows = merge.rows.max(1);
+        }
+    }
+
+    let left = m
+        .header_w
+        .saturating_add(px_i32(sizes.col_x(sheet, col as u32)))
+        .saturating_sub(offset_x);
+    let top = m
+        .header_h
+        .saturating_add(px_i32(sizes.row_y(sheet, row as u32)))
+        .saturating_sub(offset_y);
+    let width: i32 = (0..cols)
+        .map(|i| sizes.col_width(sheet, col as u32 + i))
+        .fold(0i32, |acc, w| acc.saturating_add(w));
+    let height: i32 = (0..rows)
+        .map(|i| sizes.row_height(sheet, row as u32 + i))
+        .fold(0i32, |acc, h| acc.saturating_add(h));
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(RECT {
+        left,
+        top,
+        right: left.saturating_add(width),
+        bottom: top.saturating_add(height),
+    })
+}
+
 /// 表头分隔线命中测试（1.9.1）：用户拖列宽/行高时，先问这里"按在哪条线上"。
 ///
 /// - 只有按在**列号条**（顶部 `header_h` 高）或**行号条**（左侧 `header_w` 宽）上才算——
@@ -1899,6 +2024,7 @@ pub fn paint_sheet(
     sizes: &SheetSizes<'_>,
     scroll_x: i32,
     scroll_y: i32,
+    sel: Option<(u32, u32, u32, u32)>,
 ) {
     let mut ps = PAINTSTRUCT::default();
     let window_dc: HDC = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -1926,7 +2052,7 @@ pub fn paint_sheet(
     let content = intersect_rect(content.unwrap_or(after_chrome), rc);
     if content.right > content.left && content.bottom > content.top {
         check_sheet_health(sheet);
-        Painter::new(hdc, sheet, *sizes, content, scroll_x, scroll_y).paint();
+        Painter::new(hdc, sheet, *sizes, content, scroll_x, scroll_y, sel).paint();
     }
 
     if let Some(buf) = &buffer {
@@ -1957,6 +2083,7 @@ pub fn paint_sheet(
         let _ = EndPaint(hwnd, &ps);
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -2158,6 +2285,44 @@ mod tests {
                 m.header_h + 1
             ),
             Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn cell_rect_round_trips_with_hit_test() {
+        let s = sample();
+        let m = Metrics::current();
+        // 每格矩形的中心点必须能命中回自己（合并区换算成左上角）。
+        for row in 0..s.rows.min(6) {
+            for col in 0..s.cols.min(6) {
+                let Some(rect) =
+                    sheet_cell_rect(&s, &SheetSizes::EMPTY, 0, 0, row as usize, col as usize)
+                else {
+                    continue;
+                };
+                let cx = (rect.left + rect.right) / 2;
+                let cy = (rect.top + rect.bottom) / 2;
+                let hit = sheet_cell_at(&s, &SheetSizes::EMPTY, 0, 0, cx, cy);
+                let expected = if s.covered_by_merge(row, col) {
+                    None // 从属格不该被单独返回矩形，交给外面判空
+                } else if let Some(merge) = s.merge_at(row, col) {
+                    Some((merge.row as usize, merge.col as usize))
+                } else {
+                    Some((row as usize, col as usize))
+                };
+                if let Some(expected) = expected {
+                    assert_eq!(hit, Some(expected), "({row},{col}) 矩形中心命中错了");
+                }
+            }
+        }
+        // 矩形左上角就是"表头 + 该格内容坐标"（未滚动）
+        let rect = sheet_cell_rect(&s, &SheetSizes::EMPTY, 0, 0, 1, 0).unwrap();
+        assert_eq!(rect.left, m.header_w + px_i32(s.col_x(0)));
+        assert_eq!(rect.top, m.header_h + px_i32(s.row_y(1)));
+        // 越界格返回 None，不 panic
+        assert_eq!(
+            sheet_cell_rect(&s, &SheetSizes::EMPTY, 0, 0, 9_999, 0),
+            None
         );
     }
 

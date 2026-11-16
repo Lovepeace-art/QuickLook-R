@@ -15,8 +15,8 @@ pub(crate) use qlr_core::{
     Config, Level, format, log, log_debug, log_error, log_info, log_warn, paths, plugins, version,
 };
 pub(crate) use qlr_platform::{
-    crash, dpi, hotkey, instance, integrity, selection, shellpreview, thumbnail, tray, win11,
-    window,
+    clipboard, crash, dpi, hotkey, instance, integrity, selection, shellpreview, thumbnail, tray,
+    win11, window,
 };
 pub(crate) use qlr_render::Canvas;
 pub(crate) use std::path::{Path, PathBuf};
@@ -32,7 +32,8 @@ pub(crate) use windows::Win32::Graphics::Gdi::HDC;
 // KillTimer / PostQuitMessage / SetTimer`——`verify-layers.ps1` 会断言 app 不许直接调。
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, WM_ACTIVATE, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_ERASEBKGND,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEHWHEEL,
+    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_HOTKEY,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER,
 };
 

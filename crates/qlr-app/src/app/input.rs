@@ -353,12 +353,241 @@ pub(crate) fn goto_sheet(index: usize) {
     }
     with_state(|s| {
         s.page = target;
-        // 换表从左上角看起（跟翻页键一致）。
+        // 换表从左上角看起（跟翻页键一致），选中也一并清掉。
         s.sheet_scroll = (0, 0);
+        s.sheet_sel = None;
+        s.sheet_sel_focus = None;
+        s.sheet_dragging = false;
     });
     let (width, height) = view_size(preview.raw());
     request_render(&path, width, height, target);
     log_info!(SCOPE, "PAGE {}/{}", target + 1, pages.unwrap_or(target + 1));
+}
+
+/// 点表格内容区选中一个单元格（1.9.4）。
+///
+/// 只接管"内容区里、落在真格子上"的点击；点表头/空白处清掉选中。
+/// 非表格内容一律返回 `false`，让上层继续走原来的"拖动整窗"。
+pub(crate) fn sheet_click(lparam: LPARAM) -> bool {
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(sheet) = doc.sheet() else {
+        return false;
+    };
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let (mx, my) = client_xy(lparam);
+    let (sx, sy, col_extra, row_extra) = with_state(|s| {
+        (
+            s.sheet_scroll.0,
+            s.sheet_scroll.1,
+            s.sheet_col_w.clone(),
+            s.sheet_row_h.clone(),
+        )
+    })
+    .unwrap_or((0, 0, Vec::new(), Vec::new()));
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    let layout = frame(preview.raw());
+    let px = mx - layout.content.left;
+    let py = my - layout.content.top;
+    let hit = window::sheet_cell_at(sheet, &sizes, sx, sy, px, py);
+    with_state(|s| {
+        s.sheet_sel = hit.map(|(r, c)| (r as u32, c as u32));
+        s.sheet_sel_focus = s.sheet_sel;
+        // 按在格子上就进入"拖动扩选"状态（松手前移动鼠标会更新焦点）。
+        s.sheet_dragging = s.sheet_sel.is_some();
+    });
+    match hit {
+        Some((row, col)) => log_debug!(SCOPE, "SHEET-SEL ({row},{col}) 内容区 ({px},{py})"),
+        None => log_debug!(SCOPE, "SHEET-SEL 清空 内容区 ({px},{py}) 内容区原点 ({},{})", layout.content.left, layout.content.top),
+    }
+    window::invalidate(preview.raw());
+    true
+}
+
+/// 拖动扩选（1.9.4）：按住左键在表格里移动时更新选区焦点。
+pub(crate) fn sheet_drag_move(lparam: LPARAM) -> bool {
+    if !with_state(|s| s.sheet_dragging).unwrap_or(false) {
+        return false;
+    }
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(sheet) = doc.sheet() else {
+        return false;
+    };
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let (mx, my) = client_xy(lparam);
+    let (sx, sy, col_extra, row_extra) = with_state(|s| {
+        (
+            s.sheet_scroll.0,
+            s.sheet_scroll.1,
+            s.sheet_col_w.clone(),
+            s.sheet_row_h.clone(),
+        )
+    })
+    .unwrap_or((0, 0, Vec::new(), Vec::new()));
+    let sizes = window::SheetSizes {
+        col_extra: &col_extra,
+        row_extra: &row_extra,
+    };
+    let layout = frame(preview.raw());
+    let px = mx - layout.content.left;
+    let py = my - layout.content.top;
+    let Some((row, col)) = window::sheet_cell_at(sheet, &sizes, sx, sy, px, py) else {
+        return true;
+    };
+    let (row, col) = (row as u32, col as u32);
+    let changed = with_state(|s| {
+        let before = s.sheet_sel_focus;
+        s.sheet_sel_focus = Some((row, col));
+        before != s.sheet_sel_focus
+    })
+    .unwrap_or(false);
+    if changed {
+        window::invalidate(preview.raw());
+    }
+    true
+}
+
+/// 松开左键：结束拖动扩选（1.9.4）。
+pub(crate) fn sheet_drag_end() -> bool {
+    let dragging = with_state(|s| s.sheet_dragging).unwrap_or(false);
+    if dragging {
+        with_state(|s| s.sheet_dragging = false);
+    }
+    dragging
+}
+
+/// Ctrl+C：把选中区放进剪贴板（1.9.4）。
+///
+/// 单格 → 纯文本；多格 → TSV（行用 `\r\n`、列用 `\t`），直接粘到 Excel/表格软件
+/// 就是一块区域。复制的是**显示文本**（已按数字格式化成 `1,234.5`、`23.70%`），
+/// 不是 XML 原始值——用户复制就是要能贴出去的东西。
+pub(crate) fn sheet_copy_selection(hwnd: HWND) -> bool {
+    let Some(canvas) = get_content() else {
+        return false;
+    };
+    let Canvas::Sheet(doc) = &*canvas else {
+        return false;
+    };
+    let Some(sheet) = doc.sheet() else {
+        return false;
+    };
+    let Some((r0, c0)) = with_state(|s| s.sheet_sel).flatten() else {
+        show_toast_ms(hwnd, "先在表格里点一下要复制的单元格", 1600);
+        return true;
+    };
+    let (r1, c1) = with_state(|s| s.sheet_sel_focus)
+        .flatten()
+        .unwrap_or((r0, c0));
+    let (top, bottom) = (r0.min(r1), r0.max(r1));
+    let (left, right) = (c0.min(c1), c0.max(c1));
+    let mut out = String::new();
+    for row in top..=bottom {
+        for col in left..=right {
+            if col > left {
+                out.push('\t');
+            }
+            if let Some(cell) = sheet.cell(row, col) {
+                out.push_str(&cell.text);
+            }
+        }
+        if row < bottom {
+            out.push_str("\r\n");
+        }
+    }
+    let cells = (bottom - top + 1) as usize * (right - left + 1) as usize;
+    if clipboard::set_text(&out) {
+        let label = if cells == 1 {
+            format!("已复制 {}{}", column_name(left), top + 1)
+        } else {
+            format!(
+                "已复制 {}{}:{}{}（{cells} 格）",
+                column_name(left),
+                top + 1,
+                column_name(right),
+                bottom + 1
+            )
+        };
+        log_info!(
+            SCOPE,
+            "SHEET-COPY {label} 字符数 {}",
+            out.chars().count()
+        );
+        show_toast_ms(hwnd, &label, 1400);
+    } else {
+        log_warn!(SCOPE, "SHEET-COPY 剪贴板被占用，复制失败");
+        show_toast_ms(hwnd, "剪贴板被别的程序占着，稍后再试", 2000);
+    }
+    true
+}
+
+/// 光标是否在预览窗的窗口矩形里（1.9.4）。
+///
+/// 用壳层自己的 `State::preview` 句柄算，不依赖 `hotkey` 模块里的全局
+/// `PREVIEW_HWND`（那个在"钩子没装上/被重建"时可能是 0）。
+pub(crate) fn preview_cursor_inside() -> bool {
+    let Some(preview) = with_state(|s| s.preview) else {
+        return false;
+    };
+    let (Some((cx, cy)), rect) = (window::cursor_pos(), window::window_rect(preview.raw())) else {
+        return false;
+    };
+    cx >= rect.left && cx < rect.right && cy >= rect.top && cy < rect.bottom
+}
+
+/// 25 ms 轮询一次 Ctrl+C（1.9.4）：只在"光标在预览窗上"时认这个键。
+pub(crate) fn sheet_poll_ctrl_c(hwnd: HWND) {
+    let over = preview_cursor_inside();
+    let (ctrl, c) = hotkey::ctrl_c_state();
+    // 诊断：每 2 秒最多一条，用来判断"轮询有没有在跑 / 键状态读没读到"。
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > 2000 {
+            LAST.store(now, Ordering::Relaxed);
+            log_debug!(SCOPE, "CTRLCPOLL over={over} ctrl={ctrl} c={c}");
+        }
+    }
+    if !over {
+        return;
+    }
+    if hotkey::poll_ctrl_c() {
+        log_debug!(SCOPE, "CTRLCPOLL 命中 Ctrl+C");
+        sheet_copy_selection(hwnd);
+    }
+}
+
+/// 列号 → Excel 列名（0 → A、25 → Z、26 → AA）。只给提示文案用。
+fn column_name(mut col: u32) -> String {
+    let mut out = String::new();
+    loop {
+        out.push((b'A' + (col % 26) as u8) as char);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    out.chars().rev().collect()
 }
 
 pub(crate) fn sheet_scroll_by_wheel(notches: isize) -> bool {
@@ -1490,6 +1719,13 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
         return;
     }
     match vk as u32 {
+        // Ctrl+C（1.9.4）：复制选中的单元格。必须放在方向键/缩放之前。
+        0x43 => {
+            if let Some(preview) = preview_raw() {
+                sheet_copy_selection(preview);
+            }
+            return;
+        }
         // + / = 放大，- 缩小，0 复位；上下方向键纵向平移（放大后才有意义）。
         0xBB | 0x6B => return set_zoom(1.25),
         0xBD | 0x6D => return set_zoom(0.8),

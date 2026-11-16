@@ -35,16 +35,18 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
+    MOD_CONTROL, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
     VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjects;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GA_ROOT, GUITHREADINFO, GetAncestor, GetClassNameW,
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, HHOOK,
-    IsWindowVisible, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW,
-    QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId,
+    HHOOK, IsWindowVisible, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
+    PostMessageW, QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+    WM_KEYUP, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const SCOPE: &str = "hotkey";
@@ -354,6 +356,113 @@ pub fn set_active(active: bool) {
 /// 滚轮吞掉就没法滚。PPT 由我们接管翻页，仍然吞。
 pub fn set_wheel_pass_through(pass: bool) {
     WHEEL_PASS_THROUGH.store(pass, Ordering::Relaxed);
+}
+
+/// Ctrl+C 的边沿检测（1.9.4）：供壳层 25 ms 轮询用。
+///
+/// 返回 `true` 只在"这一拍从松开变成按下"时给一次，按住不放不会连发——
+/// 复制是幂等的一次性动作，连发只会让剪贴板反复被写。
+pub fn poll_ctrl_c() -> bool {
+    static LATCH: AtomicBool = AtomicBool::new(false);
+    let (ctrl, c) = ctrl_c_state();
+    let down = ctrl && c;
+    let was = LATCH.swap(down, Ordering::Relaxed);
+    down && !was
+}
+
+/// 当前 Ctrl / C 的物理按键状态（诊断用，1.9.4）。
+pub fn ctrl_c_state() -> (bool, bool) {
+    unsafe {
+        let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0
+            || GetAsyncKeyState(VK_LCONTROL.0 as i32) as u16 & 0x8000 != 0
+            || GetAsyncKeyState(VK_RCONTROL.0 as i32) as u16 & 0x8000 != 0;
+        let c = GetAsyncKeyState(0x43) as u16 & 0x8000 != 0;
+        (ctrl, c)
+    }
+}
+
+/// 表格复制用的系统热键 id（1.9.4）：`RegisterHotKey` 不需要焦点，能可靠拿到 Ctrl+C。
+pub const COPY_HOTKEY_ID: i32 = 0x4C52;
+
+/// 注册 Ctrl+C 系统热键（1.9.4）。
+///
+/// 预览窗是 `WS_EX_NOACTIVATE`，键盘消息永远轮不到它，低层键盘钩子在这类环境里
+/// 也不一定稳；`RegisterHotKey` 是唯一"不需要焦点也能收到"的官方手段。
+/// 代价是它会**全局**截住 Ctrl+C，所以收到 `WM_HOTKEY` 后要判断光标在不在预览上：
+/// 在就复制，不在就把这个 C 重新发出去（见 [`forward_ctrl_c`]），别把别的程序
+/// 的复制吃掉。
+pub fn register_copy(hwnd: HWND) -> bool {
+    unsafe {
+        let ok = RegisterHotKey(Some(hwnd), COPY_HOTKEY_ID, MOD_CONTROL, 0x43).is_ok();
+        if ok {
+            log_info!(SCOPE, "Ctrl+C 系统热键已注册");
+        } else {
+            log_warn!(SCOPE, "Ctrl+C 系统热键注册失败（可能被别的程序占用）");
+        }
+        ok
+    }
+}
+
+/// 注销 Ctrl+C 系统热键（1.9.4），退出/隐藏时调用，别把用户的 Ctrl+C 一直扣着。
+pub fn unregister_copy(hwnd: HWND) {
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), COPY_HOTKEY_ID);
+    }
+}
+
+/// 把 Ctrl+C 里的 C 重新发出去（1.9.4）。
+///
+/// `RegisterHotKey` 会吞掉这次按键；如果光标不在预览上，用户本来是想在别的
+/// 程序里复制，所以补一次 `C` 的按下/抬起（Ctrl 本身还物理按着，不用补）。
+pub fn forward_ctrl_c() {
+    unsafe {
+        let mut inputs = [INPUT::default(); 2];
+        inputs[0].r#type = INPUT_KEYBOARD;
+        inputs[0].Anonymous.ki = KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0x43),
+            wScan: 0,
+            dwFlags: KEYBD_EVENT_FLAGS(0),
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        inputs[1].r#type = INPUT_KEYBOARD;
+        inputs[1].Anonymous.ki = KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0x43),
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let _ = SendInput(&inputs, core::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 光标此刻是否落在预览窗里（1.9.4）。
+///
+/// 预览窗是 `WS_EX_NOACTIVATE`，用户点它、在它上面按 Ctrl+C 时**它也不会变成
+/// 前台窗口**（前台往往还是资源管理器或桌面）。所以"前台是不是我们"这个判据
+/// 在预览场景下几乎永远为假，Ctrl+C 会被放行给别的程序。用"光标在预览窗上"
+/// 当补充判据：用户把鼠标放到预览里，就是"他在看这个预览"。
+pub fn cursor_over_preview() -> bool {
+    let preview = PREVIEW_HWND.load(Ordering::Relaxed);
+    if preview == 0 {
+        return false;
+    }
+    unsafe {
+        let hwnd = HWND(preview as *mut core::ffi::c_void);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return false;
+        }
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return false;
+        }
+        pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
+    }
 }
 
 /// 告知钩子预览窗的 HWND（滚轮命中判定要用它）。
@@ -775,7 +884,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             }
             let ours = foreground_is_ours() || foreground_belongs_to_preview();
             let shell = foreground_class().is_some_and(|class| is_shell_class(&class));
-            if !(ours || shell) {
+            // 1.9.4：预览窗是 NOACTIVATE，拿不到前台；光标在预览上也视为"在用预览"。
+            if !(ours || shell || cursor_over_preview()) {
                 PASSED_OTHER_CLASS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(None, code, wparam, lparam);
             }
@@ -805,6 +915,25 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 || foreground_class().is_some_and(|class| is_shell_class(&class));
             if allowed {
                 let msg = ESCAPE_MSG.load(Ordering::Relaxed);
+                if msg != 0 && post_action(msg, vk, GetTickCount()) {
+                    SWALLOWED.fetch_add(1, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
+            }
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
+        // ---- 复制选中单元格（1.9.4）：吞键 ----
+        // Ctrl+C 只在"用户正在看我们的预览"时才有意义，不吞的话资源管理器
+        // 会同时把选中的文件也复制一遍，两边抢剪贴板。所以照 Esc 的做法：
+        // 只有前台是我们、或前台是资源管理器（预览浮在它上面）时才吞。
+        if action_hits(Action::Copy, vk) {
+            let allowed = foreground_is_ours()
+                || foreground_class().is_some_and(|class| is_shell_class(&class))
+                // 1.9.4：预览窗永远不是前台，光标在预览上就说明用户在看它。
+                || cursor_over_preview();
+            if allowed {
+                let msg = NOTIFY_MSG.load(Ordering::Relaxed);
                 if msg != 0 && post_action(msg, vk, GetTickCount()) {
                     SWALLOWED.fetch_add(1, Ordering::Relaxed);
                     return LRESULT(1);

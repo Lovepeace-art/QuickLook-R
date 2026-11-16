@@ -19,6 +19,14 @@ pub(crate) const TRAY_ID: u32 = 1;
 pub(crate) static TRAY_FAILURE_NOTICE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 托盘图标是否真的加上了（1.9.4）。
+///
+/// 托盘加不上时进程会**静默常驻后台**：双击 exe 没有任何窗口、任务栏也没有入口，
+/// 用户唯一的感觉就是"点了没反应"（实测反馈 m07273）。所以这一位用来判断
+/// "裸启动时要不要给一个可见的入口"——托盘正常时保持原来的纯后台语义，
+/// 托盘不可用时裸启动/裸 Toggle 就把设置窗拉出来当入口。
+pub(crate) static TRAY_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 放大镜默认倍数与上下限（Shift + 滚轮每一格 ±1）。
 pub(crate) const LENS_DEFAULT_ZOOM: f32 = 3.0;
 pub(crate) const LENS_MIN_ZOOM: f32 = 1.5;
@@ -49,6 +57,15 @@ pub(crate) const AUDIO_TICK_MS: u32 = 250;
 pub(crate) const AUDIO_SEEK_STEP_MS: i64 = 5_000;
 /// 视频逐帧播放的取帧定时器（1.7.9）。
 pub(crate) const TIMER_VIDEO: usize = 0x77;
+/// 表格 Ctrl+C 轮询定时器（1.9.4）。
+///
+/// 为什么不靠全局键盘钩子：预览窗是 `WS_EX_NOACTIVATE`，前台永远不是我们，
+/// 钩子在这类环境里也不一定稳定拿到键；而按 Ctrl+C 时**光标一定在预览窗上**
+/// （用户刚点过单元格），所以用"光标在预览 + Ctrl/C 按下"这一条判据轮询，
+/// 既不会误伤别的程序，也不依赖钩子的生存状态。
+pub(crate) const TIMER_SHEET_KEYS: usize = 0x78;
+/// Ctrl+C 轮询间隔（毫秒）。25 ms 足够抓到一次正常按键（人手按下通常 ≥80 ms）。
+pub(crate) const SHEET_KEYS_POLL_MS: u32 = 25;
 /// 视频取帧间隔（毫秒）。40 ms ≈ 25 fps：720p 解码一帧只要几毫秒，
 /// 剩下的时间留给"到点该显示哪一帧"的判断（落后就跳帧，见 `video_tick`）。
 pub(crate) const VIDEO_TICK_MS: u32 = 40;
@@ -184,6 +201,13 @@ pub(crate) struct State {
     pub(crate) sheet_row_h: Vec<(u32, i32)>,
     /// 正在拖的表格分隔线（1.9.1）：`None` = 没在拖。
     pub(crate) sheet_resize: Option<SheetResize>,
+    /// 选中的单元格（1.9.4）：`(row, col)`，本版只支持单选一格。
+    pub(crate) sheet_sel: Option<(u32, u32)>,
+    /// 选中区的另一端（1.9.4 多选）：按下时的格子是锚点 `sheet_sel`，
+    /// 拖动/点第二个格子时更新这个焦点，两者构成矩形选区。
+    pub(crate) sheet_sel_focus: Option<(u32, u32)>,
+    /// 是否正在拖动扩选（按下后还没松手）。
+    pub(crate) sheet_dragging: bool,
     /// 上次绘制时当前窗口吃掉了多少**原始行**（折行后一屏 ≠ 一屏原始行）。
     /// 翻页按它前进，否则折行会让 PageDown 漏掉大半屏内容。
     pub(crate) wrapped_consumed: usize,
@@ -372,6 +396,9 @@ impl State {
             sheet_col_w: Vec::new(),
             sheet_row_h: Vec::new(),
             sheet_resize: None,
+            sheet_sel: None,
+            sheet_sel_focus: None,
+            sheet_dragging: false,
             wrapped_consumed: 0,
             natural: None,
             base: None,

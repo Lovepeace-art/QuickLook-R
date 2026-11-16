@@ -34,11 +34,13 @@ pub enum Action {
     ZoomIn,
     /// 缩小一档（默认 -）。
     ZoomOut,
+    /// 复制选中的单元格（默认 Ctrl+C，1.9.4）。
+    Copy,
 }
 
 impl Action {
     /// 全部动作，顺序即索引。平台层的绑定表按这个顺序排。
-    pub const ALL: [Action; 8] = [
+    pub const ALL: [Action; 9] = [
         Action::Toggle,
         Action::Close,
         Action::PageNext,
@@ -47,9 +49,10 @@ impl Action {
         Action::ScrollUp,
         Action::ZoomIn,
         Action::ZoomOut,
+        Action::Copy,
     ];
     /// 动作种类数量。
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     pub fn index(self) -> usize {
         match self {
@@ -61,6 +64,7 @@ impl Action {
             Action::ScrollUp => 5,
             Action::ZoomIn => 6,
             Action::ZoomOut => 7,
+            Action::Copy => 8,
         }
     }
 
@@ -75,6 +79,7 @@ impl Action {
             Action::ScrollUp => "scroll_up",
             Action::ZoomIn => "zoom_in",
             Action::ZoomOut => "zoom_out",
+            Action::Copy => "copy",
         }
     }
 
@@ -89,6 +94,7 @@ impl Action {
             Action::ScrollUp => "向上滚动一行",
             Action::ZoomIn => "放大一档",
             Action::ZoomOut => "缩小一档",
+            Action::Copy => "复制选中单元格",
         }
     }
 
@@ -118,6 +124,7 @@ impl Action {
             Action::ScrollUp => "Up",
             Action::ZoomIn => "=",
             Action::ZoomOut => "-",
+            Action::Copy => "Ctrl+C",
         }
     }
 
@@ -135,6 +142,7 @@ impl Action {
             Action::ScrollUp => 0x26,   // VK_UP
             Action::ZoomIn => 0xBB,     // VK_OEM_PLUS
             Action::ZoomOut => 0xBD,    // VK_OEM_MINUS
+            Action::Copy => 0x43,       // VK_C
         }
     }
 }
@@ -405,6 +413,8 @@ pub struct Hotkeys {
     pub scroll_up: String,
     pub zoom_in: String,
     pub zoom_out: String,
+    /// 复制选中的单元格（1.9.4；默认 Ctrl+C）。
+    pub copy: String,
     /// 放大镜的**按住键**（不是点按绑定：按住期间显示镜头）。
     pub lens_hold: String,
 }
@@ -420,6 +430,7 @@ impl Default for Hotkeys {
             scroll_up: Action::ScrollUp.default_binding().to_string(),
             zoom_in: Action::ZoomIn.default_binding().to_string(),
             zoom_out: Action::ZoomOut.default_binding().to_string(),
+            copy: Action::Copy.default_binding().to_string(),
             lens_hold: "Shift".to_string(),
         }
     }
@@ -437,6 +448,7 @@ impl Hotkeys {
             Action::ScrollUp => &self.scroll_up,
             Action::ZoomIn => &self.zoom_in,
             Action::ZoomOut => &self.zoom_out,
+            Action::Copy => &self.copy,
         }
     }
 
@@ -450,6 +462,7 @@ impl Hotkeys {
             Action::ScrollUp => self.scroll_up = value,
             Action::ZoomIn => self.zoom_in = value,
             Action::ZoomOut => self.zoom_out = value,
+            Action::Copy => self.copy = value,
         }
     }
 
@@ -490,7 +503,7 @@ impl Hotkeys {
     /// 给日志看的摘要（例：`toggle=Space close=Esc page=PageDown/PageUp`）。
     pub fn summary(&self) -> String {
         format!(
-            "toggle={} close={} page={}/{} scroll={}/{} zoom={}/{} lens={}",
+            "toggle={} close={} page={}/{} scroll={}/{} zoom={}/{} copy={} lens={}",
             self.toggle,
             self.close,
             self.page_next,
@@ -499,6 +512,7 @@ impl Hotkeys {
             self.scroll_up,
             self.zoom_in,
             self.zoom_out,
+            self.copy,
             self.lens_hold
         )
     }

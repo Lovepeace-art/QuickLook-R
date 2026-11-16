@@ -565,6 +565,10 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     with_state(|s| {
         s.page = first_page;
         s.pages = pages;
+        // 1.9.4：换文件时清掉上一个文件留下的单元格选中。
+        s.sheet_sel = None;
+        s.sheet_sel_focus = None;
+        s.sheet_dragging = false;
     });
 
     clear_archive_view();
@@ -590,6 +594,8 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
         window::show_at(preview_hwnd.raw(), rect, config.topmost);
         sync_shadow();
         hotkey::set_active(true);
+        // 1.9.4：Ctrl+C 用系统热键（预览窗拿不到焦点，钩子不可靠）。
+        hotkey::register_copy(preview_hwnd.raw());
         // 托盘没加上时，第一次"窗口真的可见"就用 toast 说一次（1.8.3）。
         notify_tray_failure_once(preview_hwnd.raw());
         with_state(|s| {
@@ -759,6 +765,10 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // 开着的时候才需要旁听翻页键。
     // 跟随计时器从启动就跑（1.1.0）：窗口收着的时候它负责预渲染，所以这里不再重开。
     hotkey::set_active(true);
+    // 1.9.4：Ctrl+C 用系统热键（预览窗拿不到焦点，钩子不可靠）。
+    if let Some(p) = with_state(|s| s.preview) {
+        hotkey::register_copy(p.raw());
+    }
     // 托盘没加上时，第一次"窗口真的可见"就用 toast 说一次（1.8.3）。
     notify_tray_failure_once(preview_hwnd.raw());
 
@@ -1037,6 +1047,10 @@ pub(crate) fn hide_preview() {
     let _ = preview;
     hotkey::set_wheel_pass_through(false);
     hotkey::set_active(false);
+    // 1.9.4：收起就别再扣着用户的 Ctrl+C。
+    if let Some(p) = with_state(|s| s.preview) {
+        hotkey::unregister_copy(p.raw());
+    }
     if let Some(preview) = with_state(|s| s.preview) {
         window::set_activatable(preview.raw(), false);
     }

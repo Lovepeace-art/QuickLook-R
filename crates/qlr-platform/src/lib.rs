@@ -6,6 +6,7 @@
 //! - 命名统一：`xxx_yyy`，不做类型再包装（直接用 `windows` crate 的句柄类型，减少转换层）。
 
 pub mod audio;
+pub mod clipboard;
 pub mod crash;
 pub mod dpi;
 pub mod hotkey;

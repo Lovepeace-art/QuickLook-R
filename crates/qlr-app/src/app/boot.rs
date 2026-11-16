@@ -292,6 +292,9 @@ pub fn run() -> ExitCode {
         }
     };
 
+    // 1.9.4：记下托盘到底有没有加上。加不上时裸启动要给出可见入口（见 `toggle`）。
+    TRAY_OK.store(tray_ready, std::sync::atomic::Ordering::Relaxed);
+
     // 配置马上要被移进 State，热键摘要与绑定表先留一份出来（下面装钩子要用）。
     let hotkeys = config.hotkeys.clone();
 
@@ -360,6 +363,8 @@ pub fn run() -> ExitCode {
     window::start_timer(preview, TIMER_FOLLOW, FOLLOW_INTERVAL_MS);
     // 渲染看门狗（1.2.0）：和跟随计时器分开，因为它要 250 ms 一拍才够灵敏。
     window::start_timer(preview, TIMER_WATCHDOG, WATCHDOG_INTERVAL_MS);
+    // 表格 Ctrl+C 轮询（1.9.4）：25 ms 一拍，只在光标在预览上时才认这个键。
+    window::start_timer(preview, TIMER_SHEET_KEYS, SHEET_KEYS_POLL_MS);
 
     // 全局空格热键（A1.5）。失败不致命：还可以用 CLI / 托盘触发。
     let mut hotkey_guard = if hotkey_enabled {
@@ -404,6 +409,12 @@ pub fn run() -> ExitCode {
         request.path.is_some() || matches!(request.action, Action::Show | Action::Settings);
     if startup_shows {
         apply_request(&request);
+    } else if !tray_ready && request.path.is_none() {
+        // 1.9.4（用户 m07273）：双击 exe 是裸启动，本意是"启动程序"。托盘加不上时
+        // 纯后台 = 用户眼里"什么都没发生"（无窗口、无托盘、任务栏也没有），
+        // 所以这里直接把设置窗拉出来当可见入口；关掉它程序仍常驻后台。
+        log_info!(SCOPE, "裸启动且托盘不可用：打开设置窗作为可见入口");
+        open_settings();
     } else {
         log_info!(
             SCOPE,
@@ -616,6 +627,12 @@ pub(crate) fn toggle(path: Option<PathBuf>) {
                     return;
                 }
                 hide_preview();
+            } else if !TRAY_OK.load(std::sync::atomic::Ordering::Relaxed) {
+                // 1.9.4：托盘没加上时"纯后台"就等于"点了没反应"（用户 m07273 的
+                // 反馈）。这种环境（管理员运行 / 无 explorer 托盘）下把设置窗拉出来
+                // 当可见入口——它同时是"程序确实在跑"的证明，关掉后仍常驻后台。
+                log_info!(SCOPE, "裸启动且托盘不可用：打开设置窗作为可见入口");
+                open_settings();
             } else {
                 log_debug!(SCOPE, "裸 Toggle 且窗口未显示：忽略（保持后台）");
             }
@@ -768,6 +785,23 @@ pub(crate) unsafe extern "system" fn wndproc(
                 hide_preview();
                 LRESULT(0)
             }
+            WM_MOUSEWHEEL => {
+                // 1.9.4：光标在预览窗上滚轮时，Windows 也会把 WM_MOUSEWHEEL 投到这里
+                // （预览窗是 NOACTIVATE，焦点一直在别处，钩子那条路不一定通）。
+                // 高 16 位是带符号的增量（一格 ±120），和钩子投来的 WM_QLR_WHEEL 等价。
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                log_debug!(SCOPE, "WHEEL 直投 delta={delta}");
+                on_wheel(delta);
+                LRESULT(0)
+            }
+            WM_MOUSEHWHEEL => {
+                // 横向滚轮（部分鼠标/触控板）：Shift 语义交给 on_wheel 判断不了，
+                // 直接按"左右滚表格"处理。
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                log_debug!(SCOPE, "HWHEEL 直投 delta={delta}");
+                sheet_scroll_by(-delta / 120 * 64 * 3, 0);
+                LRESULT(0)
+            }
             ipc::WM_QLR_WHEEL => {
                 // wparam 里是 i16 的滚轮增量（一格 ±120）
                 let delta = (wparam.0 as i32) as i16 as i32;
@@ -827,6 +861,10 @@ pub(crate) unsafe extern "system" fn wndproc(
                 } else if sheet_tab_click(lparam) {
                     // 3) 底部工作表标签（1.9.2）：点了就切表，不吃掉会变成拖窗口。
                     LRESULT(0)
+                } else if sheet_click(lparam) {
+                    // 3.5) 表格内容区（1.9.4）：点一下选中单元格。只有真点中格子/
+                    //      表头才吃掉，非表格内容原样返回 false 继续走"拖窗口"。
+                    LRESULT(0)
                 } else if archive_click(hwnd, lparam) {
                     // 3) 压缩包行（1.7.3）：选中 + 目录折叠，不吃掉的话会变成拖窗口。
                     LRESULT(0)
@@ -840,6 +878,10 @@ pub(crate) unsafe extern "system" fn wndproc(
                 if sheet_resize_move(lparam) {
                     return LRESULT(0);
                 }
+                // 表格选区拖动（1.9.4）：按住左键在格子上划过时扩选。
+                if sheet_drag_move(lparam) {
+                    return LRESULT(0);
+                }
                 // 悬停只影响顶栏按钮与目录高亮，先更新再走手势分派。
                 update_hover(hwnd, lparam);
                 on_mouse_move(lparam);
@@ -848,6 +890,10 @@ pub(crate) unsafe extern "system" fn wndproc(
             WM_LBUTTONUP => {
                 // 表格列宽/行高拖拽结束（1.9.1）：尺寸已经写进 state，这里只收尾。
                 if sheet_resize_end() {
+                    return LRESULT(0);
+                }
+                // 表格选区拖动结束（1.9.4）。
+                if sheet_drag_end() {
                     return LRESULT(0);
                 }
                 if with_state(|s| std::mem::replace(&mut s.scroll_drag, false)).unwrap_or(false) {
@@ -882,6 +928,22 @@ pub(crate) unsafe extern "system" fn wndproc(
             // 渲染看门狗（1.2.0）：只记日志 + 请求取消，绝不阻塞 UI。
             WM_TIMER if wparam.0 == TIMER_WATCHDOG => {
                 on_render_watchdog();
+                LRESULT(0)
+            }
+            // 表格 Ctrl+C 轮询（1.9.4）：预览窗拿不到焦点、键盘钩子在这类环境
+            // 不一定收得到键，用"光标在预览上 + Ctrl/C 按下"这条判据兜底。
+            WM_HOTKEY if wparam.0 as i32 == hotkey::COPY_HOTKEY_ID => {
+                // 1.9.4：系统热键收到了 Ctrl+C。光标在预览上就复制，否则把 C 补发出去。
+                if preview_cursor_inside() {
+                    log_debug!(SCOPE, "HOTKEY Ctrl+C → 复制选中区");
+                    sheet_copy_selection(hwnd);
+                } else {
+                    hotkey::forward_ctrl_c();
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_SHEET_KEYS => {
+                sheet_poll_ctrl_c(hwnd);
                 LRESULT(0)
             }
             // 音频进度条（1.7.9）：只重画进度条那一条，整窗不动。

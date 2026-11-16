@@ -688,6 +688,14 @@ pub(crate) fn repaint(hwnd: HWND) {
                     col_extra: &col_extra,
                     row_extra: &row_extra,
                 };
+                // 选中单元格（1.9.4）：必须进 `paint_sheet` 的双缓冲，事后用 `GetDC`
+                // 画的像素 `PrintWindow` 和系统重绘都看不到（CONVENTIONS #169）。
+                let sel = with_state(|s| match (s.sheet_sel, s.sheet_sel_focus) {
+                    (Some(a), Some(b)) => Some((a.0, a.1, b.0, b.1)),
+                    (Some(a), None) => Some((a.0, a.1, a.0, a.1)),
+                    _ => None,
+                })
+                .flatten();
                 let fallback;
                 let sheet = match doc.sheet() {
                     Some(s) => s,
@@ -708,6 +716,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
+                log_debug!(SCOPE, "PAINT sel={sel:?}");
                 window::paint_sheet(
                     hwnd,
                     Some(&chrome),
@@ -716,6 +725,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                     &sizes,
                     sx,
                     sy,
+                    sel,
                 );
                 // 竖直滚动条（1.9.1）：滑块按**像素**算，画在内容区右侧那条上。
                 // `paint_sheet` 内部已经 `EndPaint`，这里再用 `GetDC` 那版不冲突。
