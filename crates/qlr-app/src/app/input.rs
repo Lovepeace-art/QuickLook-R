@@ -407,7 +407,12 @@ pub(crate) fn sheet_click(lparam: LPARAM) -> bool {
     });
     match hit {
         Some((row, col)) => log_debug!(SCOPE, "SHEET-SEL ({row},{col}) 内容区 ({px},{py})"),
-        None => log_debug!(SCOPE, "SHEET-SEL 清空 内容区 ({px},{py}) 内容区原点 ({},{})", layout.content.left, layout.content.top),
+        None => log_debug!(
+            SCOPE,
+            "SHEET-SEL 清空 内容区 ({px},{py}) 内容区原点 ({},{})",
+            layout.content.left,
+            layout.content.top
+        ),
     }
     window::invalidate(preview.raw());
     true
@@ -523,11 +528,7 @@ pub(crate) fn sheet_copy_selection(hwnd: HWND) -> bool {
                 bottom + 1
             )
         };
-        log_info!(
-            SCOPE,
-            "SHEET-COPY {label} 字符数 {}",
-            out.chars().count()
-        );
+        log_info!(SCOPE, "SHEET-COPY {label} 字符数 {}", out.chars().count());
         show_toast_ms(hwnd, &label, 1400);
     } else {
         log_warn!(SCOPE, "SHEET-COPY 剪贴板被占用，复制失败");

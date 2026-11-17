@@ -3442,3 +3442,23 @@ Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**�
 - **`<colorScale>` 的 `<color>` 与 `<cfvo>` 是按下标一一对应**（第 i 个 color 对第 i 个 cfvo），
   不是按"红=最小"约定。按预期反转插值会让真实 Excel 文件的色阶全画反。→ CONVENTIONS #168。
 - clippy `digits of hex … not in groups of equal size`：`0x00_638E_C6` 要写成 `0x0063_8EC6`（等长分组）。
+
+## 2026-11-17 · 1.9.4-fix：双击 exe 有可见反馈 + Ctrl+C 走系统热键（真机可用）
+
+### 做了什么
+
+- 裸启动（双击、无参数）：托盘可用时弹一次气泡；托盘不可用时显示一张 **520x190 的提示卡片 3.2 秒**后自动收起——标题固定 `QLRust`，正文四行（`已在后台运行 / 选中文件后按空格即可预览 / 退出请运行 qlrust.exe --quit`）。实现：`Canvas::Text` + `set_content` + `window::show_at(window::natural_rect(work, 520, 190))`，`State::tip_mode` 让 `chrome.rs` 走 `plain_doc`（无行号栏）并把 `file_title()` 固定成 `QLRust`；定时器 `TIMER_TIP=0x79` / `TIP_MS=3200` 收起并复位 `tip_mode`、清 `last_path`。
+- Ctrl+C：键盘钩子在这类 `WS_EX_NOACTIVATE` 窗口上收不到键 → 改 `RegisterHotKey(hwnd, COPY_HOTKEY_ID=0x4C52, MOD_CONTROL, 0x43)`，显示时注册、隐藏时注销；`WM_HOTKEY` 里若光标不在预览窗内则 `forward_ctrl_c()` 用 `SendInput` 补发，避免吞掉别的程序的复制。
+- 多选 + 复制：`sheet_sel_focus` / `sheet_dragging` 支持拖选矩形；复制按矩形拼 TSV（`\r\n` 行、`\t` 列），单格仍纯文本，toast `已复制 A1:D5（16 格）`。
+- 滚轮：wndproc 直接处理 `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL`（`WS_EX_NOACTIVATE` 窗口拿不到焦点，系统不会投给别处）。
+
+### 为什么
+
+用户报了三件事：双击 exe「根本没有软件在运行」、滚轮无效、Ctrl+C 复制无效。逐项定位后：双击的问题不是进程没起（进程一直在，只是没有任何可见反馈）；滚轮是窗口从没处理 `WM_MOUSEWHEEL`；复制是钩子收不到键。
+
+### 怎么验证
+
+- 裸启动真机实测：日志 `托盘图标创建失败 … 0x80070005` → `启动提示：文本提示窗 3200 ms（托盘不可用）` → 3 秒后 `HIDE elapsed=3209ms`，进程持续存活；截图 `_bench\sheet\startup-tip3.png` 目视即上面那张卡片。
+- 复制链路（注入只能验投递）：`PostMessage(WM_LBUTTONDOWN/UP)` 点中格 → `SHEET-SEL (2,3)` → `PostMessage(WM_HOTKEY, 0x4C52)` → `HOTKEY Ctrl+C → 复制选中区` → `SHEET-COPY 已复制 D3 字符数 4`，`Get-Clipboard` = `水饮冲调`。
+- 回归：`cargo test --workspace --offline` **363 passed / 0 failed / 13 ignored**；`cargo clippy --workspace --all-targets -- -D warnings` exit 0；`cargo fmt --all` 干净；`scripts/verify-sheet.ps1` **13 PASS / 0 FAIL / 0 SKIP**。
+- 已知限制：本会话里托盘 `Shell_NotifyIcon` 恒 `0x80070005`（UIPI），所以提示窗是"托盘不可用"的兜底路径；普通桌面双击（中完整性）应能正常出托盘图标。

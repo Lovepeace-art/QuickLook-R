@@ -1776,3 +1776,32 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 
 **推广**：OOXML 里凡是"一组取值点 + 一组颜色/样式"并列的结构（colorScale、dataBar 的 color、
 渐变填充的 gsLst），默认都是**同序配对**，除非 schema 明确写了下标引用。
+
+## #169 事后 `GetDC` 画的像素，`PrintWindow`/重绘都拿不到——要长期存在的绘制必须进 `WM_PAINT` 的双缓冲
+
+**现象**：表格选中框第一版画在 `paint_sheet` 之后（`BeginPaint/EndPaint` 都结束了），另起 `GetDC` 直接在客户区画 1px 绿框。日志证明算出了正确矩形（`SEL rect (248,179,316,197) content (0,30,858,724)`），但截图与"没选中"时 **sha256 完全相同**（`a6d236dd…`），用户屏幕上也是一被遮挡就没了。
+
+**根因**：`PrintWindow` 与系统的重绘都只重放 `WM_PAINT` 里 `BeginPaint` 拿到的 DC 内容。事后 `GetDC` 画的是"额外涂上去的像素"，既不在双缓冲里，也没有失效区域让它重画。
+
+**做法**：把选中框搬进 `Painter`（`sel` 字段），在 `paint()` 的 `paint_region` 之后、`RestoreDC` 之前画，跟表格内容走同一块离屏位图。同理：任何"要一直看得见"的东西（边框、标尺、水印）都别用 `GetDC` 补画。
+
+**推广**：调试时若截图对不上但日志说"画了"，先怀疑"画的不是同一块 DC"，而不是坐标算错。
+
+## #170 裸启动提示窗别借"占位预览"——`show_preview(None)` 会被 `renderable=false` 直接拒绝
+
+**现象**：双击 exe 想弹个提示窗，第一版实现是 `show_preview(None)` + 定时器收起。结果用户仍然"看不到任何东西"——日志是 `SHOW 拒绝 kind=unsupported target=-`，窗口矩形 `0x0`。
+
+**根因**：`show_preview` 的入口有 `renderable` 闸门，没有目标文件时 `kind=Unsupported` → 直接 `SHOW 拒绝` 返回，既没建尺寸也没画内容；`start_timer` 只是让一个零尺寸窗口存活 3 秒。
+
+**做法**：提示窗自己构造 `Canvas::Text`（`TextDoc{lines, total_lines}`）+ `set_content`，再用 `window::show_at(rect)` 显式给尺寸（`window::natural_rect(work, dpi::px(520), dpi::px(190))`）。
+
+**配套坑**：文本预览会画行号栏和"第 X–Y 行 / 共 N 行"，提示窗里全是噪音。用 `State::tip_mode` 标记，让 `chrome.rs` 的 `plain_doc` 为真（照 HTML/音频那条"排版文档"路径走，gutter=0），并让 `file_title()` 固定返回 "QLRust"（否则标题栏显示借来的假文件名）。定时器收起时要把 `tip_mode` 复位，否则下次按空格会把提示再翻出来。
+
+## #171 `RegisterHotKey` 才是不抢焦点的窗口收 Ctrl+C 的正解；注入的键只能验"投递链路"
+
+**现象**：预览窗是 `WS_EX_NOACTIVATE`，键盘钩子在这类窗口上经常收不到键（用户实测 Ctrl+C 无效，日志里连 `按下` 都没有）。
+
+**做法**：`RegisterHotKey(hwnd, COPY_HOTKEY_ID=0x4C52, MOD_CONTROL, 0x43)`，在 `show` 时注册、`hide` 时注销；`WM_HOTKEY` 里判"光标是否在预览窗内"——不在就把 Ctrl+C 用 `SendInput` 补发出去（`forward_ctrl_c()`），否则会把别的程序的复制吃掉。
+
+**验法**：`keybd_event` 注入的 Ctrl+C 不一定会触发系统热键（取决于注入源与前台），所以自动化只能验"投递链路"——直接 `PostMessage(hwnd, WM_HOTKEY, 0x4C52, 0)` 走一遍 `HOTKEY → SHEET-COPY → 剪贴板`，真按键留给用户手验。
+

@@ -25,7 +25,8 @@ pub(crate) static TRAY_FAILURE_NOTICE: std::sync::atomic::AtomicBool =
 /// 用户唯一的感觉就是"点了没反应"（实测反馈 m07273）。所以这一位用来判断
 /// "裸启动时要不要给一个可见的入口"——托盘正常时保持原来的纯后台语义，
 /// 托盘不可用时裸启动/裸 Toggle 就把设置窗拉出来当入口。
-pub(crate) static TRAY_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static TRAY_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 放大镜默认倍数与上下限（Shift + 滚轮每一格 ±1）。
 pub(crate) const LENS_DEFAULT_ZOOM: f32 = 3.0;
@@ -64,6 +65,10 @@ pub(crate) const TIMER_VIDEO: usize = 0x77;
 /// （用户刚点过单元格），所以用"光标在预览 + Ctrl/C 按下"这一条判据轮询，
 /// 既不会误伤别的程序，也不依赖钩子的生存状态。
 pub(crate) const TIMER_SHEET_KEYS: usize = 0x78;
+/// 裸启动提示窗的自动收起定时器（1.9.4）。
+pub(crate) const TIMER_TIP: usize = 0x79;
+/// 裸启动提示窗显示时长（毫秒）。
+pub(crate) const TIP_MS: u32 = 3200;
 /// Ctrl+C 轮询间隔（毫秒）。25 ms 足够抓到一次正常按键（人手按下通常 ≥80 ms）。
 pub(crate) const SHEET_KEYS_POLL_MS: u32 = 25;
 /// 视频取帧间隔（毫秒）。40 ms ≈ 25 fps：720p 解码一帧只要几毫秒，
@@ -200,6 +205,8 @@ pub(crate) struct State {
     /// 表格的视图内行高调整（1.9.1），语义同 `sheet_col_w`。
     pub(crate) sheet_row_h: Vec<(u32, i32)>,
     /// 正在拖的表格分隔线（1.9.1）：`None` = 没在拖。
+    /// 裸启动提示窗模式（1.9.4）：标题固定 "QLRust"、正文按"排版文档"渲染（无行号栏）。
+    pub(crate) tip_mode: bool,
     pub(crate) sheet_resize: Option<SheetResize>,
     /// 选中的单元格（1.9.4）：`(row, col)`，本版只支持单选一格。
     pub(crate) sheet_sel: Option<(u32, u32)>,
@@ -396,6 +403,7 @@ impl State {
             sheet_col_w: Vec::new(),
             sheet_row_h: Vec::new(),
             sheet_resize: None,
+            tip_mode: false,
             sheet_sel: None,
             sheet_sel_focus: None,
             sheet_dragging: false,

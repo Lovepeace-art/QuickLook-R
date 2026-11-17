@@ -36,8 +36,7 @@ use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, SetEv
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
     MOD_CONTROL, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL,
-    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjects;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -45,8 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId,
     HHOOK, IsWindowVisible, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
     PostMessageW, QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-    WM_KEYUP, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const SCOPE: &str = "hotkey";

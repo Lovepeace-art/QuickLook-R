@@ -410,11 +410,9 @@ pub fn run() -> ExitCode {
     if startup_shows {
         apply_request(&request);
     } else if !tray_ready && request.path.is_none() {
-        // 1.9.4（用户 m07273）：双击 exe 是裸启动，本意是"启动程序"。托盘加不上时
-        // 纯后台 = 用户眼里"什么都没发生"（无窗口、无托盘、任务栏也没有），
-        // 所以这里直接把设置窗拉出来当可见入口；关掉它程序仍常驻后台。
-        log_info!(SCOPE, "裸启动且托盘不可用：打开设置窗作为可见入口");
-        open_settings();
+        // 1.9.4（用户 m07367）：双击 exe 应该是"程序起来了 + 桌面有个启动提示"，
+        // 不是弹设置窗。托盘不可用时就用 3 秒占位窗当提示；托盘可用时下面会弹气泡。
+        show_startup_tip();
     } else {
         log_info!(
             SCOPE,
@@ -628,11 +626,9 @@ pub(crate) fn toggle(path: Option<PathBuf>) {
                 }
                 hide_preview();
             } else if !TRAY_OK.load(std::sync::atomic::Ordering::Relaxed) {
-                // 1.9.4：托盘没加上时"纯后台"就等于"点了没反应"（用户 m07273 的
-                // 反馈）。这种环境（管理员运行 / 无 explorer 托盘）下把设置窗拉出来
-                // 当可见入口——它同时是"程序确实在跑"的证明，关掉后仍常驻后台。
-                log_info!(SCOPE, "裸启动且托盘不可用：打开设置窗作为可见入口");
-                open_settings();
+                // 1.9.4（用户 m07367）：第二次双击 exe 会走到这里（转发给常驻宿主），
+                // 托盘不可用时给一次启动提示，别让用户觉得"点了没反应"。
+                show_startup_tip();
             } else {
                 log_debug!(SCOPE, "裸 Toggle 且窗口未显示：忽略（保持后台）");
             }
@@ -720,6 +716,56 @@ pub(crate) fn open_settings() {
     };
     settings::open(host.raw(), &config);
     log_info!(SCOPE, "设置窗口：已请求打开");
+}
+
+/// 裸启动（双击 exe）的"启动提示"（1.9.4）。
+///
+/// 用户对双击的预期（m07367）：**程序起来 + 图标进托盘 + 桌面弹个启动提示**，
+/// 不该弹设置窗。所以这里分两条路：
+/// - 托盘可用 → 弹一次气泡（Windows 会落到通知中心，失败也不致命）；
+/// - 托盘不可用（提权 / 无托盘环境）→ 临时显示占位窗 3 秒再自动收起，
+///   让"双击了但什么都没有"变成"双击了，看见它起来了"。
+pub(crate) fn show_startup_tip() {
+    if TRAY_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(host) = with_state(|s| s.host) {
+            let _ = tray::notify(
+                host.raw(),
+                TRAY_ID,
+                &version::banner(),
+                "已在后台运行：选中文件按空格预览；右键托盘图标可退出。",
+            );
+        }
+        log_info!(SCOPE, "启动提示：托盘气泡");
+        return;
+    }
+    // 托盘不可用（提权启动 / 无托盘环境）：不能指望气泡，也不能弹设置窗（用户明确否掉），
+    // 所以在屏幕上放一个**真的看得见**的小提示窗 —— 复用预览窗，塞一段文本。
+    let Some(preview) = with_state(|s| s.preview) else {
+        return;
+    };
+    let mut doc = qlr_render::TextDoc::default();
+    doc.lines = vec![
+        format!("{} 已在后台运行", version::banner()),
+        String::new(),
+        "选中文件后按空格即可预览".to_string(),
+        "退出请运行 qlrust.exe --quit".to_string(),
+    ];
+    doc.total_lines = doc.lines.len();
+    set_content(Some(std::sync::Arc::new(Canvas::Text(doc))));
+    with_state(|s| {
+        // 标题固定 "QLRust"、按"排版文档"渲染（不画行号栏，见 chrome.rs plain_doc）。
+        s.tip_mode = true;
+        s.last_path = None;
+        s.pages = None;
+        s.page = 0;
+    });
+    let work = window::work_area(preview.raw());
+    let rect = window::natural_rect(work, dpi::px(520), dpi::px(190));
+    let topmost = with_state(|s| s.config.topmost).unwrap_or(true);
+    window::show_at(preview.raw(), rect, topmost);
+    window::invalidate(preview.raw());
+    window::start_timer(preview.raw(), TIMER_TIP, TIP_MS);
+    log_info!(SCOPE, "启动提示：文本提示窗 {} ms（托盘不可用）", TIP_MS);
 }
 
 /// 设置窗保存完毕：重读配置 → 热更新钩子绑定。
@@ -944,6 +990,16 @@ pub(crate) unsafe extern "system" fn wndproc(
             }
             WM_TIMER if wparam.0 == TIMER_SHEET_KEYS => {
                 sheet_poll_ctrl_c(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_TIP => {
+                window::stop_timer(hwnd, TIMER_TIP);
+                hide_preview();
+                // 退出提示模式，否则下次"空格"会把提示再翻出来。
+                with_state(|s| {
+                    s.tip_mode = false;
+                    s.last_path = None;
+                });
                 LRESULT(0)
             }
             // 音频进度条（1.7.9）：只重画进度条那一条，整窗不动。

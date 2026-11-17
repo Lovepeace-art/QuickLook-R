@@ -2016,6 +2016,7 @@ pub fn sheet_divider_at(
 /// 标题之后真正可以画表格的矩形（会先被表头切掉左上一块）。
 ///
 /// 空表（`rows == 0 || cols == 0`）画成一张"空白表 + 表头"，不要画成纯白。
+#[allow(clippy::too_many_arguments)]
 pub fn paint_sheet(
     hwnd: HWND,
     chrome: Option<&Chrome<'_>>,
@@ -2083,7 +2084,6 @@ pub fn paint_sheet(
         let _ = EndPaint(hwnd, &ps);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
