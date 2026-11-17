@@ -735,6 +735,13 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
     // §7 收尾（平台层完善第 7 项）：内容抵达时用**实际 Canvas** 校准表面，
     // 让 `State.surface` 与 `get_content()` 始终一致（`show_preview` 的预算是按 Kind 猜的）。
     let surface = content.as_deref().map(backend::Surface::from_canvas);
+    // docx（1.10.0）：页数只有**解析完**才知道，开窗时 `show_preview` 只能先给 `None`。
+    // 内容一到这里就把总页数补进 `State.pages`，翻页/页码框/滚动条立刻可用。
+    let doc_pages = match content.as_deref() {
+        Some(Canvas::Document(doc)) => Some(doc.len()),
+        Some(Canvas::Presentation(doc)) => Some(doc.len()),
+        _ => None,
+    };
     if let Some(slot) = CONTENT.get()
         && let Ok(mut guard) = slot.lock()
     {
@@ -756,6 +763,13 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.sheet_resize = None;
         // 折行缓存是按"行号"存的，换内容必须整本作废（否则会拿旧文件的折行结果画新文件）。
         s.wrap_cache.clear();
+        // docx：拿到实际页数后补进 `State.pages`，并把当前页码夹到合法范围。
+        if let Some(total) = doc_pages {
+            s.pages = Some(total.max(1));
+            if s.page >= s.pages.unwrap_or(1) {
+                s.page = 0;
+            }
+        }
         if let Some(surface) = surface {
             s.surface = Some(surface);
         }

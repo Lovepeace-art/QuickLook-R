@@ -8,6 +8,7 @@
 //! 平台无关的（`libloading` 在三个平台上都是同一套 API），所以放在这里而不是平台层。
 
 pub mod config;
+pub mod docx;
 pub mod error;
 pub mod format;
 pub mod ipc;
@@ -15,6 +16,7 @@ pub mod keymap;
 pub mod log;
 pub mod paths;
 pub mod plugins;
+pub mod pptx;
 pub mod sheet;
 pub mod version;
 

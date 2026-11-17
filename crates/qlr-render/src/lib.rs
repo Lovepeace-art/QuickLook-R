@@ -21,12 +21,14 @@ pub mod budget;
 pub mod cancel;
 pub mod canvas;
 pub mod code;
+pub mod docx;
 pub mod downscale;
 pub mod html;
 pub mod image_view;
 pub mod markdown;
 pub mod media;
 pub mod pdf;
+pub mod pptx;
 pub mod scale;
 pub mod sheet;
 pub mod source_cache;
@@ -291,6 +293,42 @@ static HTML_VIEWER: HtmlViewer = HtmlViewer;
 static VIDEO_VIEWER: VideoViewer = VideoViewer;
 static AUDIO_VIEWER: AudioViewer = AudioViewer;
 static SHEET_VIEWER: SheetViewer = SheetViewer;
+static DOCUMENT_VIEWER: DocumentViewer = DocumentViewer;
+static PPTX_VIEWER: PptxViewer = PptxViewer;
+
+/// Word 文档渲染器：**只解析+排版，不出像素**。
+///
+/// 返回 `Canvas::Document(DocDoc)`——已经分好页的纯数据模型，`page` 字段这里忽略
+/// （整篇一次解析拿到全部页，翻页由壳层换页下标），真正画到窗口在
+/// `qlr_platform::window::docx`。
+pub struct DocumentViewer;
+
+impl Viewer for DocumentViewer {
+    fn kind(&self) -> Kind {
+        Kind::Document
+    }
+
+    fn render(&self, req: &RenderRequest<'_>) -> Result<Canvas> {
+        Ok(Canvas::Document(Box::new(docx::parse_docx(req.path)?)))
+    }
+}
+
+/// 演示文稿渲染器：**只解析+排版，不出像素**。
+///
+/// 返回 `Canvas::Presentation(PptxDoc)`——每张幻灯片上绝对定位的图形 + 已折行文字，
+/// `page` 字段这里忽略（整份一次解析），翻页由壳层换幻灯片下标；真正画到窗口在
+/// `qlr_platform::window::pptx`。
+pub struct PptxViewer;
+
+impl Viewer for PptxViewer {
+    fn kind(&self) -> Kind {
+        Kind::Presentation
+    }
+
+    fn render(&self, req: &RenderRequest<'_>) -> Result<Canvas> {
+        Ok(Canvas::Presentation(Box::new(pptx::parse_pptx(req.path)?)))
+    }
+}
 
 /// 拼一张媒体"元信息卡片"的文字行（音频卡片与视频降级共用）。
 ///
@@ -375,6 +413,8 @@ pub fn viewer_for(kind: Kind) -> Option<&'static dyn Viewer> {
         Kind::Audio => Some(&AUDIO_VIEWER),
         Kind::Video => Some(&VIDEO_VIEWER),
         Kind::Sheet => Some(&SHEET_VIEWER),
+        Kind::Document => Some(&DOCUMENT_VIEWER),
+        Kind::Presentation => Some(&PPTX_VIEWER),
         Kind::Unsupported => None,
     }
 }
@@ -454,6 +494,10 @@ pub fn natural_size(path: &Path, kind: Kind) -> Option<(u32, u32)> {
         | Kind::Audio
         | Kind::Sheet
         | Kind::Unsupported => None,
+        // Word：返回页面尺寸（页宽/页高），开窗按整页比例。
+        Kind::Document => docx::document_layout(path).map(|s| (s.page_w, s.page_h)),
+        // PowerPoint：返回幻灯片尺寸（宽/高），开窗按整页比例。
+        Kind::Presentation => pptx::presentation_layout(path).map(|s| (s.width, s.height)),
     }
 }
 
@@ -495,6 +539,9 @@ mod tests {
         assert!(viewer_for(Kind::Html).is_some());
         assert!(viewer_for(Kind::Audio).is_some());
         assert!(viewer_for(Kind::Video).is_some());
+        assert!(viewer_for(Kind::Sheet).is_some());
+        assert!(viewer_for(Kind::Document).is_some());
+        assert!(viewer_for(Kind::Presentation).is_some());
         // 八类之外必须返回 None（壳层据此出"暂未支持"提示）
         assert!(viewer_for(Kind::Unsupported).is_none());
         // `format::KINDS` 里的每一类都必须有渲染器（否则壳层会开窗然后报"暂不支持"）
@@ -505,7 +552,8 @@ mod tests {
 
     #[test]
     fn unimplemented_kind_reports_plugin_hint() {
-        let err = render_file(&PathBuf::from(r"C:\x\a.docx"), 800, 600).unwrap_err();
+        // `.epub` 不是内置格式 → Unsupported，走插件/系统路线提示
+        let err = render_file(&PathBuf::from(r"C:\x\a.epub"), 800, 600).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unsupported"), "{msg}");
         assert!(msg.contains("插件"), "应提示插件路线：{msg}");
@@ -527,6 +575,9 @@ mod tests {
         assert_eq!(HTML_VIEWER.kind(), Kind::Html);
         assert_eq!(AUDIO_VIEWER.kind(), Kind::Audio);
         assert_eq!(VIDEO_VIEWER.kind(), Kind::Video);
+        assert_eq!(SHEET_VIEWER.kind(), Kind::Sheet);
+        assert_eq!(DOCUMENT_VIEWER.kind(), Kind::Document);
+        assert_eq!(PPTX_VIEWER.kind(), Kind::Presentation);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-﻿QLRust — 按空格预览（Rust 重写的 QuickLook）
+QLRust — 按空格预览（Rust 重写的 QuickLook）
 ================================================
 
 一个常驻托盘的轻量预览工具：在资源管理器里选中文件，按一下空格，弹窗直接看内容；
@@ -11,7 +11,7 @@
   · 源码    rs go py js ts c cpp java cs php rb lua sh ps1 sql json toml yaml …（仿 VSCode：等宽 + 行号 + 语法着色）
   · Markdown md markdown（标题/代码块/引用/列表/任务框/表格带排版，行内标记渲染后去掉，左侧可点目录）
 
-Office（docx/xlsx/pptx/odt…）优先交给 Windows 自己的预览处理器渲染真排版（装了 Office 才生效）；压缩包（zip/cbz/jar）由随包附带的 qlr_plugin_office 画目录树，见第 5 节。
+表格（xlsx/xlsm/xltx/xltm）、文档（docx/docm/dotx/dotm）与演示文稿（pptx/pptm/potx/potm/ppsx/ppsm）为**内置原生渲染，不需要装 Office**（表格逐格网格、文档分页可翻页、演示文稿按页翻页）；其余 ODF（odt/ods/odp…）优先交给 Windows 自己的预览处理器渲染真排版（装了 Office 才生效）；压缩包（zip/cbz/jar）由随包附带的 qlr_plugin_office 画目录树，见第 5 节。
 
 
 1. 怎么开始用
@@ -126,6 +126,8 @@ U 盘里拷走就能用（换个账号也能跑）。删掉 portable.lock 就变
    48MP 图片        渲染 77 ms，峰值 12.5 MB
    26.6 MB 文本     21 ms（12 万行，只渲染可视区）
    200 页 PDF       翻页均值 6.3 ms
+    47 页 docx       解析 8–10 ms，峰值常驻 ~11 MB（内置原生，翻页只重画当前页）
+    31 页 pptx       解析 8 ms，峰值常驻 ~8–12 MB（内置原生，翻页只重画当前页）
    空闲内存         7.6–8.8 MB
 
 统计口径与复现方法见仓库 docs\dev\bench.md。

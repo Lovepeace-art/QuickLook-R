@@ -520,7 +520,7 @@ pub(crate) fn clamp_render_size(w: u32, h: u32) -> (u32, u32) {
 /// 投一个渲染任务，返回本次的代际号。
 pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
     let (max_w, max_h) = clamp_render_size(max_w, max_h);
-    let is_pdf = with_state(|s| s.pages.is_some()).unwrap_or(false);
+    let is_pdf = format::kind_for_path(path) == format::Kind::Pdf;
     // 1.3.0：PDF 页缓存。翻回去看一眼是 PDF 最常见的动作，命中就别再麻烦渲染线程。
     // 注意代际也要 +1：否则先前那一帧算完回来会把刚上屏的这一页顶掉。
     if is_pdf {
@@ -562,7 +562,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
     // 1.2.0：新请求发出去之前，先让**正在跑**的那个活自己退出（阶段边界检查点会看到），
     // 否则用户连按方向键时，工作线程要先把前面几个没人要的文件渲染完。
     qlr_render::cancel::cancel();
-    let is_pdf = with_state(|s| s.pages.is_some()).unwrap_or(false);
+    let is_pdf = format::kind_for_path(path) == format::Kind::Pdf;
     // 注意：`with_state` 是普通 `Mutex`，**嵌套调用会自己把自己锁死**（这里踩过：
     // 在闭包里又调 `with_state(|s| s.zoom > 1.0)`，进程卡在开窗那一步，日志只到"开窗尺寸"）。
     // 所以先把要用的值取出来，再进闭包。
@@ -861,6 +861,10 @@ pub(crate) fn canvas_bytes(canvas: &Canvas) -> usize {
                     + sh.merges.len() * 16
             })
             .sum(),
+        // 文档帧只带模型（不带像素）：按文本长度 + 每行/每块开销估算。
+        Canvas::Document(d) => d.approx_bytes(),
+        // 幻灯片帧同理，只带模型。
+        Canvas::Presentation(d) => d.approx_bytes(),
     }
 }
 
@@ -955,6 +959,10 @@ pub(crate) fn frame_matches_size(canvas: &Canvas, width: u32, height: u32) -> bo
         Canvas::Text(_) => true,
         // 表格同理：数据到手后逐格现画，"渲出来的尺寸"没有意义。
         Canvas::Sheet(_) => true,
+        // 文档：模型到手后按当前窗口尺寸逐页现画，尺寸无关。
+        Canvas::Document(_) => true,
+        // 幻灯片：逐张现画，尺寸无关。
+        Canvas::Presentation(_) => true,
     }
 }
 
@@ -963,6 +971,8 @@ pub(crate) fn canvas_size(canvas: &Canvas) -> (u32, u32) {
         Canvas::Bitmap(bitmap) => (bitmap.width, bitmap.height),
         Canvas::Text(_) => (0, 0),
         Canvas::Sheet(_) => (0, 0),
+        Canvas::Document(_) => (0, 0),
+        Canvas::Presentation(_) => (0, 0),
     }
 }
 
@@ -983,6 +993,10 @@ pub(crate) fn fits_render_box(canvas: &Canvas, width: u32, height: u32) -> bool 
         Canvas::Text(_) => true,
         // 表格永远是"按当前盒子的可见区域现画"，天生装得进盒子。
         Canvas::Sheet(_) => true,
+        // 文档同理：逐页现画，与渲染盒尺寸无关。
+        Canvas::Document(_) => true,
+        // 幻灯片同理：逐张现画，与渲染盒尺寸无关。
+        Canvas::Presentation(_) => true,
         Canvas::Bitmap(bitmap) => {
             let inside = bitmap.width <= width && bitmap.height <= height;
             let touches = bitmap.width.abs_diff(width) <= 2 || bitmap.height.abs_diff(height) <= 2;
@@ -1277,6 +1291,10 @@ pub(crate) fn prewarm_within_budget(path: &Path, kind: format::Kind) -> bool {
         // 表格：预渲染的是"数据"而不是画面（画面取决于窗口尺寸/滚动位置），
         // 预热能省的只有解析那 1–20 ms，却要多驻留一份 SheetDoc，先不预。
         format::Kind::Sheet => false,
+        // 文档：同表格，预渲染省下的只有解析那十几毫秒，却要多驻留一份整篇 DocDoc，先不预。
+        format::Kind::Document => false,
+        // 幻灯片：同文档，预渲染只省解析那十几毫秒，却要多驻留一份整篇 PptxDoc，先不预。
+        format::Kind::Presentation => false,
         format::Kind::Unsupported => false,
     }
 }

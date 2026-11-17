@@ -3481,3 +3481,57 @@ Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**�
 - `_bench\trayprobe`：Medium 标签 → `IL=0x2000` + `TRAY_ERR 0x80070005`；改成 High 标签 → `IL=0x3000` + `TRAY_OK`。
 - 部署到 `C:\qlrust-app`（exe/dll 全部 `High`）：双击等价启动后日志 `令牌完整性=high` → `托盘图标已添加 rect=(1659,1040)-(1683,1080) 尺寸=24x40` → `启动后保持后台：不显示窗口`，无任何窗口/弹窗。
 - `cargo test --workspace --offline` **363 passed / 0 failed / 13 ignored**；clippy `-D warnings`、`cargo fmt --all -- --check` 干净。
+
+## 2026-11-17 · 1.10.0：文档（docx）改内置原生分页渲染（替代系统 IPreviewHandler）
+
+### 做了什么
+
+- 新增 `qlr-core::docx` 纯数据模型（`DocDoc`/`Page`/`Block{Para,Table,Rule,Image}`/`Line`/`Run`/`TableCell`/`DocImage`；`emu_to_px`/`twips_to_px`/`dpt_to_px` 换算），零 `windows` 依赖，可在 Linux 单测。
+- 新增 `qlr-render::docx`：手写 OOXML 拉取式扫描（不引 XML 库），解析 `word/document.xml` + `styles.xml`（含 basedOn 继承链）+ `numbering.xml`（项目符号/十进制/字母/罗马）+ `_rels` + `docProps/core.xml`（标题），构建段落/表格/图片流；分页排版 `layout_document`（每行宽度用注入的纯度量 `approx_measure`：CJK 全宽、ASCII 半宽、**故意略大以免溢出**，绘制端再按行矩形裁剪）；`document_layout` 仅读 `sectPr/pgSz` 快速给窗口尺寸（twips/15=px）。安全上限（单条目 64MB、累计 256MB、图片 512 张 / 40M 像素等），坏包返回 `Err` 不 panic。
+- 新增 `qlr-platform::window::docx::paint_page`：逐页 GDI 绘制（自有 `DocxBuffer` 双缓冲、`FontKey` 字体缓存上限 256 + 退化链、`DrawTextW` 逐 run 绘制并按行矩形裁剪、表格边框/底色、`StretchDIBits` 画内嵌图、页眉页脚）；`text::fonts_invalidate` 联动清缓存。
+- 装配：`Kind::Document`（`DOC_EXTS=["docx","docm","dotx","dotm"]`）+ `Canvas::Document(Box<DocDoc>)`；`NativeBackend` 优先级 0 自动接管 docx（系统/插件后端对已有原生 viewer 的类型让位）；`show`/`session` 回填总页数；`render` 把 `is_pdf` 判定改为按 `Kind::Pdf`（docx 不进 PDF 页缓存）；`chrome` 翻页走 `s.page`、`input` 的 `step_page`/`goto_page` 对 Document 短路（只 `invalidate` 重画、不重新解析）。
+
+### 为什么
+
+用户要求（m00001）："和 Excel 的优化一样，要求有性能和内存上的提升"；口径（m00098）："先做docx，直接做到p1,翻页式就行，其他都按建议来就好"。系统处理器路线 docx 冷启 ~718 ms、常驻 130–300 MB 且依赖本机装 Office；原生路线把这两项各降一个数量级，且不依赖 Office。
+
+### 怎么验证
+
+- `cargo build -p qlr-app --release` OK；release `--render` 实测（parse 取日志 `elapsed`，峰值用 psapi `GetProcessMemoryInfo` 轮询）：cn-report 1–2 ms / 8.7 MB、big-report 47 页 8–10 ms / 10.8 MB、real-contract <1 ms、table-heavy 43 ms / 29.7 MB、image-heavy 440 ms / 36.4 MB（图片一次性全解码，记为已知限制）。
+- `scripts/verify-docx.ps1`（headless A 段，`--render` 结构校验）**24 PASS / 0 FAIL / 1 SKIP**（无桌面会话自动跳过 GUI 段）；坏包输出 `RENDER-CLI FAIL`、退出码 3、无 panic；`.doc` 旧格式不被当作 `document`。
+- `cargo test --workspace --no-fail-fast`：qlr-app 75、qlr-core 72、qlr-platform 46（4 ignored）、plugin_api 4、demo 7、office 11、qlr-render lib 155（4 个 media 用例因本沙箱缺 Media Foundation 解码器失败，`media.rs` 未改动，属预存环境问题）、fuzz 1、malformed 9；`cargo fmt --all -- --check` 干净。
+
+## 2026-11-18 · 1.11.0：演示文稿（pptx）改内置原生分页渲染（替代系统 IPreviewHandler）
+
+### 做了什么
+- 新增 `Kind::Presentation`（`format.rs`，扩展名 pptx/pptm/potx/potm/ppsx/ppsm）与 `Canvas::Presentation(Box<PptxDoc>)`；`PptxViewer` 注册到 `viewer_for` 与 `natural_size`（读 `presentation.xml` 的 `sldSz`）。
+- `qlr-core::pptx`：纯数据模型（`PptxDoc{slides,width,height,images,title}`、`Slide{shapes,bg,number}`、`Shape{Text/Picture/Rect/Table}`），复用 `qlr-core::docx` 的 `Rect/Run/Line/Para/DocImage`；零 `windows` 依赖、可跨平台单测。
+- `qlr-render::pptx`：手写 OOXML 解析 + 简单排版。`sldSz`(EMU/9525→px) 定尺寸；主题 `clrScheme` 解析 `schemeClr/srgbClr/sysClr` 与 lumMod/lumOff/tint/shade；占位符几何沿 slide→slideLayout→slideMaster 按 (ph type, idx) 补全；`sldIdLst`+rels 定页序（回退 `slideN.xml`）；递归 `p:sp/p:pic/p:graphicFrame/grpSp/cxnSp`；文本按 `a:r/a:rPr` 取 run 级字号（sz/10 dpt）、粗/斜/下划/删除线、颜色，用 docx 的 `approx_measure` 折行；表格按 `a:tbl` 的 `gridCol` 缩放到框宽。硬上限：条目 64MB、总解压 256MB、页 ≤2048、每页形状 ≤4096、图 ≤1024、单图 ≤40M 像素。
+- `qlr-platform::window::pptx`：逐页 GDI 绘制（适配居中缩放、自有 14 档字体缓存 + 降级、表格网格、图片 RGBA→BGRA `StretchDIBits`、色块边框）；DPI 变化时随 `text::fonts_invalidate()` 清本模块字体缓存。
+- `qlr-app` 接线：`Surface::Presentation`、`from_canvas`/`NativeBackend.surface` 分支；`session::set_content` 回填 `s.pages`（翻页复用既有 `s.page/s.pages` 通用逻辑，`input.rs` 的 step_page/goto_page 对 Document|Presentation 直接 invalidate 重画、不重新 request_render）；`render.rs` 的 `canvas_bytes/frame_matches_size/canvas_size/fits_render_box/prewarm` 增加分支；`chrome.rs` 的 `scroll_info` 加 `Presentation=>None`、`repaint` 加 `Canvas::Presentation` 走 `window::paint_slide`。
+
+### 为什么
+- 与 docx / 表格同一思路：进程内纯 Rust 解析 + GDI 绘制，摆脱"必须装 Office"的 `IPreviewHandler`（旧路线冷启 ~718 ms、常驻 130–300 MB）。翻页式（一屏一页 + PageUp/PageDown + 页码框）与 docx 体验一致。
+
+### 怎么验证
+- `cargo build -p qlr-app --release` OK；release `--render` 实测（parse 取日志 `elapsed`，峰值用 psapi `GetProcessMemoryInfo` 轮询）：real-proposal 31 页 8 ms、real-deck-9mb 17 页 13 ms、real-deck-62mb 37 ms；峰值常驻 ~8–12 MB。
+- `scripts/verify-pptx.ps1`（headless A 段，`--render` 结构校验）**25 PASS / 0 FAIL / 1 SKIP**（无桌面会话自动跳过 GUI 段）；坏包 `RENDER-CLI FAIL`、退出码 3、无 panic；`.ppt` 旧格式不被当作 `presentation`。
+- `cargo test --workspace --no-fail-fast`：qlr-app 75、qlr-core 77、qlr-platform 49（4 ignored）、plugin_api 4、demo 7、office 11、qlr-render lib 167（8 ignored）、fuzz 1、malformed 9，全绿；`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 均干净。
+
+## 2026-11-18 · 1.11.1：修复 pptx 原生预览整页空白
+
+### 问题
+用户实测 `plugin-demo.pptx`（4:3、3 页、标题+正文占位符、无显式 `a:xfrm`）原生预览整页全白，仅页码框显示 1/3。
+
+### 根因
+`qlr-render::pptx` 的 `parse_xml` 返回合成 `#root` 结点，而 `parse_rels` 直接在 `#root` 上取 `root.children("Relationship")`，真正的 `<Relationships>` 是 `#root` 的子结点 → rels map 恒为空。于是 slide→layout→master 的占位符几何全部拿不到（每个 `sp` 落到兜底 `Rect(0,0,1,1)`，文字被挤成 1px 宽逐字竖排、行高异常），图片也无法按 `r:embed` 解出。另 `DEFAULT_SIZE_DPT` 误写为 1800（OOXML `sz` 是百分之一磅，18pt 应为 180 dpt），默认字号大 10 倍。
+
+### 修法
+- `parse_rels` 先 `root.child("Relationships")` 再取其 `Relationship` 子结点（回退 `&root`）。
+- `DEFAULT_SIZE_DPT` 1800 → 180，并注释 `sz` 单位换算。
+- 回归测试：`parse_rels_descends_relationships_root`；`qlr-platform::window::pptx` 抽出 `draw_slide_page` 并加离屏 DIB 像素测试 `draw_slide_page_renders_non_blank`（断言非白像素 > 200，直接防"模型对了但绘制仍空白"）。
+
+### 怎么验证
+- `plugin-demo.pptx` 模型：3 页，每页 2 个 Text，rect 正常（标题 (48,29,864,120)、正文 (48,168,864,475)），行高 29px。
+- 真实 31 页提案：`images=19`（修复前 0）、标题正常、图/文本矩形正常。
+- `cargo test --workspace --no-fail-fast` 全绿（qlr-platform 50 passed/4 ignored，含新像素测试，render lib 168 passed/8 ignored）；`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 干净。

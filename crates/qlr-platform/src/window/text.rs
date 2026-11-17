@@ -263,6 +263,11 @@ pub fn fonts_invalidate() {
     // 不是正常路径（每跳一次就要重建 14 个 HFONT，绘制会明显变慢）。
     qlr_core::log_debug!("window", "字体缓存失效（DPI 变化）");
     FONTS.with(|cell| cell.borrow_mut().clear());
+    // docx 有自己的"按文件字号"字体缓存（见 `window::docx`），DPI 变了同样要丢，
+    // 否则跨屏后还在用旧像素高度的字体、且每次新建都漏一个 HFONT。
+    super::docx::clear_font_cache();
+    // pptx 同理（见 `window::pptx`），DPI 变化也要丢。
+    super::pptx::clear_font_cache();
 }
 
 /// 装上"DPI 变了 → 重建字体"的钩子。宿主启动时调一次即可。

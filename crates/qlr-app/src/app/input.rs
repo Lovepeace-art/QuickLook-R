@@ -1590,6 +1590,17 @@ pub(crate) fn step_page(delta: isize) {
         s.sheet_scroll = (0, 0);
     });
 
+    // docx（1.10.0）：整篇模型已经在内存里，翻页只要改页码重画即可——
+    // 不必再投一次渲染任务把整篇重新解析一遍（那会白花十几毫秒还会闪一下）。
+    if matches!(
+        get_content().as_deref(),
+        Some(Canvas::Document(_) | Canvas::Presentation(_))
+    ) {
+        window::invalidate(preview.raw());
+        log_info!(SCOPE, "PAGE {}/{}（文档翻页）", target + 1, pages);
+        return;
+    }
+
     let (width, height) = view_size(preview.raw());
     request_render(&path, width, height, target);
 
@@ -1618,6 +1629,15 @@ pub(crate) fn goto_page(page: usize) {
     })
     .unwrap_or(false);
     if !changing {
+        return;
+    }
+    // docx（1.10.0）：同上，文档翻页直接重画，不重新解析。
+    if matches!(
+        get_content().as_deref(),
+        Some(Canvas::Document(_) | Canvas::Presentation(_))
+    ) {
+        window::invalidate(preview.raw());
+        log_info!(SCOPE, "PAGE {}/{}（文档跳转）", target, total);
         return;
     }
     let (width, height) = view_size(preview.raw());

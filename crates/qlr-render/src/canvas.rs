@@ -4,6 +4,8 @@
 //! 这么切的理由：渲染是唯一需要跨平台单测、也是最需要被基准脚本直接调用的部分；
 //! 把它和窗口解耦之后，`cargo test` 和 `scripts/bench` 都能在无窗口环境跑。
 
+use qlr_core::docx::DocDoc;
+use qlr_core::pptx::PptxDoc;
 use qlr_core::sheet::SheetDoc;
 
 /// 一张已就绪、可直接贴到窗口上的位图。像素格式固定 `BGRA8`（Windows 原生顺序，
@@ -183,6 +185,10 @@ pub enum Canvas {
     Text(TextDoc),
     /// 电子表格：只带数据，不带像素（绘制在 qlr-platform::window::sheet，可滚动/可翻 sheet）。
     Sheet(Box<SheetDoc>),
+    /// Word 文档：已分好页的纯数据模型，不带像素（绘制在 qlr-platform::window::docx，可翻页）。
+    Document(Box<DocDoc>),
+    /// 演示文稿：按幻灯片组织的纯数据模型，不带像素（绘制在 qlr-platform::window::pptx，可翻页）。
+    Presentation(Box<PptxDoc>),
 }
 
 impl Canvas {
@@ -198,6 +204,12 @@ impl Canvas {
                 .count(),
             Canvas::Text(t) => t.lines.len(),
             Canvas::Sheet(d) => d.sheet().map(|s| s.cells.len()).unwrap_or(0),
+            Canvas::Document(d) => {
+                d.pages.iter().map(|p| p.blocks.len()).sum::<usize>() + d.images.len()
+            }
+            Canvas::Presentation(d) => {
+                d.slides.iter().map(|s| s.shapes.len()).sum::<usize>() + d.images.len()
+            }
         }
     }
 
@@ -205,7 +217,9 @@ impl Canvas {
     pub fn dimensions(&self) -> (u32, u32) {
         match self {
             Canvas::Bitmap(b) => (b.width, b.height),
-            Canvas::Text(_) | Canvas::Sheet(_) => (0, 0),
+            Canvas::Text(_) | Canvas::Sheet(_) | Canvas::Document(_) | Canvas::Presentation(_) => {
+                (0, 0)
+            }
         }
     }
 
@@ -214,6 +228,8 @@ impl Canvas {
             Canvas::Bitmap(_) => "bitmap",
             Canvas::Text(_) => "text",
             Canvas::Sheet(_) => "sheet",
+            Canvas::Document(_) => "document",
+            Canvas::Presentation(_) => "presentation",
         }
     }
 
@@ -232,6 +248,8 @@ impl Canvas {
                         + s.merges.len() * 16
                 })
                 .sum(),
+            Canvas::Document(d) => d.approx_bytes(),
+            Canvas::Presentation(d) => d.approx_bytes(),
         }
     }
 }

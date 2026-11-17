@@ -22,6 +22,10 @@ pub(crate) enum Surface {
     ChildWindow,
     /// 电子表格网格（内核算出可见行列，逐格 GDI 画，可滚动/可翻 sheet）。
     Sheet,
+    /// 分页文档（docx）：模型带每页的块/行坐标，逐页 GDI 画，翻页只改页码。
+    Document,
+    /// 幻灯片（pptx）：模型带每张幻灯片的形状/文字坐标，逐张 GDI 画，翻页只改页码。
+    Presentation,
     /// 壳层自绘列表（压缩包目录树）。
     List,
 }
@@ -37,6 +41,8 @@ impl Surface {
             qlr_render::Canvas::Bitmap(_) => Surface::Bitmap,
             qlr_render::Canvas::Text(_) => Surface::Text,
             qlr_render::Canvas::Sheet(_) => Surface::Sheet,
+            qlr_render::Canvas::Document(_) => Surface::Document,
+            qlr_render::Canvas::Presentation(_) => Surface::Presentation,
         }
     }
 }
@@ -108,6 +114,8 @@ impl PreviewBackend for NativeBackend {
             | format::Kind::Html
             | format::Kind::Audio => Surface::Text,
             format::Kind::Sheet => Surface::Sheet,
+            format::Kind::Document => Surface::Document,
+            format::Kind::Presentation => Surface::Presentation,
             _ => Surface::Bitmap,
         }
     }

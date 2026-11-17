@@ -70,6 +70,24 @@ fn render_quietly(path: &Path) -> Option<String> {
                         path.display()
                     );
                 }
+                // 文档帧（1.10.0）也是合法的：坏 docx 要么 Err、要么退化成单张空页，
+                // 但页面尺寸必须自洽（非零）。
+                qlr_render::Canvas::Document(d) => {
+                    assert!(
+                        d.page_w > 0 && d.page_h > 0,
+                        "文档页面尺寸非法：{}",
+                        path.display()
+                    );
+                }
+                // 演示文稿帧（1.11.0）同理：坏 pptx 要么 Err、要么退化成空演示，
+                // 但画布尺寸必须自洽（非零）。
+                qlr_render::Canvas::Presentation(d) => {
+                    assert!(
+                        d.width > 0 && d.height > 0,
+                        "演示文稿尺寸非法：{}",
+                        path.display()
+                    );
+                }
             }
             None
         }
@@ -294,8 +312,9 @@ fn fuzz_mutated_samples_never_panic() {
 
 #[test]
 fn unsupported_kind_never_reaches_a_parser() {
-    // 八类之外的扩展名必须直接拒绝，不能落到某个渲染器里
-    let path = write("unsupported", "doc.docx", b"PK\x03\x04");
+    // 内置类别之外的扩展名必须直接拒绝，不能落到某个渲染器里。
+    // 注意别拿 docx/xlsx 当"不支持"的样本了——它们现在都有自己的原生查看器（1.9.0 / 1.10.0）。
+    let path = write("unsupported", "story.epub", b"PK\x03\x04");
     let err = render_file(&path, 1024, 768).unwrap_err().to_string();
     assert!(err.contains("插件"), "应当提示走插件：{err}");
 }
@@ -320,8 +339,12 @@ fn broken_video_degrades_to_card_instead_of_error() {
             );
         }
         qlr_render::Canvas::Bitmap(b) => panic!("坏视频不该解出位图：{}x{}", b.width, b.height),
-        // 视频只能是卡片或位图；表格帧出现在这里就是类别串了。
+        // 视频只能是卡片或位图；表格/文档帧出现在这里就是类别串了。
         qlr_render::Canvas::Sheet(_) => panic!("坏视频不该解出表格：{}", path.display()),
+        qlr_render::Canvas::Document(_) => panic!("坏视频不该解出文档：{}", path.display()),
+        qlr_render::Canvas::Presentation(_) => {
+            panic!("坏视频不该解出演示文稿：{}", path.display())
+        }
     }
 }
 

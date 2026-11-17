@@ -11,7 +11,8 @@
  [源码](docs/screenshots/preview-code.png) |
  [Markdown](docs/screenshots/preview-markdown.png) |
  [表格（xlsx）](docs/screenshots/preview-sheet.png) |
- Office（docx / pptx） |
+ 文档（docx，内置原生分页） |
+ 演示文稿（pptx，内置原生分页） |
  [zip](docs/screenshots/preview-archive.png) |
  [音频](docs/screenshots/preview-audio.png) |
  [视频](docs/screenshots/preview-video.png) |
@@ -38,7 +39,8 @@
 | 字体预览 | 不支持 | **支持（DirectWrite 样本页）** |
 | 视频声音 | 无 | **有** |
 | 表格 xlsx（本机实测） | **内置原生渲染，不需要装 Office**（23,167 格的真实表：解析 17.6 ms、首帧 23 ms、宿主 +6 MB） | 未装 `OfficeViewer-Native` → 打不开 |
-| Office 文档 docx / pptx | **内置接管系统预览处理器**（需本机装 Office） | 未装 `OfficeViewer-Native` → 打不开 |
+| 文档 docx（本机实测） | **内置原生分页渲染，不需要装 Office**（47 页报告：解析 8–10 ms、峰值常驻 ~11 MB；中文合同 1–2 ms / 8.7 MB） | 未装 `OfficeViewer-Native` → 打不开 |
+| 演示文稿 pptx（本机实测） | **内置原生分页渲染，不需要装 Office**（31 页提案：解析 8 ms；62 MB 演示 37 ms；峰值常驻 ~8–12 MB） | 未装 `OfficeViewer-Native` → 打不开 |
 | 压缩包 | **内置目录树，129 ms** | 插件列表，488 ms |
 
 完整数据、逐夹具明细与测量口径：[docs/dev/COMPARE-live-1.8.3-fix.md](docs/dev/COMPARE-live-1.8.3-fix.md)（上一版：[COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md)）。
@@ -61,7 +63,7 @@ pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"   # 卸载�
 
 首次运行会有 SmartScreen 提示（无代码签名证书），选"更多信息 → 仍要运行"即可。
 
-**系统要求**：Windows 10 / Windows 11，x64。表格（xlsx/xlsm/xltx/xltm）**不需要装 Office**（内置原生渲染，见 [ADR-0011](docs/adr/0011-native-sheet-preview.md)）；docx / pptx 预览仍走系统 `IPreviewHandler`，需要本机装了 Microsoft Office；PDF 需要随包提供的 `pdfium.dll`。
+**系统要求**：Windows 10 / Windows 11，x64。表格（xlsx/xlsm/xltx/xltm）**不需要装 Office**（内置原生渲染，见 [ADR-0011](docs/adr/0011-native-sheet-preview.md)）；文档（docx/docm/dotx/dotm）也已改为**内置原生分页渲染，不需要装 Office**（见 [docx 方案](docs/plans/docx-native-preview.md)）；演示文稿（pptx/pptm/potx/potm/ppsx/ppsm）也已改为**内置原生分页渲染，不需要装 Office**；仅其余 ODF（odt/ods/odp）仍走系统 `IPreviewHandler`，需要本机装了字处理软件；PDF 需要随包提供的 `pdfium.dll`。
 
 ## 致谢
 

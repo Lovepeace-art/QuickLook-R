@@ -1,6 +1,6 @@
 //! 格式注册表：把路径映射到"用哪个查看器"。
 //!
-//! 内置查看器覆盖 9 类：图片 / PDF / 文本 / Markdown / SVG / HTML / 音频 / 视频 / 表格。
+//! 内置查看器覆盖 11 类：图片 / PDF / 文本 / Markdown / SVG / HTML / 音频 / 视频 / 表格 / 文档 / 演示文稿。
 //! 其余格式一律 `Kind::Unsupported`，由壳层给出"暂未支持，后续以插件形式提供"
 //! 的提示 —— 插件体系见 `crates/qlr-plugin-api` 与 `docs/dev/PLUGINS.md`。
 //!
@@ -45,6 +45,10 @@ pub enum Kind {
     Video,
     /// 电子表格（xlsx/xlsm/xltx/xltm）：原生网格渲染，可滚动、看得到公式结果缓存值
     Sheet,
+    /// 文字处理文档（docx/docm/dotx/dotm）：原生分页渲染，翻页查看（1.10.0）
+    Document,
+    /// 演示文稿（pptx/pptm/potx/potm…）：原生按幻灯片渲染，翻页查看（1.10.0）
+    Presentation,
     /// 扩展名表之外：壳层只出提示文字
     Unsupported,
 }
@@ -62,6 +66,8 @@ impl Kind {
             Kind::Audio => "audio",
             Kind::Video => "video",
             Kind::Sheet => "sheet",
+            Kind::Document => "document",
+            Kind::Presentation => "presentation",
             Kind::Unsupported => "unsupported",
         }
     }
@@ -78,6 +84,8 @@ impl Kind {
             Kind::Audio => "音频",
             Kind::Video => "视频",
             Kind::Sheet => "表格",
+            Kind::Document => "文档",
+            Kind::Presentation => "演示文稿",
             Kind::Unsupported => "未知格式",
         }
     }
@@ -94,7 +102,11 @@ impl Kind {
 
     /// 是不是"按原始像素尺寸开窗"的类别（图片与矢量图）。
     pub fn has_natural_size(self) -> bool {
-        matches!(self, Kind::Image | Kind::Svg | Kind::Video | Kind::Pdf)
+        // 文档也按"页面像素尺寸"开窗（拿 sectPr 的 pgSz 换算，见 qlr-render::docx）。
+        matches!(
+            self,
+            Kind::Image | Kind::Svg | Kind::Video | Kind::Pdf | Kind::Document | Kind::Presentation
+        )
     }
 
     /// 不支持时给用户的建议（内置查看器之外的路子）。
@@ -135,6 +147,15 @@ const VIDEO_EXTS: &[&str] = &[
 /// 老式二进制 `.xls`/`.et` **不在**这里：它要 BIFF 解析器，本轮不做，
 /// 交回系统处理器/插件兜底（见 `docs/adr/0010-native-sheet-preview.md`）。
 const SHEET_EXTS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm"];
+/// 文字处理文档（OOXML 的四种后缀，容器完全一样，只是宏/模板标记不同）。
+///
+/// 老式二进制 `.doc`/`.dot` **不在**这里：它要 BIFF/CFB 解析器，本轮不做，
+/// 交回系统处理器/插件兜底（与 `.xls` 同一处理，见 `docs/adr/0011`）。
+const DOC_EXTS: &[&str] = &["docx", "docm", "dotx", "dotm"];
+/// 演示文稿（OOXML 的各种后缀，容器一样，只是宏/模板/放映标记不同）。
+///
+/// 老式二进制 `.ppt` **不在**这里：它要 CFB/BIFF 解析器，本轮不做，交回系统处理器/插件兜底。
+const PPTX_EXTS: &[&str] = &["pptx", "pptm", "potx", "potm", "ppsx", "ppsm"];
 const TEXT_EXTS: &[&str] = &[
     // 纯文本 / 日志 / 说明
     "txt",
@@ -259,6 +280,8 @@ pub fn extensions(kind: Kind) -> &'static [&'static str] {
         Kind::Audio => AUDIO_EXTS,
         Kind::Video => VIDEO_EXTS,
         Kind::Sheet => SHEET_EXTS,
+        Kind::Document => DOC_EXTS,
+        Kind::Presentation => PPTX_EXTS,
         Kind::Unsupported => &[],
     }
 }
@@ -274,6 +297,8 @@ pub const KINDS: &[Kind] = &[
     Kind::Audio,
     Kind::Video,
     Kind::Sheet,
+    Kind::Document,
+    Kind::Presentation,
 ];
 
 /// 内置能预览的全部扩展名（给文档 / 矩阵脚本 / 文件关联用）。
@@ -335,6 +360,12 @@ pub fn kind_for_ext(ext: &str) -> Option<Kind> {
     }
     if SHEET_EXTS.contains(&ext.as_str()) {
         return Some(Kind::Sheet);
+    }
+    if DOC_EXTS.contains(&ext.as_str()) {
+        return Some(Kind::Document);
+    }
+    if PPTX_EXTS.contains(&ext.as_str()) {
+        return Some(Kind::Presentation);
     }
     if TEXT_EXTS.contains(&ext.as_str()) {
         return Some(Kind::Text);
@@ -442,11 +473,28 @@ mod tests {
 
     #[test]
     fn media_and_office_are_unsupported() {
-        assert_eq!(kind(r"C:\a\b.docx"), Kind::Unsupported);
+        // docx/docm/dotx/dotm 已在 1.10.0 提升为原生 `Kind::Document`（见 docx_routes_to_document），
+        // 这里只留仍不支持的 `.zip` / `.exe` / 字体 / 模型等。
         assert_eq!(kind(r"C:\a\b.zip"), Kind::Unsupported);
         assert_eq!(kind(r"C:\a\b.exe"), Kind::Unsupported);
         assert_eq!(kind(r"C:\a\b.ttf"), Kind::Unsupported);
         assert_eq!(kind(r"C:\a\b.stl"), Kind::Unsupported);
+    }
+
+    #[test]
+    fn docx_routes_to_document() {
+        for p in [
+            r"C:\a\b.docx",
+            r"C:\a\b.DOCX",
+            r"C:\a\b.docm",
+            r"C:\a\b.dotx",
+            r"C:\a\b.dotm",
+        ] {
+            assert_eq!(kind(p), Kind::Document, "{p}");
+        }
+        // 老式二进制 .doc/.dot 仍交回系统处理器/插件兜底，不是 Document。
+        assert_eq!(kind(r"C:\a\b.doc"), Kind::Unsupported);
+        assert_eq!(kind(r"C:\a\b.dot"), Kind::Unsupported);
     }
 
     #[test]
@@ -482,6 +530,8 @@ mod tests {
             Kind::Audio,
             Kind::Video,
             Kind::Sheet,
+            Kind::Document,
+            Kind::Presentation,
         ] {
             assert!(k.is_renderable(), "{k} 应可渲染");
         }
@@ -491,12 +541,19 @@ mod tests {
         for k in KINDS {
             assert!(k.is_renderable(), "KINDS 里混进了不可渲染的 {k}");
         }
-        assert_eq!(KINDS.len(), 9, "内置类别数量变了：同步文档与矩阵脚本");
+        assert_eq!(KINDS.len(), 11, "内置类别数量变了：同步文档与矩阵脚本");
     }
 
     #[test]
     fn natural_size_kinds_are_declared() {
-        for k in [Kind::Image, Kind::Svg, Kind::Video, Kind::Pdf] {
+        for k in [
+            Kind::Image,
+            Kind::Svg,
+            Kind::Video,
+            Kind::Pdf,
+            Kind::Document,
+            Kind::Presentation,
+        ] {
             assert!(k.has_natural_size(), "{k} 应按原始尺寸开窗");
         }
         for k in [
@@ -566,6 +623,15 @@ mod tests {
         for ext in ["mp4", "wav", "svg", "html"] {
             assert!(all.contains(&ext), "{ext} 应在内置表里");
         }
-        assert!(!all.contains(&"docx"), "Office 仍由插件/系统处理器负责");
+        // 1.10.0：docx 一族进内置表（原生 Document）
+        for ext in ["docx", "docm", "dotx", "dotm"] {
+            assert!(all.contains(&ext), "{ext} 应在内置表里");
+        }
+        // 1.10.0：pptx 一族进内置表（原生 Presentation）
+        for ext in ["pptx", "pptm", "potx", "potm"] {
+            assert!(all.contains(&ext), "{ext} 应在内置表里");
+        }
+        // zip 仍由插件/系统处理器负责
+        assert!(!all.contains(&"zip"), "压缩包仍由插件负责");
     }
 }

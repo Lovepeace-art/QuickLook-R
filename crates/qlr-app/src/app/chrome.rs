@@ -153,6 +153,12 @@ pub(crate) fn scroll_info() -> Option<window::ScrollInfo> {
         // 表达不了"横向还剩多少"，硬塞进来只会误导；滚动条留给 `paint_sheet`
         // 自己按内容范围画（P1.1）。所以这里返回 `None`，内容区不为此让宽。
         Canvas::Sheet(_) => None,
+        // 文档（1.10.0）：页数已在上面 `pages` 分支处理；走到这里说明页数还没补上，
+        // 这一瞬不画滚动条（内容区先按全宽）。
+        Canvas::Document(_) => None,
+        // 幻灯片（1.11.0）：同文档，页数已在上面 `pages` 分支处理；走到这里说明页数还没补上，
+        // 这一瞬不画滚动条。
+        Canvas::Presentation(_) => None,
     }
 }
 
@@ -737,6 +743,40 @@ pub(crate) fn repaint(hwnd: HWND) {
                     let active = with_state(|s| s.page).unwrap_or(0);
                     window::paint_sheet_tabs(hwnd, tabs, doc, active);
                 }
+                paint_overlays(hwnd, &layout);
+                paint_lens_if_any(hwnd);
+                return;
+            }
+            // 文档（1.10.0）：当前页现画。模型带页面坐标，`paint_page` 按内容区缩放居中，
+            // 逐段画字 + 表格 + 内嵌图。翻页只改 `s.page`，不重新解析/排版。
+            Canvas::Document(doc) => {
+                let page = with_state(|s| s.page).unwrap_or(0);
+                log_debug!(
+                    SCOPE,
+                    "PAINT docx page={}/{} content={}x{}",
+                    page + 1,
+                    doc.len(),
+                    layout.content.right - layout.content.left,
+                    layout.content.bottom - layout.content.top
+                );
+                window::paint_page(hwnd, Some(&chrome), Some(layout.content), doc, page);
+                paint_overlays(hwnd, &layout);
+                paint_lens_if_any(hwnd);
+                return;
+            }
+            // 幻灯片（1.11.0）：当前张现画。模型带幻灯片坐标，`paint_slide` 按内容区缩放居中，
+            // 逐形状画（文字框/图片/色块/表格）。翻页只改 `s.page`，不重新解析。
+            Canvas::Presentation(doc) => {
+                let page = with_state(|s| s.page).unwrap_or(0);
+                log_debug!(
+                    SCOPE,
+                    "PAINT pptx slide={}/{} content={}x{}",
+                    page + 1,
+                    doc.len(),
+                    layout.content.right - layout.content.left,
+                    layout.content.bottom - layout.content.top
+                );
+                window::paint_slide(hwnd, Some(&chrome), Some(layout.content), doc, page);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
                 return;
