@@ -1,5 +1,7 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-17 · **表格（xlsx）预览 1.9.x 冻结**：用户确认"暂时能用"，冻结不再加功能。1.9.0→1.9.4-fix2 共 8 个提交，原生渲染（2.3 万格解析 17.6ms、首帧 5+18ms、宿主 16MB）、拖表头调列宽/行高、标签栏切表、条件格式、单元格选中+Ctrl+C 复制、裸启动静默驻留+托盘可用。**阶段状态记录见 [`docs/dev/SHEET-1.9.x.md`](SHEET-1.9.x.md)**（已完成清单/回归基线/已知限制/解冻建议/docx·pptx 起点）。回归 `cargo test` **363 passed / 0 failed**、`verify-sheet` 13 PASS、`verify-office` 23 PASS。下一阶段：新窗口做 docx / pptx。
+>
 > 更新时间：2026-11-17 · **双击即静默驻留 + 托盘可用（1.9.4-fix2）**：删掉上一版的启动提示卡片（用户要求零弹窗）；托盘 `0x80070005` 真因查明=**exe 被打了 Medium 完整性标签**（本机 Explorer 为 High，UIPI 拒 `NIM_ADD`），改 `High` 后 `令牌完整性=high` + `托盘图标已添加`。回归 `cargo test` **363 passed / 0 failed**、clippy/fmt 零输出。明细见 LOG / CONVENTIONS #172。
 >
 > 更新时间：2026-11-17 · **双击 exe 有可见反馈 + Ctrl+C 系统热键（1.9.4-fix）**：裸启动托盘可用弹气泡、不可用显示 520x190 提示卡片 3.2s 自动收起（`State::tip_mode` 走 `plain_doc`，无行号栏）；Ctrl+C 改 `RegisterHotKey(0x4C52, MOD_CONTROL, 0x43)`，光标不在预览窗时 `forward_ctrl_c()` 补发；多选拖选 + TSV 复制。回归 `cargo test` **363 passed / 0 failed**、fmt/clippy 零输出、`verify-sheet` **13 PASS**、`verify-office` 23 PASS、`smoke` 16 PASS·1 SKIP。明细见 LOG。
