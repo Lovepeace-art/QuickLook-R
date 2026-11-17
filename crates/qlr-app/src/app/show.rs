@@ -402,9 +402,6 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // 与 hide_preview 的 GDI/USER 计数配对：两个数字一起看，才知道增长发生在 show 还是 hide。
     let (gdi0, user0) = window::gui_resources();
     log_debug!(SCOPE, "SHOW 起点 GDI={gdi0} USER={user0}");
-    // 真预览开始时退出"裸启动提示"模式（1.9.4）。
-    with_state(|s| s.tip_mode = false);
-
     // 现场报障："md 有时候第一次点 × 没反应，第二次才关"。如果这次 SHOW 紧跟在一次
     // HIDE 之后，用户看到的就是"点了没反应"——不管是谁（渲染回调、跟随计时器、
     // 热键）把窗口叫回来的，先把这条痕留下，下次复现直接看日志定位。

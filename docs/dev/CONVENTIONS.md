@@ -1805,3 +1805,16 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 
 **验法**：`keybd_event` 注入的 Ctrl+C 不一定会触发系统热键（取决于注入源与前台），所以自动化只能验"投递链路"——直接 `PostMessage(hwnd, WM_HOTKEY, 0x4C52, 0)` 走一遍 `HOTKEY → SHEET-COPY → 剪贴板`，真按键留给用户手验。
 
+
+## #172 托盘图标 0x80070005 的真凶是"给 exe 打了 Medium 完整性标签"，不是 `Shell_NotifyIconW` 用法
+
+**现象**：`qlrust.exe` 双击后托盘不出现，日志 `令牌完整性=medium` + `托盘图标创建失败（不影响预览）：platform: 拒绝访问。(0x80070005)`。把 `NIF_ICON`/`NIF_MESSAGE`/`NIF_TIP`、cbSize（936/956/968/976）、窗口样式（`WS_POPUP`/`WS_OVERLAPPEDWINDOW`/show/hide）、uID、`LoadIconW` 真图标、`schtasks /RL HIGHEST`、经 `explorer.exe` 启动……**全部 0x80070005**，一度怀疑 windows-rs 的 `Shell_NotifyIconW` 绑定坏了。
+
+**根因**：托盘 `NIM_ADD` 走 UIPI——**进程完整性级别必须 ≥ 任务栏（Explorer）的级别**。这台机器的 Explorer 是 **High（0x3000）**，而部署脚本用 `icacls qlrust.exe /setintegritylevel Medium` 给 exe 打了 Medium 标签；**文件上的强制性完整性标签会把进程 IL 压到 Medium**（进程 IL = min(令牌 IL, 文件标签 IL)），于是托盘被拒。同一份二进制把标签改成 `High` 后立刻 `IL=0x3000` + `TRAY_OK`（`_bench\trayprobe` 实测）。
+
+**做法**：
+- 部署时**不要**给 `qlrust.exe`/插件 dll 设 Medium 标签；从低完整性目录（DSH 工作区是 Low）拷出来的文件，用 `icacls <exe> /setintegritylevel High`。
+- 清单保持 `asInvoker`（改 `highestAvailable` 会在 UAC 开启的机器上弹提权框，用户明确不要弹窗）。
+- 排查顺序应是"先量真实 IL"（`OpenProcessToken`+`TokenIntegrityLevel`，注意 `PSID` 里 SubAuthority[0] 在 +8 偏移），再怀疑 API 用法。别拿 PowerShell/C# 版 `Shell_NotifyIcon` 的返回值当证据——封送不对时 `hwnd=0` 都能返回 True。
+
+**推广**：任何"系统级 UI（托盘/任务栏/通知）加不上、报拒绝访问"的场景，先查**两边的完整性级别**，而不是先改参数。

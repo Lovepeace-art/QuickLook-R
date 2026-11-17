@@ -3462,3 +3462,22 @@ Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**�
 - 复制链路（注入只能验投递）：`PostMessage(WM_LBUTTONDOWN/UP)` 点中格 → `SHEET-SEL (2,3)` → `PostMessage(WM_HOTKEY, 0x4C52)` → `HOTKEY Ctrl+C → 复制选中区` → `SHEET-COPY 已复制 D3 字符数 4`，`Get-Clipboard` = `水饮冲调`。
 - 回归：`cargo test --workspace --offline` **363 passed / 0 failed / 13 ignored**；`cargo clippy --workspace --all-targets -- -D warnings` exit 0；`cargo fmt --all` 干净；`scripts/verify-sheet.ps1` **13 PASS / 0 FAIL / 0 SKIP**。
 - 已知限制：本会话里托盘 `Shell_NotifyIcon` 恒 `0x80070005`（UIPI），所以提示窗是"托盘不可用"的兜底路径；普通桌面双击（中完整性）应能正常出托盘图标。
+
+## 2026-11-17 · 1.9.4-fix2：双击 exe = 纯静默驻留 + 托盘图标（查清 0x80070005 真因）
+
+### 做了什么
+
+- 删掉 1.9.4-fix 引入的"启动提示卡片"一整套（`show_startup_tip`、`TIMER_TIP`/`TIP_MS`、`State::tip_mode`、`chrome.rs` 的两处 `tip_mode` 分支、`show.rs` 的复位），裸启动回到"只打一行日志、安静驻留"。
+- 裸启动的第二次双击（转发给常驻宿主、窗口未显示）也不再给任何提示。
+- 定位并修掉托盘 `0x80070005`：**给 exe 打 Medium 完整性标签会把进程 IL 压到 Medium**，而本机 Explorer 是 High，UIPI 直接拒 `NIM_ADD`。部署脚本改为不让 exe 停在 Medium；从低完整性目录拷出的二进制用 `icacls … /setintegritylevel High`。清单保持 `asInvoker`。
+- 新增 CONVENTIONS #172（含排查顺序：先量真实 IL，再怀疑 API）。
+
+### 为什么
+
+用户明确（m07568）："双击 exe 不需要任何形式的弹窗，直接运行并且在托盘显示就好"。此前两版都错在"想法子让用户看见"，而正确解是让托盘真的能加上。
+
+### 怎么验证
+
+- `_bench\trayprobe`：Medium 标签 → `IL=0x2000` + `TRAY_ERR 0x80070005`；改成 High 标签 → `IL=0x3000` + `TRAY_OK`。
+- 部署到 `C:\qlrust-app`（exe/dll 全部 `High`）：双击等价启动后日志 `令牌完整性=high` → `托盘图标已添加 rect=(1659,1040)-(1683,1080) 尺寸=24x40` → `启动后保持后台：不显示窗口`，无任何窗口/弹窗。
+- `cargo test --workspace --offline` **363 passed / 0 failed / 13 ignored**；clippy `-D warnings`、`cargo fmt --all -- --check` 干净。

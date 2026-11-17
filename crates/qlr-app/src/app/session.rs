@@ -66,9 +66,7 @@ pub(crate) const TIMER_VIDEO: usize = 0x77;
 /// 既不会误伤别的程序，也不依赖钩子的生存状态。
 pub(crate) const TIMER_SHEET_KEYS: usize = 0x78;
 /// 裸启动提示窗的自动收起定时器（1.9.4）。
-pub(crate) const TIMER_TIP: usize = 0x79;
 /// 裸启动提示窗显示时长（毫秒）。
-pub(crate) const TIP_MS: u32 = 3200;
 /// Ctrl+C 轮询间隔（毫秒）。25 ms 足够抓到一次正常按键（人手按下通常 ≥80 ms）。
 pub(crate) const SHEET_KEYS_POLL_MS: u32 = 25;
 /// 视频取帧间隔（毫秒）。40 ms ≈ 25 fps：720p 解码一帧只要几毫秒，
@@ -206,7 +204,6 @@ pub(crate) struct State {
     pub(crate) sheet_row_h: Vec<(u32, i32)>,
     /// 正在拖的表格分隔线（1.9.1）：`None` = 没在拖。
     /// 裸启动提示窗模式（1.9.4）：标题固定 "QLRust"、正文按"排版文档"渲染（无行号栏）。
-    pub(crate) tip_mode: bool,
     pub(crate) sheet_resize: Option<SheetResize>,
     /// 选中的单元格（1.9.4）：`(row, col)`，本版只支持单选一格。
     pub(crate) sheet_sel: Option<(u32, u32)>,
@@ -403,7 +400,6 @@ impl State {
             sheet_col_w: Vec::new(),
             sheet_row_h: Vec::new(),
             sheet_resize: None,
-            tip_mode: false,
             sheet_sel: None,
             sheet_sel_focus: None,
             sheet_dragging: false,

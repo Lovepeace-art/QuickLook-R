@@ -59,9 +59,6 @@ pub(crate) fn line_bg(style: qlr_render::LineStyle) -> Option<u32> {
 
 /// 顶栏标题：文件名（不带路径）。
 pub(crate) fn file_title() -> String {
-    if with_state(|s| s.tip_mode).unwrap_or(false) {
-        return "QLRust".to_string();
-    }
     with_state(|s| {
         s.last_path
             .as_ref()
@@ -762,11 +759,10 @@ pub(crate) fn repaint(hwnd: HWND) {
                 let rc = layout.content;
                 // HTML（1.7.9）是"排版出来的文档"，不是源码：行号栏和"第 X–Y 行"都是噪音，
                 // 排出来的效果应该像一篇网页而不是带行号的文本。音频卡片同理（就几行元信息）。
-                let plain_doc = with_state(|s| s.tip_mode).unwrap_or(false)
-                    || matches!(
-                        current_kind(),
-                        Some(format::Kind::Html) | Some(format::Kind::Audio)
-                    );
+                let plain_doc = matches!(
+                    current_kind(),
+                    Some(format::Kind::Html) | Some(format::Kind::Audio)
+                );
                 let gutter = if plain_doc { 0 } else { window::text_gutter() };
                 let width = ((rc.right - rc.left) - 48 - gutter).max(0) as u32;
                 // 折行需要"这段文字有多宽"，只能问 GDI：抓一次 DC 量一屏，

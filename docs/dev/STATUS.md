@@ -1,5 +1,7 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-17 · **双击即静默驻留 + 托盘可用（1.9.4-fix2）**：删掉上一版的启动提示卡片（用户要求零弹窗）；托盘 `0x80070005` 真因查明=**exe 被打了 Medium 完整性标签**（本机 Explorer 为 High，UIPI 拒 `NIM_ADD`），改 `High` 后 `令牌完整性=high` + `托盘图标已添加`。回归 `cargo test` **363 passed / 0 failed**、clippy/fmt 零输出。明细见 LOG / CONVENTIONS #172。
+>
 > 更新时间：2026-11-17 · **双击 exe 有可见反馈 + Ctrl+C 系统热键（1.9.4-fix）**：裸启动托盘可用弹气泡、不可用显示 520x190 提示卡片 3.2s 自动收起（`State::tip_mode` 走 `plain_doc`，无行号栏）；Ctrl+C 改 `RegisterHotKey(0x4C52, MOD_CONTROL, 0x43)`，光标不在预览窗时 `forward_ctrl_c()` 补发；多选拖选 + TSV 复制。回归 `cargo test` **363 passed / 0 failed**、fmt/clippy 零输出、`verify-sheet` **13 PASS**、`verify-office` 23 PASS、`smoke` 16 PASS·1 SKIP。明细见 LOG。
 
 > 更新时间：2026-11-11 · **表格条件格式（色阶 / 数据条 / 条件红字）**：解析 `<dxfs>` 与 `<conditionalFormatting>`（`colorScale` 2/3 色线性插值写 `colors.bg`、`dataBar` 写 `Cell.data_bar` 比例、`cellIs` 8 个 operator + `dxf` 写 `colors.fg/bg`；跳过 expression/iconSet/top10），绘制端按格宽 × 比例画蓝色数据条并压在网格线之下。`verify-sheet` 新增条件格式三项，**13 PASS**。回归 `cargo test` **362 passed / 0 failed / 12 ignored**、fmt/clippy 零输出。明细见 LOG。
