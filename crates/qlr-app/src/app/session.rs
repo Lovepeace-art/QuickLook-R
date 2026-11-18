@@ -7,6 +7,8 @@ use super::*;
 pub(crate) const SCOPE: &str = "app";
 pub(crate) const PREVIEW_CLASS: &str = "QLRust.PreviewWindow";
 /// 投影浮层的窗口类（1.0.10；分层窗口，永远贴在预览窗下面）。
+/// 对比模式改造后阴影停用（P5 彻底删除），暂留常量以免大面积改动。
+#[allow(dead_code)]
 pub(crate) const SHADOW_CLASS: &str = "QLRust.ShadowWindow";
 pub(crate) const TRAY_ID: u32 = 1;
 
@@ -549,17 +551,144 @@ impl ResizeEdges {
     }
 }
 
-pub(crate) static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-/// 绘制内容单独放一个锁：`WM_PAINT` 可能在 `ShowWindow` 里同步重入，
-/// 若此时还持有 `STATE` 就会死锁。规矩：**先写 LINES、放锁，再动窗口**。
-pub(crate) static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-/// 已渲染好的画面（`Arc` 是因为要给 worker 回传与 UI 共享，避免整块像素拷贝）。
-pub(crate) static CONTENT: OnceLock<Mutex<Option<Arc<Canvas>>>> = OnceLock::new();
+/// 一个预览窗口的完整会话：状态 + 两份与「绘制」强相关的旁挂数据。
+///
+/// 为什么 `State` 和 `lines/content` 仍分三把锁（而不是塞进 `State`）：`WM_PAINT` 可能在
+/// `ShowWindow` 里同步重入，若那时还持有 `State` 就会死锁（历史 #128）。这个约束原样保留，
+/// 只是从"进程级全局一套"变成"每窗口各一套"。
+///
+/// 多窗口（对比模式）：原来的单个 `STATE/LINES/CONTENT` 换成"按窗口句柄索引的会话"，
+/// 见 `resolve()`。所有 `with_state/get_content/set_content` 调用点语义不变。
+pub(crate) struct Session {
+    pub(crate) state: Mutex<State>,
+    pub(crate) lines: Mutex<Vec<String>>,
+    pub(crate) content: Mutex<Option<Arc<Canvas>>>,
+}
+
+/// 预览窗口句柄（HWND 原始值 `isize`）→ 会话。
+static SESSIONS: OnceLock<Mutex<std::collections::HashMap<isize, Arc<Session>>>> = OnceLock::new();
+/// 当前"驱动窗"：空格/跟随/托盘/命令行都作用在它上面；被锁窗不在其列。
+static DRIVER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
+thread_local! {
+    /// wndproc 入口写入"这条消息属于哪个窗口"，`resolve()` 据此选会话。
+    /// 0 = 不在任何窗口的消息上下文里（后台线程），回退到 DRIVER。
+    static CURRENT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn sessions() -> &'static Mutex<std::collections::HashMap<isize, Arc<Session>>> {
+    SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn driver_isize() -> Option<isize> {
+    DRIVER
+        .get()
+        .and_then(|m| *m.lock().unwrap_or_else(|e| e.into_inner()))
+        .filter(|v| *v != 0)
+}
+
+/// 选会话：CURRENT（当前消息窗口）有会话就用它，否则回退 DRIVER，最后兜底任一存活会话。
+///
+/// 关键：先把 `Arc<Session>` clone 出来**再**放掉会话表的锁，避免"持表锁再拿会话锁"。
+fn resolve() -> Option<Arc<Session>> {
+    let cur = CURRENT.with(|c| c.get());
+    let drv = driver_isize().unwrap_or(0);
+    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    for key in [cur, drv] {
+        if key != 0 {
+            if let Some(session) = map.get(&key) {
+                return Some(session.clone());
+            }
+        }
+    }
+    map.values().next().cloned()
+}
+
+/// 进入某窗口的消息上下文，返回守卫在 `drop` 时恢复上一层 CURRENT（支持重入）。
+pub(crate) fn enter_session(hwnd: isize) -> SessionGuard {
+    let prev = CURRENT.with(|c| c.replace(hwnd));
+    SessionGuard { prev }
+}
+
+pub(crate) struct SessionGuard {
+    prev: isize,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|c| c.set(self.prev));
+    }
+}
+
+/// 在"指定窗口"的会话上下文里跑一段代码（输入重定向用）。`hwnd` 为 0 时等价于默认。
+pub(crate) fn with_session<R>(hwnd: isize, f: impl FnOnce() -> R) -> R {
+    let _guard = enter_session(hwnd);
+    f()
+}
+
+/// 新建一个窗口会话并登记（`boot` 建驱动窗、`pin_current` 建新窗都走它）。
+pub(crate) fn new_session(
+    preview: HWND,
+    host: HWND,
+    config: Config,
+    shadow: Option<Hwnd>,
+    started: Instant,
+) -> Arc<Session> {
+    let session = Arc::new(Session {
+        state: Mutex::new(State::new(
+            config,
+            Hwnd::from_raw(host),
+            Hwnd::from_raw(preview),
+            shadow,
+            started,
+        )),
+        lines: Mutex::new(vec!["QLRust".to_string()]),
+        content: Mutex::new(None),
+    });
+    sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(preview.0 as isize, session.clone());
+    session
+}
+
+/// 注销一个窗口会话（句柄销毁前调用；`Arc` 归零时 `State` 里的 audio/shell 等随之释放）。
+pub(crate) fn drop_session(hwnd: isize) {
+    sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&hwnd);
+}
+
+/// 设置/切换驱动窗（`None` = 暂无驱动窗）。
+pub(crate) fn set_driver(hwnd: Option<isize>) {
+    let slot = DRIVER.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = hwnd.filter(|v| *v != 0);
+}
+
+/// 当前驱动窗句柄。
+pub(crate) fn driver() -> Option<isize> {
+    driver_isize()
+}
+
+/// 所有存活预览窗的原始句柄（对比模式：驱动窗 + 所有被锁窗）。
+/// 热键判定（光标是否在任一预览窗上）与命中测试用。
+pub(crate) fn preview_keys() -> Vec<isize> {
+    sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect()
+}
 /// 渲染任务队列的发送端。worker 线程在 `run()` 里拉起后长期存活。
 pub(crate) static JOB_TX: OnceLock<Mutex<Sender<RenderJob>>> = OnceLock::new();
 /// worker 的产出槽：`(代际号, 结果)`。`PostMessage` 只能带两个整数，所以载荷走这里。
 pub(crate) type RenderOutcome = (u64, Result<Canvas, qlr_core::Error>);
-pub(crate) static RESULT: OnceLock<Mutex<Option<RenderOutcome>>> = OnceLock::new();
+/// 每个窗口各自的结果槽：`(窗口裸句柄, (代际号, 结果))`。
+///
+/// 对比模式（1.12.0）起渲染结果按窗口分堆：渲染线程把结果投向**请求它的那个窗口**，
+/// 而不再无条件投给驱动窗 —— 这样被锁住的旧窗翻页/缩放时，重渲染会落回它自己。
+pub(crate) static RESULT: OnceLock<Mutex<Vec<(isize, RenderOutcome)>>> = OnceLock::new();
 
 /// 渲染线程代号（1.8.3）：每 spawn 一条就换一个新的、更大的号。
 ///
@@ -682,6 +811,9 @@ pub(crate) struct RenderJob {
     pub(crate) page: usize,
     /// 允许放大渲染（缩放到 100% 以上时为 `true`，否则位图封顶在原始像素）。
     pub(crate) upscale: bool,
+    /// 这一帧属于哪个预览窗（裸 `HWND` 整数）。结果回传给**这个窗口**，而不是驱动窗
+    /// （对比模式 1.12.0）。预渲染/预取任务用 0（它们不走结果槽）。
+    pub(crate) target: isize,
 }
 
 /// 取 `STATE` 锁并跑闭包。
@@ -694,8 +826,8 @@ pub(crate) struct RenderJob {
 /// 为什么敢带着中毒的状态继续：release 是 `panic = "abort"`，中毒只可能来自
 /// dev/测试里的 unwind；那种时候"状态可能差半个字段"比"整个界面哑掉"轻得多。
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
-    let mutex = STATE.get()?;
-    let mut guard = match mutex.lock() {
+    let session = resolve()?;
+    let mut guard = match session.state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             log_error!(SCOPE, "STATE 锁已中毒（持锁 panic 过），取回继续");
@@ -706,17 +838,16 @@ pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 pub(crate) fn set_lines(lines: Vec<String>) {
-    if let Some(slot) = LINES.get()
-        && let Ok(mut guard) = slot.lock()
+    if let Some(session) = resolve()
+        && let Ok(mut guard) = session.lines.lock()
     {
         *guard = lines;
     }
 }
 
 pub(crate) fn get_lines() -> Vec<String> {
-    LINES
-        .get()
-        .and_then(|slot| slot.lock().ok().map(|guard| guard.clone()))
+    resolve()
+        .and_then(|session| session.lines.lock().ok().map(|guard| guard.clone()))
         .unwrap_or_default()
 }
 
@@ -742,8 +873,8 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         Some(Canvas::Presentation(doc)) => Some(doc.len()),
         _ => None,
     };
-    if let Some(slot) = CONTENT.get()
-        && let Ok(mut guard) = slot.lock()
+    if let Some(session) = resolve()
+        && let Ok(mut guard) = session.content.lock()
     {
         *guard = content;
     }
@@ -777,9 +908,7 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
 }
 
 pub(crate) fn get_content() -> Option<Arc<Canvas>> {
-    CONTENT
-        .get()
-        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+    resolve().and_then(|session| session.content.lock().ok().and_then(|guard| guard.clone()))
 }
 
 /// 当前预览的文件类型（没有预览或路径未知时 `None`）。

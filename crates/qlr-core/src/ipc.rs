@@ -100,6 +100,11 @@ pub enum Action {
     /// 设置窗不在这里改任何东西：它自己读写 `config.json`，改完通过
     /// `QLR_SETTINGS_SAVED` 消息把新配置交给常驻实例热更新。
     Settings,
+
+    /// 冻结当前驱动窗（钉住、停跟随）并另开一个空驱动窗——对比模式的「锁」。
+    ///
+    /// 等价于点顶栏的锁按钮；给 `--pin` 与自动化验证用（GUI 里没有可脚本化的点击）。
+    Pin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

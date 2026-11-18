@@ -286,9 +286,24 @@ pub(crate) fn check_render_hang() {
 /// 取消链路——真造一个要跑 5 s 的合法文件很难，"注入延迟"才能稳定复现看门狗的行为）；
 /// `QLRUST_RENDER_HANG_MS` 让第一条线程的第一个任务睡（验证 1.8.3 的挂死自愈）。
 /// 两者都只读一次环境变量，生产环境不设置时零开销。
-pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64), qlr_core::Error> {
+/// 把一批渲染任务按目标窗口去重（对比模式 1.12.0）：同一窗口只保留最新那帧，
+/// 跨窗口的任务顺序与数量都不动 —— 不同窗口的活不能互相顶掉。
+pub(crate) fn coalesce_by_target(batch: Vec<RenderJob>) -> Vec<RenderJob> {
+    let mut order: Vec<isize> = Vec::new();
+    let mut map: std::collections::HashMap<isize, RenderJob> = std::collections::HashMap::new();
+    for job in batch {
+        if !map.contains_key(&job.target) {
+            order.push(job.target);
+        }
+        map.insert(job.target, job);
+    }
+    order.into_iter().filter_map(|t| map.remove(&t)).collect()
+}
+
+pub(crate) fn spawn_render_worker(
+    _host: HWND,
+) -> Result<(Sender<RenderJob>, u64), qlr_core::Error> {
     let (tx, rx) = mpsc::channel::<RenderJob>();
-    let host_raw = host.0 as isize;
     let epoch = RENDER_EPOCH.load(Ordering::Acquire) + 1;
     // 挂死只注入到第一条线程：要验证的是"自愈之后能恢复"，新线程必须是好的。
     let hang_ms = if epoch == 1 { fake_hang_ms() } else { None };
@@ -296,125 +311,138 @@ pub(crate) fn spawn_render_worker(host: HWND) -> Result<(Sender<RenderJob>, u64)
         .name("qlr-render".to_string())
         .spawn(move || {
             let mut hang_simulated = false;
-            while let Ok(mut job) = rx.recv() {
-                // 1.2.0：队列里堆着好几个过期的活（用户连按方向键）时，只做最新的那个。
-                // 工作线程是单线程，不这么做"过期帧"会一个个渲染完再被丢弃——纯浪费。
-                let mut dropped = 0u32;
-                while let Ok(newer) = rx.try_recv() {
-                    job = newer;
-                    dropped += 1;
+            while let Ok(first) = rx.recv() {
+                // 1.2.0：队列里堆着好几个过期的活时只做最新的。1.12.0（对比模式）起
+                // 改为**按窗口**去重：同一窗口只做最新一帧，不同窗口的活互不顶替。
+                let mut batch = vec![first];
+                while let Ok(j) = rx.try_recv() {
+                    batch.push(j);
                 }
-                if dropped > 0 {
+                let total = batch.len();
+                let jobs = coalesce_by_target(batch);
+                if jobs.len() < total {
                     log_debug!(
                         SCOPE,
-                        "RENDER 丢弃 {dropped} 个排队任务，只做最新的 gen={}",
-                        job.generation
+                        "RENDER 合并同一窗口的过期帧：{total} → {} 帧",
+                        jobs.len()
                     );
                 }
-                // 新活开跑：清掉上一条活留下的取消信号（否则这一帧一进来就自杀）。
-                qlr_render::cancel::reset();
-                let started = Instant::now();
-                // 测试钩子（1.2.0）：注入一段假的慢渲染，用来验证看门狗与取消链路。
-                // 只读一次环境变量，正常使用时不产生任何开销。
-                if let Some(ms) = fake_slow_ms() {
-                    log_warn!(SCOPE, "RENDER 注入慢渲染 {ms}ms（测试钩子）");
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
-                }
-                // 测试钩子（1.8.3）：模拟"卡在第三方 FFI 里不返回"——不查取消标志、
-                // 不响应任何协作式退出，只能靠 UI 线程换一条线程来恢复。
-                if let Some(ms) = hang_ms.filter(|_| !hang_simulated) {
-                    hang_simulated = true;
-                    log_warn!(
+                for job in jobs {
+                    // 新活开跑：清掉上一条活留下的取消信号（否则这一帧一进来就自杀）。
+                    qlr_render::cancel::reset();
+                    let started = Instant::now();
+                    // 测试钩子（1.2.0）：注入一段假的慢渲染，用来验证看门狗与取消链路。
+                    // 只读一次环境变量，正常使用时不产生任何开销。
+                    if let Some(ms) = fake_slow_ms() {
+                        log_warn!(SCOPE, "RENDER 注入慢渲染 {ms}ms（测试钩子）");
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                    // 测试钩子（1.8.3）：模拟"卡在第三方 FFI 里不返回"——不查取消标志、
+                    // 不响应任何协作式退出，只能靠 UI 线程换一条线程来恢复。
+                    if let Some(ms) = hang_ms.filter(|_| !hang_simulated) {
+                        hang_simulated = true;
+                        log_warn!(
+                            SCOPE,
+                            "RENDER 注入挂死 {ms}ms（测试钩子 QLRUST_RENDER_HANG_MS，仅开发用）"
+                        );
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                    // 测试钩子（1.2.0）：验证崩溃兜底（panic → 报告 + minidump）。
+                    // release 是 `panic = "abort"`，所以这里**一定会**把进程带走——
+                    // 这正是要验证的路径：进程没了，但证据必须留下。
+                    // 注意 `cmd /c "set X=1 && ..."` 里 `set` 会把 `&&` 前的空格算进值里
+                    // （值变成 `"1 "`），所以这里必须 trim 再比，否则测试钩子静默失效。
+                    if std::env::var("QLRUST_PANIC_TEST")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .as_deref()
+                        == Some("1")
+                    {
+                        panic!("QLRust 崩溃测试（QLRUST_PANIC_TEST=1）");
+                    }
+                    // 内置查看器优先；内置不接的格式才问插件（"插件只补空缺，不抢内置"）。
+                    let kind = format::kind_for_path(&job.path);
+                    // 帧级分配计数（只有 `--features alloc-stats` 才有这行代码）。
+                    // `bytes=` 报的是位图大小，报不出这一帧总共分配了多少 —— 缩放中间缓冲、
+                    // 文本布局字符串、Vec 扩容都在里面，量出来才知道"每帧重建"值不值得优化。
+                    #[cfg(feature = "alloc-stats")]
+                    let alloc_before = crate::alloc_stats::total_allocated();
+                    let native =
+                        backend::resolve(&job.path, kind).is_some_and(|b| b.id() == "native");
+                    let result = if native {
+                        qlr_render::render_file_at_zoom(
+                            &job.path,
+                            job.max_width,
+                            job.max_height,
+                            job.page,
+                            job.upscale,
+                        )
+                    } else {
+                        render_with_plugin(&job.path, kind, job.max_width, job.max_height)
+                    };
+                    let elapsed = started.elapsed().as_millis();
+                    // 单独一行而不是塞进 RENDER：RENDER 的字段顺序被日志解析（bench.ps1、
+                    // 现场 grep）依赖着，多插一个字段就会让老正则错位。
+                    #[cfg(feature = "alloc-stats")]
+                    log_info!(
                         SCOPE,
-                        "RENDER 注入挂死 {ms}ms（测试钩子 QLRUST_RENDER_HANG_MS，仅开发用）"
-                    );
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-                // 测试钩子（1.2.0）：验证崩溃兜底（panic → 报告 + minidump）。
-                // release 是 `panic = "abort"`，所以这里**一定会**把进程带走——
-                // 这正是要验证的路径：进程没了，但证据必须留下。
-                // 注意 `cmd /c "set X=1 && ..."` 里 `set` 会把 `&&` 前的空格算进值里
-                // （值变成 `"1 "`），所以这里必须 trim 再比，否则测试钩子静默失效。
-                if std::env::var("QLRUST_PANIC_TEST")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .as_deref()
-                    == Some("1")
-                {
-                    panic!("QLRust 崩溃测试（QLRUST_PANIC_TEST=1）");
-                }
-                // 内置查看器优先；内置不接的格式才问插件（"插件只补空缺，不抢内置"）。
-                let kind = format::kind_for_path(&job.path);
-                // 帧级分配计数（只有 `--features alloc-stats` 才有这行代码）。
-                // `bytes=` 报的是位图大小，报不出这一帧总共分配了多少 —— 缩放中间缓冲、
-                // 文本布局字符串、Vec 扩容都在里面，量出来才知道"每帧重建"值不值得优化。
-                #[cfg(feature = "alloc-stats")]
-                let alloc_before = crate::alloc_stats::total_allocated();
-                let native = backend::resolve(&job.path, kind).is_some_and(|b| b.id() == "native");
-                let result = if native {
-                    qlr_render::render_file_at_zoom(
-                        &job.path,
-                        job.max_width,
-                        job.max_height,
-                        job.page,
-                        job.upscale,
-                    )
-                } else {
-                    render_with_plugin(&job.path, kind, job.max_width, job.max_height)
-                };
-                let elapsed = started.elapsed().as_millis();
-                // 单独一行而不是塞进 RENDER：RENDER 的字段顺序被日志解析（bench.ps1、
-                // 现场 grep）依赖着，多插一个字段就会让老正则错位。
-                #[cfg(feature = "alloc-stats")]
-                log_info!(
-                    SCOPE,
-                    "RENDERALLOC gen={} bytes={} live={}",
-                    job.generation,
-                    crate::alloc_stats::total_allocated().saturating_sub(alloc_before),
-                    crate::alloc_stats::live_bytes()
-                );
-                match &result {
-                    Ok(canvas) => log_info!(
-                        SCOPE,
-                        "RENDER gen={} {} {}x{} bytes={} ink={} elapsed={}ms (请求 {}x{})",
+                        "RENDERALLOC gen={} bytes={} live={}",
                         job.generation,
-                        canvas.kind_name(),
-                        canvas.dimensions().0,
-                        canvas.dimensions().1,
-                        canvas.approx_bytes(),
-                        canvas.ink_pixels(),
-                        elapsed,
-                        job.max_width,
-                        job.max_height
-                    ),
-                    Err(e) => log_warn!(
-                        SCOPE,
-                        "RENDER gen={} 失败 elapsed={}ms：{e}",
-                        job.generation,
-                        elapsed
-                    ),
-                }
-                // 可丢缓存的总账（源图档位 + PDF 文档槽 + PDF 页缓存），一行固定格式：
-                // 排查"预览器占着几百兆"时先看这里，再看各缓存自己的淘汰日志。
-                log_info!(SCOPE, "MEM {}", qlr_render::budget::summary());
-                // 1.8.3：自愈换线程之后，旧线程迟早会从第三方代码里爬出来交活。
-                // 它的结果绝不能进结果槽、也不能通知 UI —— 那会顶掉新线程刚算好的那一帧
-                // （UI 只看代际号，一代就对得上），或者把用户早翻过去的旧图糊上来。
-                if RENDER_EPOCH.load(Ordering::Acquire) != epoch {
-                    log_debug!(
-                        SCOPE,
-                        "RENDER gen={} 来自已退役的渲染线程（epoch={epoch}），丢弃",
-                        job.generation
+                        crate::alloc_stats::total_allocated().saturating_sub(alloc_before),
+                        crate::alloc_stats::live_bytes()
                     );
-                    continue;
+                    match &result {
+                        Ok(canvas) => log_info!(
+                            SCOPE,
+                            "RENDER gen={} {} {}x{} bytes={} ink={} elapsed={}ms (请求 {}x{})",
+                            job.generation,
+                            canvas.kind_name(),
+                            canvas.dimensions().0,
+                            canvas.dimensions().1,
+                            canvas.approx_bytes(),
+                            canvas.ink_pixels(),
+                            elapsed,
+                            job.max_width,
+                            job.max_height
+                        ),
+                        Err(e) => log_warn!(
+                            SCOPE,
+                            "RENDER gen={} 失败 elapsed={}ms：{e}",
+                            job.generation,
+                            elapsed
+                        ),
+                    }
+                    // 可丢缓存的总账（源图档位 + PDF 文档槽 + PDF 页缓存），一行固定格式：
+                    // 排查"预览器占着几百兆"时先看这里，再看各缓存自己的淘汰日志。
+                    log_info!(SCOPE, "MEM {}", qlr_render::budget::summary());
+                    // 1.8.3：自愈换线程之后，旧线程迟早会从第三方代码里爬出来交活。
+                    // 它的结果绝不能进结果槽、也不能通知 UI —— 那会顶掉新线程刚算好的那一帧
+                    // （UI 只看代际号，一代就对得上），或者把用户早翻过去的旧图糊上来。
+                    if RENDER_EPOCH.load(Ordering::Acquire) != epoch {
+                        log_debug!(
+                            SCOPE,
+                            "RENDER gen={} 来自已退役的渲染线程（epoch={epoch}），丢弃",
+                            job.generation
+                        );
+                        continue;
+                    }
+                    end_lease(epoch, job.generation);
+                    if let Some(slot) = RESULT.get()
+                        && let Ok(mut guard) = slot.lock()
+                    {
+                        guard.push((job.target, (job.generation, result)));
+                        // 关掉的窗口不会再取自己的结果：别让过期条目无限堆积（最多留 32 条）。
+                        if guard.len() > 32 {
+                            let drop_n = guard.len() - 32;
+                            guard.drain(0..drop_n);
+                        }
+                    }
+                    // 结果只投给**请求这一帧的那个窗口**（对比模式 1.12.0）。
+                    window::post(
+                        HWND(job.target as *mut core::ffi::c_void),
+                        ipc::WM_QLR_RENDER,
+                    );
                 }
-                end_lease(epoch, job.generation);
-                if let Some(slot) = RESULT.get()
-                    && let Ok(mut guard) = slot.lock()
-                {
-                    *guard = Some((job.generation, result));
-                }
-                window::post(HWND(host_raw as *mut core::ffi::c_void), ipc::WM_QLR_RENDER);
             }
             log_debug!(SCOPE, "渲染线程退出");
         })
@@ -586,6 +614,9 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         // 任何格式都记"上一帧"的 key：重开同一个文件时可以直接上屏（1.4.0）。
         s.pending_frame = Some(frame);
     });
+    // 对比模式（1.12.0）：记下这一帧属于哪个窗口，结果按窗口回传。CURRENT 已由
+    // with_session/wndproc 保证是本会话（驱动窗或其被锁的旧窗）。
+    let target = with_state(|s| s.preview.raw().0 as isize).unwrap_or(0);
     let job = RenderJob {
         generation,
         path: path.to_path_buf(),
@@ -593,6 +624,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         max_height: max_h,
         page,
         upscale: with_state(|s| s.zoom > 1.0).unwrap_or(false),
+        target,
     };
     // 1.8.3：登记租约（先登记再投递，顺序理由见 `begin_lease`）。
     begin_lease(&job);
@@ -657,9 +689,18 @@ pub(crate) fn on_render_watchdog() {
 
 /// UI 线程收到 `WM_QLR_RENDER`：取结果、校验代际、上屏。
 pub(crate) fn on_render_done() {
-    let taken = RESULT
-        .get()
-        .and_then(|slot| slot.lock().ok().and_then(|mut guard| guard.take()));
+    // 对比模式（1.12.0）：结果槽按窗口分堆，只取"本窗口"最新那条（本函数跑在该窗口的
+    // 消息循环里，CURRENT 就是它）。
+    let me = with_state(|s| s.preview.raw().0 as isize);
+    let Some(me) = me else {
+        return;
+    };
+    let taken = RESULT.get().and_then(|slot| {
+        slot.lock().ok().and_then(|mut guard| {
+            let pos = guard.iter().rposition(|(t, _)| *t == me)?;
+            Some(guard.remove(pos).1)
+        })
+    });
     let Some((generation, result)) = taken else {
         return;
     };
@@ -1209,6 +1250,7 @@ pub(crate) fn prefetch_neighbor_pages(key: &pagecache::PageKey) {
             max_height: neighbor.height,
             page: neighbor.page,
             upscale: false,
+            target: 0,
         }));
     }
 }
@@ -1233,6 +1275,7 @@ pub(crate) fn request_prewarm(path: &Path, width: u32, height: u32) {
         max_height,
         page: 0,
         upscale: false,
+        target: 0,
     };
     if tx.send(WarmTask::Prepared(job)).is_err() {
         log_warn!(SCOPE, "预渲染线程已退出，丢弃本次预热");

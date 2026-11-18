@@ -10,6 +10,9 @@
 //! 排版（折行、分页）在 `qlr-render::docx`，因为它需要注入的字体度量（`measure`）；
 //! 绘制在 `qlr-platform::window::docx`。
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 /// EMU（English Metric Unit，OOXML 内部长度单位）→ 像素（96 DPI）。
 ///
 /// 1 英寸 = 914400 EMU = 96 px，所以 1 px = 9525 EMU。用于图片 `wp:extent` 等。
@@ -268,6 +271,90 @@ impl PartialEq for DocImage {
 
 impl Eq for DocImage {}
 
+/// 一张图片的**惰性槽**：解析阶段只记录该图在包内的**条目名** + 显示尺寸；读字节与解码成
+/// RGBA 都推迟到该图所在页（docx）/ 幻灯片（pptx）**首次绘制**时
+/// （见 `qlr-render::docx::ensure_page_images` / `qlr-render::pptx::ensure_slide_images`）。
+///
+/// 为什么放 qlr-core：平台层（qlr-platform）只依赖 qlr-core，绘制时需读 `DocImage`；
+/// 而读 zip/解码要用 `zip`+`image`（只在 qlr-render）。所以模型只存条目名，读+解函数放
+/// qlr-render，由应用在绘制前按页触发，解码结果经 `OnceLock` 缓存回本槽。
+/// 这样打开文件时连图片字节都不读（≈零图像内存/耗时），未翻到的页永不读、不解。
+pub struct ImageSlot {
+    /// 页面上的显示尺寸（EMU 换算后的像素；0 表示未知，解码时按原图尺寸）。
+    pub disp_w: u32,
+    pub disp_h: u32,
+    /// 图片在包（zip）内的**条目名**，如 `word/media/image1.png` / `ppt/media/image1.png`。
+    /// 首次绘制时按它重开源文件读取并解码。
+    pub part: String,
+    /// 惰性解码结果（首次绘制时填充）。
+    decoded: OnceLock<DocImage>,
+}
+
+impl ImageSlot {
+    pub fn new(disp_w: u32, disp_h: u32, part: impl Into<String>) -> Self {
+        Self {
+            disp_w,
+            disp_h,
+            part: part.into(),
+            decoded: OnceLock::new(),
+        }
+    }
+
+    pub fn is_decoded(&self) -> bool {
+        self.decoded.get().is_some()
+    }
+
+    pub fn decoded(&self) -> Option<&DocImage> {
+        self.decoded.get()
+    }
+
+    /// 只接受第一次设置；已解码则忽略并返回 `false`。
+    pub fn set_decoded(&self, img: DocImage) -> bool {
+        self.decoded.set(img).is_ok()
+    }
+
+    /// 粗略驻留字节：条目名 +（若已解码）RGBA。
+    pub fn approx_bytes(&self) -> usize {
+        self.part.len() + self.decoded.get().map(|d| d.rgba.len()).unwrap_or(0) + 32
+    }
+}
+
+impl Default for ImageSlot {
+    fn default() -> Self {
+        Self {
+            disp_w: 0,
+            disp_h: 0,
+            part: String::new(),
+            decoded: OnceLock::new(),
+        }
+    }
+}
+
+impl Clone for ImageSlot {
+    fn clone(&self) -> Self {
+        let decoded = OnceLock::new();
+        if let Some(d) = self.decoded.get() {
+            let _ = decoded.set(d.clone());
+        }
+        Self {
+            disp_w: self.disp_w,
+            disp_h: self.disp_h,
+            part: self.part.clone(),
+            decoded,
+        }
+    }
+}
+
+impl std::fmt::Debug for ImageSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageSlot")
+            .field("disp", &(self.disp_w, self.disp_h))
+            .field("part", &self.part)
+            .field("decoded", &self.decoded.get().map(|d| (d.width, d.height)))
+            .finish()
+    }
+}
+
 /// 一页：正文块 + 页眉 + 页脚。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Page {
@@ -290,8 +377,11 @@ pub struct DocDoc {
     pub margin_top: i32,
     pub margin_right: i32,
     pub margin_bottom: i32,
-    /// 共享图片表（`Block::Image.image` 是这里面的下标）。
-    pub images: Vec<DocImage>,
+    /// 共享图片表（`Block::Image.image` 是这里面的下标）。每张是**惰性槽**：
+    /// 解析阶段只存包内条目名 + 显示尺寸，读取与解码推迟到该页首次绘制。
+    pub images: Vec<ImageSlot>,
+    /// 源文件路径（惰性解码时重开此 zip 读取图片字节；None 表示无法回读，图片将不显示）。
+    pub source: Option<PathBuf>,
     /// 文档标题（`core.xml` 的 `dc:title`）。
     pub title: Option<String>,
 }
@@ -357,7 +447,7 @@ impl DocDoc {
                     + 32
             })
             .sum();
-        let imgs: usize = self.images.iter().map(|i| i.rgba.len() + 32).sum();
+        let imgs: usize = self.images.iter().map(|i| i.approx_bytes()).sum();
         body + imgs
     }
 }
@@ -502,14 +592,29 @@ mod tests {
                 })],
                 ..Page::default()
             }],
-            images: vec![DocImage {
-                width: 2,
-                height: 2,
-                rgba: vec![0; 16],
-            }],
+            images: vec![ImageSlot::new(2, 2, "0123456789abcdef")],
             ..DocDoc::default()
         };
-        // 至少包含文本长度与图片字节
+        // 至少包含文本长度与图片条目名
         assert!(doc.approx_bytes() >= 10 + 16);
+    }
+
+    #[test]
+    fn image_slot_decodes_lazily() {
+        let slot = ImageSlot::new(2, 2, "abc");
+        assert!(!slot.is_decoded());
+        assert!(slot.decoded().is_none());
+        assert_eq!(slot.approx_bytes(), 3 + 32);
+        // 第一次设置成功
+        assert!(slot.set_decoded(DocImage {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        }));
+        assert!(slot.is_decoded());
+        assert_eq!(slot.decoded().unwrap().width, 1);
+        // 第二次忽略
+        assert!(!slot.set_decoded(DocImage::default()));
+        assert!(slot.approx_bytes() >= 3 + 4);
     }
 }

@@ -1062,6 +1062,106 @@ pub(crate) fn hide_preview() {
     *last_hide_slot() = Some(Instant::now());
 }
 
+/// 光标此刻落在哪个预览窗里（含被锁窗）。命中不到返回 None。
+///
+/// 沿"点到的窗口 → 根窗口"找，命中会话表里的预览句柄才算数（预览都是独立顶层窗）。
+pub(crate) fn preview_under_cursor() -> Option<isize> {
+    let (x, y) = window::cursor_pos()?;
+    let hit = window::window_from_point(x, y);
+    if hit.is_invalid() {
+        return None;
+    }
+    let root = window::window_root(hit);
+    let key = root.0 as isize;
+    if super::session::preview_keys().contains(&key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// 把当前所有预览窗句柄同步给热键钩子（判定"光标是否在预览上"/"前台是否属预览"）。
+pub(crate) fn sync_hotkey_previews() {
+    let list: Vec<HWND> = super::session::preview_keys()
+        .into_iter()
+        .map(|k| HWND(k as *mut core::ffi::c_void))
+        .collect();
+    hotkey::set_previews(&list);
+}
+
+/// 对比模式：把当前驱动窗"摘下"成被锁窗，并立刻新建一个空的新驱动窗。
+///
+/// 对齐 QuickLook 的 `ForgetCurrentWindow()`：`Pinned=true; InitNewViewerWindow()`。
+/// 被锁窗**不隐藏、内容保留**，只是不再跟随选中项、不再是被空格驱动的窗口。
+pub(crate) fn pin_current() {
+    let Some(old_key) = driver() else { return };
+    // 只允许"驱动窗"被锁：点被锁窗的锁按钮无效（已锁）。
+    let is_driver_window = with_state(|s| s.preview.raw().0 as isize == old_key).unwrap_or(false);
+    if !is_driver_window {
+        window::beep();
+        return;
+    }
+    // 1) 冻结旧窗：标 pinned、停"跟随选中项"，但不动内容/不隐藏。
+    let (old_preview, host, config, last_pos) = match with_state(|s| {
+        s.pinned = true;
+        (s.preview.raw(), s.host.raw(), s.config.clone(), s.last_pos)
+    }) {
+        Some(v) => v,
+        None => return,
+    };
+    window::stop_timer(old_preview, TIMER_FOLLOW);
+    // 2) 新建空驱动窗（先不显示，等下一次空格/选中给它文件）。
+    let new = match window::create_preview_window(PREVIEW_CLASS, "QLRust 预览") {
+        Ok(h) => h,
+        Err(e) => {
+            log_error!(SCOPE, "创建新驱动窗失败：{}", qlr_platform::to_core(e));
+            return;
+        }
+    };
+    new_session(new, host, config, None, Instant::now());
+    let new_key = new.0 as isize;
+    // 沿用上次窗口位置（位置记忆）。
+    with_session(new_key, || {
+        with_state(|s| s.last_pos = last_pos);
+    });
+    set_driver(Some(new_key));
+    // 3) 新驱动窗挂计时器 + 更新热键"预览窗"。
+    window::start_timer(new, TIMER_FOLLOW, FOLLOW_INTERVAL_MS);
+    window::start_timer(new, TIMER_WATCHDOG, WATCHDOG_INTERVAL_MS);
+    window::start_timer(new, TIMER_SHEET_KEYS, SHEET_KEYS_POLL_MS);
+    hotkey::set_preview(new);
+    sync_hotkey_previews();
+    log_info!(
+        SCOPE,
+        "锁：旧窗{:?}冻结为被锁窗，新驱动窗{:?}就绪（沿用位置 {:?}）",
+        old_preview,
+        new,
+        last_pos
+    );
+}
+
+/// 对比模式：关闭某个预览窗。
+///
+/// - 被锁窗 → 销毁并注销会话；
+/// - 驱动窗 → 隐藏 + 重置（同一窗口继续充当驱动，下次空格在原位弹出新文件）。
+pub(crate) fn close_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let is_driver = driver() == Some(hwnd);
+    let preview = HWND(hwnd as *mut core::ffi::c_void);
+    if is_driver {
+        with_session(hwnd, hide_preview);
+        log_info!(SCOPE, "关闭驱动窗{:?}（保留窗口，下次空格复用）", preview);
+        return;
+    }
+    with_session(hwnd, hide_preview);
+    drop_session(hwnd);
+    window::destroy_window(preview);
+    sync_hotkey_previews();
+    log_info!(SCOPE, "关闭被锁窗{:?}（已销毁）", preview);
+}
+
 pub(crate) static LAST_HIDE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 /// 上一次"收起预览"的时刻（见 `LAST_HIDE`）。

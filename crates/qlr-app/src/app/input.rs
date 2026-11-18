@@ -132,19 +132,22 @@ pub(crate) fn scroll_text_by(lines: isize) -> bool {
     if !matches!(get_content().as_deref(), Some(Canvas::Text(_))) {
         return false;
     }
-    let rows = visible_rows(preview.raw());
+    let span = page_lines(preview.raw());
     let total = text_total_lines();
-    // 内容比窗口还短：什么都不用滚，但也算"已处理"，别再退回去缩放
-    if total <= rows {
+    // 内容比一屏还短：什么都不用滚，但也算"已处理"，别再退回去缩放
+    if total <= span {
         return true;
     }
     let current = with_state(|s| s.scroll).unwrap_or(0);
-    let next = scroll_clamp(current, lines, total, rows);
+    // 注意：`span` 是"一屏能吃掉的**原始行**数"（折行后远小于屏行数）。
+    // 以前这里传 `visible_rows`（屏行数）当步长上限，导致长段落折行后
+    // "最多只能滚到 总行数-屏行数"，行尾永远露不出来——窗口越窄折行越多越明显（用户报"滚不下去"）。
+    let next = scroll_clamp(current, lines, total, span);
     if next != current {
         with_state(|s| s.scroll = next);
         log_debug!(
             SCOPE,
-            "SCROLL {current} -> {next}（共 {total} 行，可见 {rows} 行）"
+            "SCROLL {current} -> {next}（共 {total} 行，一屏 {span} 原始行）"
         );
         window::invalidate(preview.raw());
     }
@@ -225,6 +228,16 @@ pub(crate) fn text_total_lines() -> usize {
 /// - **图片**：放得下就保持老习惯（滚轮 = 缩放）；放大到超出窗口后可上下滑动。
 /// - **缩放**：图片/PDF 都改用**右键上下拖**（`on_zoom_drag_*`），滚轮不再改缩放。
 pub(crate) fn on_wheel(delta: i32) {
+    // 对比模式：滚轮作用于"光标所在的预览窗"（被锁窗也能滚）；光标不在任何预览窗上时
+    // 退回驱动窗。
+    let target = preview_under_cursor().or_else(driver);
+    match target {
+        Some(key) => with_session(key, || on_wheel_inner(delta)),
+        None => on_wheel_inner(delta),
+    }
+}
+
+fn on_wheel_inner(delta: i32) {
     // 档数走**带零头累积**的入口（1.8.3）。这里有一个真实事故：
     // 高分辨率滚轮/触控板每次只发 30–60，`delta / 120` 永远是 0，
     // 于是"滚轮完全没反应"——图片不缩放、正文不滚、目录不滚，日志里也没有任何记录。
@@ -1710,26 +1723,44 @@ pub(crate) fn page_edit_key(vk: usize) -> bool {
 pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
     // 真实空格/翻页键从钩子线程过来，不经过 `apply_request`，延迟起点要在这里重置。
     begin_request();
-    // 页码输入（1.0.9）：预览窗没有键盘焦点，数字键是钩子转发过来的。
-    if with_state(|s| s.page_edit.is_some()).unwrap_or(false) && page_edit_key(vk) {
+    // 对比模式：查看类动作（翻页/缩放/平移/复制/页码输入/音频）作用于"光标所在预览窗"，
+    // 打开/收起（空格）始终作用于"驱动窗"——两者在对比模式下可能不是同一个窗口。
+    let look = preview_under_cursor().or_else(driver);
+    let handled = match look {
+        Some(key) => with_session(key, || on_hotkey_view(vk, pressed_at)),
+        None => on_hotkey_view(vk, pressed_at),
+    };
+    if handled {
         return;
     }
+    // 剩下的是"打开/收起"（空格）：交给驱动窗。
+    match driver() {
+        Some(key) => with_session(key, || on_hotkey_toggle(vk, pressed_at)),
+        None => on_hotkey_toggle(vk, pressed_at),
+    }
+}
+
+/// 查看类动作（作用于光标所在窗）。返回 true 表示已处理。
+fn on_hotkey_view(vk: usize, pressed_at: u32) -> bool {
+    let _ = pressed_at;
+    // 页码输入（1.0.9）：预览窗没有键盘焦点，数字键是钩子转发过来的。
+    if with_state(|s| s.page_edit.is_some()).unwrap_or(false) && page_edit_key(vk) {
+        return true;
+    }
     // 音频（1.7.9）：P 播放/暂停，左右键快退/快进 5 秒。
-    // 必须放在 `page_delta_for` 之前：左右键在那条路上会被当成"上一页/下一页"，
-    // 而音频没有页——最坏情况是翻页逻辑把窗口内容换成占位文字。
     if playback_active() {
         match vk as u32 {
             0x50 => {
                 playback_toggle();
-                return;
+                return true;
             }
             0x25 => {
                 playback_seek(-AUDIO_SEEK_STEP_MS);
-                return;
+                return true;
             }
             0x27 => {
                 playback_seek(AUDIO_SEEK_STEP_MS);
-                return;
+                return true;
             }
             _ => {}
         }
@@ -1737,7 +1768,7 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
     // 翻页键（PageDown/PageUp/右/左）：钩子只旁听不吞，走到这里就直接翻页。
     if let Some(delta) = page_delta_for(vk) {
         turn_page(delta);
-        return;
+        return true;
     }
     match vk as u32 {
         // Ctrl+C（1.9.4）：复制选中的单元格。必须放在方向键/缩放之前。
@@ -1745,19 +1776,28 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
             if let Some(preview) = preview_raw() {
                 sheet_copy_selection(preview);
             }
-            return;
+            return true;
         }
         // + / = 放大，- 缩小，0 复位；上下方向键纵向平移（放大后才有意义）。
-        0xBB | 0x6B => return set_zoom(1.25),
-        0xBD | 0x6D => return set_zoom(0.8),
-        0x30 | 0x60 => return zoom_reset(),
+        0xBB | 0x6B => {
+            set_zoom(1.25);
+            return true;
+        }
+        0xBD | 0x6D => {
+            set_zoom(0.8);
+            return true;
+        }
+        0x30 | 0x60 => {
+            zoom_reset();
+            return true;
+        }
         0x28 => {
             // 表格（1.9.0）：一行一行挪，和 Excel 的手感一致；不是表格时落到文本/位图分支。
             if !sheet_scroll_by(0, qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32) && !scroll_text_by(1)
             {
                 pan_by(0, 1);
             }
-            return;
+            return true;
         }
         0x26 => {
             if !sheet_scroll_by(0, -(qlr_core::sheet::DEFAULT_ROW_HEIGHT as i32))
@@ -1765,11 +1805,15 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
             {
                 pan_by(0, -1);
             }
-            return;
+            return true;
         }
         _ => {}
     }
+    false
+}
 
+/// 打开/收起（空格）：作用于驱动窗。
+fn on_hotkey_toggle(vk: usize, pressed_at: u32) {
     let now = window::now_ms();
     let hook_to_handler = now.wrapping_sub(pressed_at);
     let found = selection::current_selection();
@@ -1785,11 +1829,7 @@ pub(crate) fn on_hotkey(vk: usize, pressed_at: u32) {
         Some(path) => toggle(Some(path)),
         None => {
             // 没有选中项：窗口开着就当"再按一次空格收起"；否则**把空格还回去**。
-            //
-            // 钩子为了拿选中项必须先吞键（回调里做不了 COM），如果这里什么也不做，
-            // 用户就会觉得"空格按了没反应、键盘坏了"——所以必须重放。
             if with_state(|s| s.visible).unwrap_or(false) {
-                // 1.0.10：开了"阻止关闭"之后这条路径也要挡住（它不经过 `toggle`）。
                 if !close_blocked("空格") {
                     hide_preview();
                 }

@@ -12,7 +12,9 @@
 //! 与 docx 的差别：幻灯片是**绝对坐标**（每个图形自带 xfrm），没有"分页/流式"排版；
 //! 所以模型里每个 shape 直接带像素矩形，文字也已经折好行（`Vec<Para>`，line 的 rect 是绝对坐标）。
 
-use crate::docx::{DocImage, Line, Para, Rect, Run};
+use std::path::PathBuf;
+
+use crate::docx::{ImageSlot, Line, Para, Rect, Run};
 
 /// 一个文本框 / 带文字的自动图形。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -70,13 +72,56 @@ pub struct TableShape {
     pub borders: bool,
 }
 
+/// 图表类型（渲染用；够画常见柱/折线/饼即可）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartKind {
+    /// 普通柱状图（含分组/单系列）。
+    Bar,
+    /// 堆叠柱。
+    BarStacked,
+    /// 百分比堆叠柱。
+    BarPercent,
+    /// 折线图。
+    Line,
+    /// 饼图。
+    Pie,
+}
+
+/// 一个图表系列：名称 + 数值 + 主色。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartSeries {
+    pub name: String,
+    pub values: Vec<f64>,
+    /// 系列主色 `0xRRGGBB`（取自 `spPr` 首个颜色；缺省用内置调色板）。
+    pub color: u32,
+}
+
+/// 一个原生图表里"预览真正会画"的数据（标题、类目、系列值）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chart {
+    pub kind: ChartKind,
+    pub title: String,
+    pub categories: Vec<String>,
+    pub series: Vec<ChartSeries>,
+    /// 数值格式码（如 `0%`），用于纵轴/数据标签显示。
+    pub number_format: String,
+}
+
+/// 图表占位形状（`p:graphicFrame` 里引用 `c:chart` 的 part）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartShape {
+    pub rect: Rect,
+    pub chart: Chart,
+}
+
 /// 幻灯片上的一个元素。顺序即 z 序（先画的在下）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Text(TextBox),
     Picture(Picture),
     Rect(FillRect),
     Table(TableShape),
+    Chart(ChartShape),
 }
 
 impl Shape {
@@ -86,12 +131,13 @@ impl Shape {
             Shape::Picture(p) => p.rect,
             Shape::Rect(r) => r.rect,
             Shape::Table(t) => t.rect,
+            Shape::Chart(c) => c.rect,
         }
     }
 }
 
 /// 一张幻灯片。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Slide {
     pub shapes: Vec<Shape>,
     /// 背景色 `0xRRGGBB`；`None` = 白底。
@@ -108,7 +154,9 @@ pub struct PptxDoc {
     pub width: u32,
     pub height: u32,
     /// 共享图片表（`Picture.image` 是这里面的下标）。
-    pub images: Vec<DocImage>,
+    pub images: Vec<ImageSlot>,
+    /// 源文件路径（惰性解码时重开此 zip 读取图片字节；None 表示无法回读，图片将不显示）。
+    pub source: Option<PathBuf>,
     /// 标题（`docProps/core.xml` 的 `dc:title`）。
     pub title: Option<String>,
 }
@@ -166,12 +214,26 @@ impl PptxDoc {
                             }
                             n
                         }
+                        Shape::Chart(c) => {
+                            c.chart.title.len()
+                                + c.chart
+                                    .categories
+                                    .iter()
+                                    .map(|s| s.len() + 8)
+                                    .sum::<usize>()
+                                + c.chart
+                                    .series
+                                    .iter()
+                                    .map(|s| s.name.len() + 8 + s.values.len() * 8)
+                                    .sum::<usize>()
+                                + 64
+                        }
                     })
                     .sum::<usize>()
                     + 32
             })
             .sum();
-        let imgs: usize = self.images.iter().map(|i| i.rgba.len() + 32).sum();
+        let imgs: usize = self.images.iter().map(|i| i.approx_bytes()).sum();
         shapes + imgs
     }
 }
@@ -262,11 +324,7 @@ mod tests {
                 })],
                 ..Slide::default()
             }],
-            images: vec![DocImage {
-                width: 2,
-                height: 2,
-                rgba: vec![0; 16],
-            }],
+            images: vec![ImageSlot::new(2, 2, "0123456789abcdef")],
             ..PptxDoc::default()
         };
         assert!(d.approx_bytes() >= 10 + 16);

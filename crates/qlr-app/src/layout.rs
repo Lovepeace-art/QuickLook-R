@@ -141,7 +141,7 @@ pub fn from_below(below: RECT, opts: Opts) -> Layout {
     // 窗口太窄就不显示目录：正文被挤到 300 px 还不如没有目录。
     let want_toc = opts.toc && (below.right - below.left) > TOC_MIN_WIDTH;
     if want_toc {
-        content.left += window::toc_width();
+        content.left += window::toc_width_for(below.right - below.left);
     }
     let toc = want_toc.then(|| window::toc_rect(below));
     // 底部标签栏（1.9.2）：从下边切一条，再切目录/滚动条——顺序与"可见顺序"一致。

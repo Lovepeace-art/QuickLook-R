@@ -32,8 +32,8 @@ use std::io::Read;
 use std::path::Path;
 
 use qlr_core::docx::{
-    Block, DocDoc, DocImage, HAlign, ImageBlock, Line, Page, PageSetup, Para, Rect, Run, Table,
-    TableCell, TableRow, dpt_to_px, emu_to_px, twips_to_px,
+    Block, DocDoc, DocImage, HAlign, ImageBlock, ImageSlot, Line, Page, PageSetup, Para, Rect, Run,
+    Table, TableCell, TableRow, dpt_to_px, emu_to_px, twips_to_px,
 };
 use qlr_core::{Error, Result};
 
@@ -109,8 +109,8 @@ pub fn parse_docx(path: &Path) -> Result<DocDoc> {
         ctx.footer_rid = sect.footer_rid;
     }
 
-    // ---- 图片：把 body 里引用到的 rId 逐张解码成显示尺寸位图 ----
-    let mut images: Vec<DocImage> = Vec::new();
+    // ---- 图片：只记录包内条目名 + 显示尺寸（惰性槽），读字节与解码推迟到该页首次绘制 ----
+    let mut images: Vec<ImageSlot> = Vec::new();
     let mut image_map: HashMap<String, usize> = HashMap::new();
     for flow in &flows {
         collect_image_rids(flow, &mut image_map);
@@ -131,14 +131,13 @@ pub fn parse_docx(path: &Path) -> Result<DocDoc> {
         let Some(part) = ctx.rels.get(&rid).cloned() else {
             continue;
         };
-        let Ok(bytes) = pkg.read_part_bytes(&part) else {
+        // 显示尺寸过大仍直接跳过（与旧行为一致，避免解一张 4 万×4 万像素的图）。
+        if w > 0 && h > 0 && (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
             continue;
-        };
-        if let Some(img) = decode_image(&bytes, w, h) {
-            let index = images.len();
-            images.push(img);
-            image_map.insert(rid, index);
         }
+        let index = images.len();
+        images.push(ImageSlot::new(w.max(0) as u32, h.max(0) as u32, part));
+        image_map.insert(rid, index);
     }
 
     // ---- 页眉/页脚 ----
@@ -155,6 +154,8 @@ pub fn parse_docx(path: &Path) -> Result<DocDoc> {
         &ctx,
         &approx_measure,
     );
+    // 记住源文件路径：绘制某页时用它重开 zip 按需读取/解码图片。
+    doc.source = Some(path.to_path_buf());
     attach_overlay(&mut doc, &header_flows, &footer_flows, &approx_measure);
     Ok(doc)
 }
@@ -2861,7 +2862,7 @@ fn layout_document(
     flows: &[Flow],
     setup: PageSetup,
     image_map: &HashMap<String, usize>,
-    images: Vec<DocImage>,
+    images: Vec<ImageSlot>,
     title: Option<String>,
     ctx: &Ctx,
     measure: &Measure,
@@ -2921,6 +2922,7 @@ fn layout_document(
         margin_right: mr,
         margin_bottom: mb,
         images,
+        source: None,
         title,
     }
 }
@@ -3058,6 +3060,72 @@ fn decode_image(bytes: &[u8], target_w: i32, target_h: i32) -> Option<DocImage> 
         height: resized.height(),
         rgba: resized.into_raw(),
     })
+}
+
+/// 打开源文件为只读 zip 包（惰性解码用；失败返回 None）。
+fn open_pkg(path: &Path) -> Option<Package> {
+    let file = File::open(path).ok()?;
+    let zip = zip::ZipArchive::new(file).ok()?;
+    Some(Package { zip, used: 0 })
+}
+
+/// 惰性解码单张图片（按需从源 zip 读取该条目并解码，缓存回槽）。`index` 是 `doc.images` 下标。
+pub fn decode_slot(doc: &DocDoc, index: usize) -> Option<()> {
+    let slot = doc.images.get(index)?;
+    if slot.is_decoded() {
+        return Some(());
+    }
+    let src = doc.source.as_deref()?;
+    let mut pkg = open_pkg(src)?;
+    let bytes = pkg.read_part_bytes(&slot.part).ok()?;
+    let img = decode_image(&bytes, slot.disp_w as i32, slot.disp_h as i32)?;
+    let _ = slot.set_decoded(img);
+    Some(())
+}
+
+/// 收集一段块里引用的图片下标（含嵌套表格）。
+fn collect_image_indices(blocks: &[Block], out: &mut Vec<usize>) {
+    for b in blocks {
+        match b {
+            Block::Image(ib) => out.push(ib.image as usize),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        collect_image_indices(&cell.blocks, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 确保某一页用到的图片都已解码（绘制该页前由应用调用；一页只开一次 zip）。
+pub fn ensure_page_images(doc: &DocDoc, page: usize) {
+    let Some(p) = doc.pages.get(page) else {
+        return;
+    };
+    let mut idxs: Vec<usize> = Vec::new();
+    collect_image_indices(&p.blocks, &mut idxs);
+    if idxs.is_empty() {
+        return;
+    }
+    let mut pkg = doc.source.as_deref().and_then(open_pkg);
+    for index in idxs {
+        let Some(slot) = doc.images.get(index) else {
+            continue;
+        };
+        if slot.is_decoded() {
+            continue;
+        }
+        if let Some(pkg) = pkg.as_mut() {
+            if let Ok(bytes) = pkg.read_part_bytes(&slot.part) {
+                if let Some(img) = decode_image(&bytes, slot.disp_w as i32, slot.disp_h as i32) {
+                    let _ = slot.set_decoded(img);
+                }
+            }
+        }
+    }
 }
 
 fn collect_image_rids(flow: &Flow, out: &mut HashMap<String, usize>) {

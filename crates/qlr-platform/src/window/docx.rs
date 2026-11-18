@@ -451,7 +451,11 @@ fn draw_table(hdc: HDC, set: &mut FontMap, table: &Table, doc: &DocDoc, ox: i32,
 }
 
 fn draw_image(hdc: HDC, block: &ImageBlock, doc: &DocDoc, ox: i32, oy: i32, s: f32) {
-    let Some(img) = doc.images.get(block.image as usize) else {
+    let Some(slot) = doc.images.get(block.image as usize) else {
+        return;
+    };
+    // 惰性槽：只有本页被应用触发解码后才有像素；没有就跳过（不画空框）。
+    let Some(img) = slot.decoded() else {
         return;
     };
     if img.width == 0

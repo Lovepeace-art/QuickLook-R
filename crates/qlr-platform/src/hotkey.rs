@@ -435,31 +435,54 @@ pub fn forward_ctrl_c() {
     }
 }
 
-/// 光标此刻是否落在预览窗里（1.9.4）。
+/// 预览窗集合（对比模式）：驱动窗 + 所有被锁窗。滚轮/Ctrl+C/空格的前台判定要遍历它。
+/// 旧版只认单个 `PREVIEW_HWND`；这里升级成集合，`PREVIEW_HWND` 仍保留作"驱动窗"。
+static PREVIEWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// 更新预览窗集合。
+pub fn set_previews(list: &[HWND]) {
+    if let Ok(mut guard) = PREVIEWS.lock() {
+        *guard = list.iter().map(|h| h.0 as isize).collect();
+    }
+}
+
+fn preview_ids() -> Vec<isize> {
+    let ids = PREVIEWS.lock().map(|g| g.clone()).unwrap_or_default();
+    if !ids.is_empty() {
+        return ids;
+    }
+    let one = PREVIEW_HWND.load(Ordering::Relaxed);
+    if one != 0 { vec![one] } else { Vec::new() }
+}
+
+/// 光标此刻是否落在**任一**预览窗里（1.9.4；对比模式扩展为窗口集合）。
 ///
-/// 预览窗是 `WS_EX_NOACTIVATE`，用户点它、在它上面按 Ctrl+C 时**它也不会变成
-/// 前台窗口**（前台往往还是资源管理器或桌面）。所以"前台是不是我们"这个判据
-/// 在预览场景下几乎永远为假，Ctrl+C 会被放行给别的程序。用"光标在预览窗上"
-/// 当补充判据：用户把鼠标放到预览里，就是"他在看这个预览"。
+/// 预览窗是 `WS_EX_NOACTIVATE`，点它也不会变前台，所以用"光标在预览窗上"当补充判据：
+/// 用户把鼠标放到预览里，就是"他在看这个预览"。
 pub fn cursor_over_preview() -> bool {
-    let preview = PREVIEW_HWND.load(Ordering::Relaxed);
-    if preview == 0 {
+    let ids = preview_ids();
+    if ids.is_empty() {
         return false;
     }
     unsafe {
-        let hwnd = HWND(preview as *mut core::ffi::c_void);
-        if !IsWindowVisible(hwnd).as_bool() {
-            return false;
-        }
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return false;
-        }
         let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() {
             return false;
         }
-        pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom
+        for id in ids {
+            let hwnd = HWND(id as *mut core::ffi::c_void);
+            if !IsWindowVisible(hwnd).as_bool() {
+                continue;
+            }
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                continue;
+            }
+            if pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -470,8 +493,8 @@ pub fn cursor_over_preview() -> bool {
 /// `foreground_is_ours()` 会返回 false —— 于是空格被当成"别的程序在按"而放行（用户报的
 /// "office 预览时空格失效，要先点一下预览窗口"）。这里沿父链找到根窗口再比。
 pub fn foreground_belongs_to_preview() -> bool {
-    let preview = PREVIEW_HWND.load(Ordering::Relaxed);
-    if preview == 0 {
+    let ids = preview_ids();
+    if ids.is_empty() {
         return false;
     }
     unsafe {
@@ -483,7 +506,7 @@ pub fn foreground_belongs_to_preview() -> bool {
         for _ in 0..8 {
             match GetAncestor(root, GA_ROOT) {
                 parent if !parent.is_invalid() => {
-                    if parent.0 as isize == preview {
+                    if ids.contains(&(parent.0 as isize)) {
                         return true;
                     }
                     if parent == root {
@@ -494,7 +517,7 @@ pub fn foreground_belongs_to_preview() -> bool {
                 _ => break,
             }
         }
-        root.0 as isize == preview
+        ids.contains(&(root.0 as isize))
     }
 }
 

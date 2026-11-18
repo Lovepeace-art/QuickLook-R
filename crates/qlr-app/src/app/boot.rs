@@ -204,21 +204,19 @@ pub fn run() -> ExitCode {
             return ExitCode::from(5);
         }
     };
-    // 柔和投影（1.0.10）：一个独立的分层窗口贴在预览窗下面。
-    // 拿不到就当作没有阴影（不影响预览本身），所以失败只记日志。
-    let shadow = match window::register_class(SHADOW_CLASS, Some(wndproc))
-        .and_then(|()| window::create_shadow_window(SHADOW_CLASS, "QLRust 阴影"))
-    {
-        Ok(h) => Some(Hwnd::from_raw(h)),
-        Err(e) => {
-            log_warn!(
-                SCOPE,
-                "创建阴影窗口失败（不显示投影）：{}",
-                qlr_platform::to_core(e)
-            );
-            None
-        }
-    };
+    // 柔和投影（1.0.10）：对比模式改造——**先停用**，之后彻底删除（含 shadow.rs 与调用点）。
+    // 保持 shadow=None；sync_shadow/hide_shadow/allow_shadow 等调用点已能容忍 None。
+    // 原实现（先注册 SHADOW_CLASS 再 create_shadow_window）注释保留备查。
+    // let shadow = match window::register_class(SHADOW_CLASS, Some(wndproc))
+    //     .and_then(|()| window::create_shadow_window(SHADOW_CLASS, "QLRust 阴影"))
+    // {
+    //     Ok(h) => Some(Hwnd::from_raw(h)),
+    //     Err(e) => {
+    //         log_warn!(SCOPE, "创建阴影窗口失败（不显示投影）：{}", qlr_platform::to_core(e));
+    //         None
+    //     }
+    // };
+    let shadow: Option<Hwnd> = None;
     // Win11 才有 DWM 圆角/backdrop（Win10 上这两个属性不存在，调用静默失败）。
     // 圆角/backdrop 都走 DWM（Win11 才有 backdrop，Win10 自动降级为无效果）。
     // Win11 走官方 DWM 属性。两者都取不到时退回纯色背景。
@@ -298,16 +296,11 @@ pub fn run() -> ExitCode {
     // 配置马上要被移进 State，热键摘要与绑定表先留一份出来（下面装钩子要用）。
     let hotkeys = config.hotkeys.clone();
 
-    let _ = STATE.set(Mutex::new(State::new(
-        config,
-        Hwnd::from_raw(host),
-        Hwnd::from_raw(preview),
-        shadow,
-        started,
-    )));
-    let _ = LINES.set(Mutex::new(vec!["QLRust".to_string()]));
-    let _ = CONTENT.set(Mutex::new(None));
-    let _ = RESULT.set(Mutex::new(None));
+    // 对比模式：首个预览窗 = 初始驱动窗；会话登记在按窗口表里，并设它为 DRIVER。
+    let _session = new_session(preview, host, config, shadow, started);
+    set_driver(Some(preview.0 as isize));
+    sync_hotkey_previews();
+    let _ = RESULT.set(Mutex::new(Vec::new()));
 
     // 渲染线程（M2）：一次拉起、长期存活。它拿不到 HWND，只能 PostMessage 通知 UI。
     match spawn_render_worker(host) {
@@ -566,6 +559,7 @@ pub(crate) fn apply_request(request: &Request) {
             on_hotkey(vk as usize, window::now_ms())
         }
         Action::Settings => open_settings(),
+        Action::Pin => pin_current(),
         Action::PageNext => turn_page(1),
         Action::PagePrev => turn_page(-1),
         Action::ZoomIn => set_zoom(1.25),
@@ -713,7 +707,19 @@ pub(crate) fn on_settings_saved() {
     log_info!(SCOPE, "配置已热更新：{}", config.summary());
 }
 
+/// 窗口过程入口：先进入"本窗口"的会话上下文（对比模式多窗口的关键），再跑真正的过程体。
+/// 用守卫包裹，`ShowWindow` 等同步派发的重入消息能正确恢复上一层 CURRENT。
 pub(crate) unsafe extern "system" fn wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let _session_guard = enter_session(hwnd.0 as isize);
+    unsafe { wndproc_body(hwnd, msg, wparam, lparam) }
+}
+
+unsafe extern "system" fn wndproc_body(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -753,12 +759,13 @@ pub(crate) unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             ipc::WM_QLR_ESCAPE => {
-                // 1.0.10：开了"阻止关闭"之后 Esc 也关不掉（锁是单向的）。
-                if close_blocked("Esc") {
-                    return LRESULT(0);
+                // 对比模式：Esc 关掉"光标所在的预览窗"（含被锁窗）；光标不在任何预览窗上时
+                // 退回驱动窗。
+                let target = preview_under_cursor().or_else(driver);
+                log_debug!(SCOPE, "ESC 关闭预览 target={:?}", target);
+                if let Some(target) = target {
+                    close_window(target);
                 }
-                log_debug!(SCOPE, "ESC 收起预览");
-                hide_preview();
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
@@ -893,7 +900,7 @@ pub(crate) unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_CLOSE => {
-                hide_preview();
+                close_window(hwnd.0 as isize);
                 LRESULT(0)
             }
             // 跟随选中项（1.0.10）：只有我们自己的定时器才处理。
@@ -1067,7 +1074,20 @@ pub(crate) unsafe extern "system" fn wndproc(
                 }
             }
             WM_DESTROY => {
-                window::post_quit();
+                // 对比模式：只有宿主窗销毁才退出进程；预览窗销毁只注销它自己的会话。
+                // 注意按 **hwnd 本身** 作 key（不能用 s.preview：被锁窗销毁时会话已被移除，
+                // resolve 会回退到驱动窗，误它的 key）。
+                let is_host =
+                    with_state(|s| s.host.raw().0 as isize == hwnd.0 as isize).unwrap_or(true);
+                if is_host {
+                    window::post_quit();
+                } else {
+                    let key = hwnd.0 as isize;
+                    drop_session(key);
+                    if driver() == Some(key) {
+                        set_driver(None);
+                    }
+                }
                 LRESULT(0)
             }
             // 窗口尺寸变了：**投递**一条消息，等这条同步呼叫退栈后再对齐系统预览处理器（1.7.9）。

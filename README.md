@@ -18,6 +18,10 @@
  [视频](docs/screenshots/preview-video.png) |
  未完待续
 
+## 对比模式（多窗口 / 锁）
+
+点顶栏「锁」把当前预览窗“钉住”（冻结它显示的文件、不再跟随资源管理器选中项），并立刻另开一个**新的空预览窗**继续跟随选中/空格——于是可以“锁住 A、再空格打开 B”并排对照（可叠多个被锁窗）。被锁窗仍**完整交互**：滚轮缩放、翻页、拖边改大小、表格点选/复制都照常，且互不影响。`Esc` / `×` 关闭**光标所在**的预览窗。这是对 QuickLook 原版 `ForgetCurrentWindow()`（`Pinned=true; InitNewViewerWindow()`）语义的忠实复刻，见 [方案](docs/plans/compare-mode-multi-window.md)。
+
 ## 与 QuickLook 原版的对比
 
 上游 [QuickLook](https://github.com/QL-Win/QuickLook)（C# / WPF，4.5.0）。下表是同一台机器（i5-12400F / 16 GB / Win10 22H2）、同一批 18 个夹具、同一测量口径的实测：
@@ -51,7 +55,7 @@
 
 ## 安装
 
-**绿色版（推荐）**：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-1.8.3-win64.zip`，解压到任意目录，双击 `qlrust.exe` 即可。目录里有 `portable.lock` 时数据（配置/日志）写在同目录 `UserData\`，不碰注册表。
+**绿色版（推荐）**：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-1.12.0-win64.zip`，解压到任意目录，双击 `qlrust.exe` 即可。目录里有 `portable.lock` 时数据（配置/日志）写在同目录 `UserData\`，不碰注册表。
 
 **安装版**（免管理员，装到 `%LOCALAPPDATA%\Programs\QLRust` 并注册"打开方式"）：
 

@@ -262,6 +262,22 @@ pub fn hide(hwnd: HWND) {
     }
 }
 
+/// 真正销毁一个窗口（对比模式关闭被锁窗用）。销毁会在窗口过程里派发 `WM_DESTROY`。
+pub fn destroy_window(hwnd: HWND) {
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+    }
+}
+
+/// 沿父链取根窗口（取不到就返回原句柄）。多窗口命中测试用。
+pub fn window_root(hwnd: HWND) -> HWND {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if root.is_invalid() { hwnd } else { root }
+    }
+}
+
 /// 把窗口改成新的矩形（拖边改大小用）。
 ///
 /// 用 `SetWindowPos` 而不是 `MoveWindow`：前者不碰 z 序、也不激活窗口

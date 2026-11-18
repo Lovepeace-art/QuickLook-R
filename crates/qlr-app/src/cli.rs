@@ -53,6 +53,7 @@ pub fn usage() -> &'static str {
  qlrust --wheel <delta>   模拟滚轮（±120 的倍数；正数向上；自动化验证用）
   qlrust --scroll <n>      文本滚动 n 行（正数向下；自动化验证用）
   qlrust --settings        打开设置窗口（快捷键等）
+  qlrust --pin             冻结当前窗口(锁)并另开一个空窗口（对比模式；自动化验证用）
   qlrust -v|--version  打印版本（写入日志）
   qlrust -h|--help     打印本帮助（写入日志）
 
@@ -121,6 +122,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Command {
             "--hide" => action = Some(Action::Hide),
             "--ping" => action = Some(Action::Ping),
             "--settings" => action = Some(Action::Settings),
+            "--pin" => action = Some(Action::Pin),
             // 未知开关忽略（不报错退出，避免打包脚本因多传参数而失败）。
             other if other.starts_with('-') => continue,
             other => path = Some(other.to_string()),
@@ -177,6 +179,7 @@ mod tests {
         assert_eq!(p(&["--quit"]), Command::Invoke(Request::new(Action::Quit)));
         assert_eq!(p(&["--hide"]), Command::Invoke(Request::new(Action::Hide)));
         assert_eq!(p(&["--ping"]), Command::Invoke(Request::new(Action::Ping)));
+        assert_eq!(p(&["--pin"]), Command::Invoke(Request::new(Action::Pin)));
     }
 
     #[test]

@@ -9,6 +9,14 @@ pub fn toc_width() -> i32 {
     dpi::px(200)
 }
 
+/// 目录栏目标宽度（随窗口宽度自适应）：窗口越窄目录越窄，避免小窗口被固定 200px
+/// 目录把正文挤扁；下限 120px，上限仍是 [`toc_width`]。
+pub fn toc_width_for(area_width: i32) -> i32 {
+    let base = toc_width();
+    let floor = dpi::px(120).min(base);
+    (area_width * 3 / 10).clamp(floor, base)
+}
+
 pub fn toc_row_height() -> i32 {
     dpi::cpx(24)
 }
@@ -31,7 +39,7 @@ pub fn toc_rect(area: RECT) -> RECT {
     RECT {
         left: area.left,
         top: area.top,
-        right: (area.left + toc_width()).min(area.right),
+        right: (area.left + toc_width_for(area.right - area.left)).min(area.right),
         bottom: area.bottom,
     }
 }

@@ -226,7 +226,7 @@ pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
             // 见 `show_preview` 里那条 HIDE→SHOW 追踪）；没有它就要往别处查
             // （命中区不对 / 被非客户区当成改大小吞掉）。
             log_info!(SCOPE, "顶栏：关闭（{x},{y}）");
-            hide_preview();
+            close_window(hwnd.0 as isize);
             return true;
         }
         // 挨着 × 却没点中：记一条，专门用来抓"差几像素"的命中问题。
@@ -254,11 +254,11 @@ pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
             // 防的就是"手忙脚乱时随手又点一下把锁关了"。
             let already = with_state(|s| s.pinned).unwrap_or(false);
             if already {
-                log_debug!(SCOPE, "顶栏：阻止关闭已开启（不能取消）");
+                log_debug!(SCOPE, "顶栏：该窗已被锁（不能重复锁）");
                 window::beep();
             } else {
-                with_state(|s| s.pinned = true);
-                log_info!(SCOPE, "已开启「阻止关闭」：空格/Esc 关不掉这个窗口");
+                // 对比模式：把当前驱动窗摘下成被锁窗，并另开一个空驱动窗。
+                pin_current();
             }
             window::invalidate(hwnd);
             return true;
@@ -759,6 +759,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
+                qlr_render::docx::ensure_page_images(doc, page);
                 window::paint_page(hwnd, Some(&chrome), Some(layout.content), doc, page);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
@@ -776,6 +777,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
+                qlr_render::pptx::ensure_slide_images(doc, page);
                 window::paint_slide(hwnd, Some(&chrome), Some(layout.content), doc, page);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);

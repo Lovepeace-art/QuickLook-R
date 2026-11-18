@@ -18,9 +18,10 @@ use std::path::Path;
 
 use image::GenericImageView;
 
-use qlr_core::docx::{DocImage, HAlign, Line, Para, Rect, Run, dpt_to_px, emu_to_px};
+use qlr_core::docx::{DocImage, HAlign, ImageSlot, Line, Para, Rect, Run, dpt_to_px, emu_to_px};
 use qlr_core::pptx::{
-    FillRect, Picture, PptxDoc, Shape, Slide, SlideSize, TableCell, TableRow, TableShape, TextBox,
+    Chart, ChartKind, ChartSeries, ChartShape, FillRect, Picture, PptxDoc, Shape, Slide, SlideSize,
+    TableCell, TableRow, TableShape, TextBox,
 };
 use qlr_core::{Error, Result};
 
@@ -988,7 +989,7 @@ fn parse_sp_tree(
     tree: &Node,
     ctx: &SlideCtx,
     map: &Xf,
-    images: &mut Vec<DocImage>,
+    images: &mut Vec<ImageSlot>,
     cache: &mut HashMap<String, u32>,
     pkg: &mut Package,
 ) -> Vec<Shape> {
@@ -1009,7 +1010,7 @@ fn parse_sp_tree(
                 }
             }
             "graphicFrame" => {
-                if let Some(s) = parse_graphic_frame(child, ctx, map) {
+                if let Some(s) = parse_graphic_frame(child, ctx, map, pkg) {
                     shapes.push(s);
                 }
             }
@@ -1080,9 +1081,9 @@ fn parse_pic(
     node: &Node,
     ctx: &SlideCtx,
     map: &Xf,
-    images: &mut Vec<DocImage>,
+    images: &mut Vec<ImageSlot>,
     cache: &mut HashMap<String, u32>,
-    pkg: &mut Package,
+    _pkg: &mut Package,
 ) -> Option<Shape> {
     let sp_pr = node.child("spPr")?;
     // 少数没有 xfrm 的图片就没有几何，直接跳过（不猜位置，避免画到页外）。
@@ -1101,10 +1102,13 @@ fn parse_pic(
         if images.len() >= MAX_IMAGES {
             return None;
         }
-        let bytes = pkg.read_raw(&rel.target).ok().flatten()?;
-        let img = decode_image(&bytes, rect.w.max(1) as u32, rect.h.max(1) as u32)?;
         let i = images.len() as u32;
-        images.push(img);
+        // 只记条目名 + 显示尺寸；读字节/解码推迟到该张首次绘制。
+        images.push(ImageSlot::new(
+            rect.w.max(1) as u32,
+            rect.h.max(1) as u32,
+            rel.target.clone(),
+        ));
         cache.insert(rel.target.clone(), i);
         i
     };
@@ -1115,13 +1119,24 @@ fn parse_pic(
     }))
 }
 
-fn parse_graphic_frame(node: &Node, ctx: &SlideCtx, map: &Xf) -> Option<Shape> {
-    let tbl = find_desc(node, "tbl")?;
+fn parse_graphic_frame(node: &Node, ctx: &SlideCtx, map: &Xf, pkg: &mut Package) -> Option<Shape> {
     // graphicFrame 的 xfrm 可能是 `p:xfrm` / `a:xfrm`，直接子节点名为 xfrm。
     let rect = node
         .child("xfrm")
         .and_then(read_off_ext)
         .map(|(ox, oy, cx, cy)| rect_from_off_ext(map, ox, oy, cx, cy))?;
+    // 不是表格时看看是不是图表：graphicData 里引用 `c:chart r:id`。
+    if find_desc(node, "tbl").is_none() {
+        if let Some(chart_el) = find_desc(node, "chart") {
+            let chart = chart_el
+                .attr("r:id")
+                .and_then(|rid| ctx.slide_rels.get(rid))
+                .and_then(|rel| pkg.read_optional(&rel.target).ok().flatten())
+                .and_then(|xml| parse_chart(&xml, ctx.theme));
+            return chart.map(|chart| Shape::Chart(ChartShape { rect, chart }));
+        }
+    }
+    let tbl = find_desc(node, "tbl")?;
 
     let mut col_emu: Vec<i64> = Vec::new();
     if let Some(grid) = tbl.child("tblGrid") {
@@ -1194,6 +1209,181 @@ fn parse_graphic_frame(node: &Node, ctx: &SlideCtx, map: &Xf) -> Option<Shape> {
     }))
 }
 
+// ---------------------------------------------------------------- 图表解析
+
+/// 图表系列主色：`spPr` 里第一个 `srgbClr`/`schemeClr`（用主题色表解析）。
+fn chart_series_color(node: &Node, theme: &Colors) -> Option<u32> {
+    fn walk(n: &Node, theme: &Colors) -> Option<u32> {
+        match n.local() {
+            "srgbClr" => {
+                if let Some(c) = n.attr("val").and_then(parse_hex) {
+                    return Some(c & 0x00FF_FFFF);
+                }
+            }
+            "schemeClr" => {
+                if let Some(c) = n.attr("val").and_then(|v| theme.get(v)) {
+                    return Some(*c & 0x00FF_FFFF);
+                }
+            }
+            _ => {}
+        }
+        for k in &n.kids {
+            if let Some(c) = walk(k, theme) {
+                return Some(c);
+            }
+        }
+        None
+    }
+    walk(node, theme)
+}
+
+/// 内置系列调色板（主题里取不到时的兜底）。
+fn chart_palette(i: usize) -> u32 {
+    const PAL: [u32; 8] = [
+        0x4472C4, 0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47, 0x264478, 0x9E480E,
+    ];
+    PAL[i % PAL.len()]
+}
+
+/// 收集一个 `c:pt` 容器的全部 `<c:pt idx=..><c:v>..` 并按 idx 排序。
+fn read_pts(node: &Node) -> Vec<(i64, String)> {
+    let cache = find_desc(node, "strCache")
+        .or_else(|| find_desc(node, "numCache"))
+        .or_else(|| find_desc(node, "strLit"))
+        .or_else(|| find_desc(node, "numLit"))
+        .unwrap_or(node);
+    let mut out: Vec<(i64, String)> = Vec::new();
+    collect_pts(cache, &mut out);
+    out.sort_by_key(|(i, _)| *i);
+    out
+}
+
+fn collect_pts(node: &Node, out: &mut Vec<(i64, String)>) {
+    for k in &node.kids {
+        if k.local() == "pt" {
+            let idx = k.attr_i64("idx").unwrap_or(out.len() as i64);
+            let v = k
+                .child("v")
+                .map(|v| v.text.trim().to_string())
+                .unwrap_or_default();
+            out.push((idx, v));
+        } else {
+            collect_pts(k, out);
+        }
+    }
+}
+
+fn chart_title(root: &Node) -> String {
+    let Some(title) = find_desc(root, "title") else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if let Some(rich) = find_desc(title, "rich") {
+        collect_all_text(rich, &mut out);
+    }
+    if out.trim().is_empty() {
+        if let Some(tx) = title.child("tx") {
+            if let Some(v) = find_desc(tx, "v") {
+                out.push_str(v.text.trim());
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+fn collect_all_text(node: &Node, out: &mut String) {
+    for k in &node.kids {
+        if k.local() == "t" {
+            out.push_str(&k.text);
+        } else {
+            collect_all_text(k, out);
+        }
+    }
+}
+
+/// 把 `ppt/charts/chartN.xml` 解析成可绘制的 [`Chart`]（只支持柱/折线/饼）。
+fn parse_chart(xml: &str, theme: &Colors) -> Option<Chart> {
+    let root = parse_xml(xml);
+    let (kind, plot) = if let Some(b) = find_desc(&root, "barChart") {
+        let grouping = b
+            .child("grouping")
+            .and_then(|g| g.attr("val"))
+            .unwrap_or("clustered");
+        let kind = match grouping {
+            "stacked" => ChartKind::BarStacked,
+            "percentStacked" => ChartKind::BarPercent,
+            _ => ChartKind::Bar,
+        };
+        (kind, b)
+    } else if let Some(l) = find_desc(&root, "lineChart") {
+        (ChartKind::Line, l)
+    } else {
+        let p = find_desc(&root, "pieChart")?;
+        (ChartKind::Pie, p)
+    };
+
+    let title = chart_title(&root);
+    let mut number_format = String::new();
+    let mut categories: Vec<String> = Vec::new();
+    let mut series: Vec<ChartSeries> = Vec::new();
+    for (i, ser) in plot.children("ser").enumerate() {
+        if series.len() >= 8 {
+            break;
+        }
+        let name = find_desc(ser, "tx")
+            .and_then(|t| find_desc(t, "v"))
+            .map(|v| v.text.trim().to_string())
+            .unwrap_or_default();
+        if categories.is_empty() {
+            if let Some(cat) = ser.child("cat") {
+                categories = read_pts(cat).into_iter().map(|(_, v)| v).collect();
+            }
+        }
+        let val_node = ser.child("val");
+        let values: Vec<f64> = val_node
+            .map(read_pts)
+            .map(|pts| {
+                pts.into_iter()
+                    .filter_map(|(_, v)| v.parse::<f64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if number_format.is_empty() {
+            if let Some(val) = val_node {
+                number_format = find_desc(val, "formatCode")
+                    .map(|f| f.text.trim().to_string())
+                    .unwrap_or_default();
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let color = ser
+            .child("spPr")
+            .and_then(|sp| chart_series_color(sp, theme))
+            .unwrap_or_else(|| chart_palette(i));
+        series.push(ChartSeries {
+            name,
+            values,
+            color,
+        });
+    }
+    if series.is_empty() {
+        return None;
+    }
+    let max_len = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
+    while categories.len() < max_len {
+        categories.push((categories.len() + 1).to_string());
+    }
+    Some(Chart {
+        kind,
+        title,
+        categories,
+        series,
+        number_format,
+    })
+}
+
 // ---------------------------------------------------------------- 图片解码
 
 fn decode_image(bytes: &[u8], want_w: u32, want_h: u32) -> Option<DocImage> {
@@ -1223,6 +1413,52 @@ fn decode_image(bytes: &[u8], want_w: u32, want_h: u32) -> Option<DocImage> {
         height: dh,
         rgba: rgba.into_raw(),
     })
+}
+
+/// 惰性解码单张图片（按需从源 pptx 重开 zip 读取该条目并解码，缓存回槽）。
+pub fn decode_slot(doc: &PptxDoc, index: usize) -> Option<()> {
+    let slot = doc.images.get(index)?;
+    if slot.is_decoded() {
+        return Some(());
+    }
+    let src = doc.source.as_deref()?;
+    let mut pkg = Package::open(src).ok()?;
+    let bytes = pkg.read_raw(&slot.part).ok().flatten()?;
+    let img = decode_image(&bytes, slot.disp_w, slot.disp_h)?;
+    let _ = slot.set_decoded(img);
+    Some(())
+}
+
+/// 确保某一幻灯片用到的图片都已解码（绘制该张前由应用调用；一张只开一次 zip）。
+pub fn ensure_slide_images(doc: &PptxDoc, slide: usize) {
+    let Some(s) = doc.slides.get(slide) else {
+        return;
+    };
+    let mut idxs: Vec<usize> = Vec::new();
+    for shape in &s.shapes {
+        if let Shape::Picture(pic) = shape {
+            idxs.push(pic.image as usize);
+        }
+    }
+    if idxs.is_empty() {
+        return;
+    }
+    let mut pkg = doc.source.as_deref().and_then(|p| Package::open(p).ok());
+    for index in idxs {
+        let Some(slot) = doc.images.get(index) else {
+            continue;
+        };
+        if slot.is_decoded() {
+            continue;
+        }
+        if let Some(pkg) = pkg.as_mut() {
+            if let Ok(Some(bytes)) = pkg.read_raw(&slot.part) {
+                if let Some(img) = decode_image(&bytes, slot.disp_w, slot.disp_h) {
+                    let _ = slot.set_decoded(img);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 顶层入口
@@ -1270,7 +1506,7 @@ pub fn parse_pptx(path: &Path) -> Result<PptxDoc> {
         }
     }
 
-    let mut images: Vec<DocImage> = Vec::new();
+    let mut images: Vec<ImageSlot> = Vec::new();
     let mut img_cache: HashMap<String, u32> = HashMap::new();
     let mut slides: Vec<Slide> = Vec::new();
     for (index, part) in slide_parts.iter().enumerate().take(MAX_SLIDES) {
@@ -1310,6 +1546,7 @@ pub fn parse_pptx(path: &Path) -> Result<PptxDoc> {
         width,
         height,
         images,
+        source: Some(path.to_path_buf()),
         title,
     })
 }
@@ -1500,5 +1737,20 @@ mod tests {
         let r = map.get("rId1").expect("rId1 存在");
         assert!(r.ty.ends_with("/slideLayout"));
         assert_eq!(r.target, "ppt/slideLayouts/slideLayout2.xml");
+    }
+
+    /// 回归：从最小 chart XML 解析出柱状图标题/类目/系列。
+    #[test]
+    fn parse_chart_reads_bar_series() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>销量对比</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:ser><c:idx val="0"/><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt></c:strCache></c:strRef></c:tx><c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr><c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>1月</c:v></c:pt><c:pt idx="1"><c:v>2月</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:formatCode>0</c:formatCode><c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let theme = Colors::new();
+        let chart = parse_chart(xml, &theme).expect("应解析出图表");
+        assert_eq!(chart.kind, ChartKind::Bar);
+        assert_eq!(chart.title, "销量对比");
+        assert_eq!(chart.categories, vec!["1月".to_string(), "2月".to_string()]);
+        assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.series[0].name, "A");
+        assert_eq!(chart.series[0].values, vec![3.0, 5.0]);
+        assert_eq!(chart.series[0].color, 0x0044_72C4);
     }
 }

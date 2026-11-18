@@ -752,6 +752,25 @@ fn hang_threshold_backs_off_then_caps() {
     );
 }
 
+/// 对比模式（1.12.0）：同一窗口的过期帧要合并成最新一帧，不同窗口的活不能互相顶掉。
+#[test]
+fn coalesce_keeps_latest_frame_per_target() {
+    let mk = |target: isize, generation: u64| RenderJob {
+        generation,
+        path: PathBuf::from("x"),
+        max_width: 10,
+        max_height: 10,
+        page: 0,
+        upscale: false,
+        target,
+    };
+    let out =
+        super::render::coalesce_by_target(vec![mk(1, 1), mk(2, 1), mk(1, 2), mk(2, 2), mk(1, 3)]);
+    assert_eq!(out.len(), 2, "两个窗口各留一帧");
+    assert_eq!((out[0].target, out[0].generation), (1, 3), "窗口1留最新");
+    assert_eq!((out[1].target, out[1].generation), (2, 2), "窗口2留最新");
+}
+
 /// 1.8.3 自愈日志：任务描述带文件名/类型/尺寸/页码，但**不许**带上完整用户路径。
 #[test]
 fn job_desc_has_no_user_path() {
@@ -762,6 +781,7 @@ fn job_desc_has_no_user_path() {
         max_height: 1000,
         page: 2,
         upscale: false,
+        target: 0,
     };
     let desc = describe_job(&job);
     assert!(desc.contains("report.pdf"), "要有文件名：{desc}");

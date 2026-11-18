@@ -3535,3 +3535,63 @@ Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**�
 - `plugin-demo.pptx` 模型：3 页，每页 2 个 Text，rect 正常（标题 (48,29,864,120)、正文 (48,168,864,475)），行高 29px。
 - 真实 31 页提案：`images=19`（修复前 0）、标题正常、图/文本矩形正常。
 - `cargo test --workspace --no-fail-fast` 全绿（qlr-platform 50 passed/4 ignored，含新像素测试，render lib 168 passed/8 ignored）；`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 干净。
+
+## 2026-11-18 · 1.12.0：对比模式（多窗口 / 锁）
+
+### 做了什么
+- 「全局单窗单态」→「按窗口会话」：`qlr-app::session` 删掉 `STATE/LINES/CONTENT` 三个全局单例，改为 `Session{state,lines,content}` + 按窗口表 `SESSIONS` + 驱动窗 `DRIVER` + `thread_local CURRENT`；`with_state/get_content/set_content` 统一走 `resolve()`（363 个调用点零改）。`wndproc` 用 `enter_session(hwnd)` 守卫，每个预览窗有独立视图状态。
+- 锁：`show::pin_current()` 标 `pinned`、停旧窗跟随、新建空驱动窗（沿用上次位置）；被锁窗内容保留、完整交互。`show::close_window()`：驱动窗隐藏复用、被锁窗销毁注销会话。
+- 输入路由：`input::{on_wheel,on_hotkey}` 先按 `show::preview_under_cursor()` 定位目标窗；热键钩子 `cursor_over_preview`/`foreground_belongs_to_preview` 改遍历预览窗集合（`hotkey::set_previews`）；平台新增 `window_root`、`destroy_window`。
+- 渲染回传：`RenderJob` 加 `target`，`RESULT` 改按窗口分堆，worker 按窗口去重过期帧并把结果 `PostMessage` 投给**请求它的窗口**——被锁窗翻页/缩放落回自己，不串窗。新增单测 `coalesce_keeps_latest_frame_per_target`。
+- 阴影按用户要求先注释：`boot.rs` 不再建 shadow 窗、`State.shadow=None`（`sync_shadow` 对 None 安全返回）。
+
+### 为什么
+用户要“锁 A 再开 B 并排对比”，且被锁窗要能继续交互——原实现是单实例单窗，`pinned` 只挡关闭、换选中就被 `follow_picked` 冲掉。故必须把状态从全局单例改成按窗口会话，并让渲染结果按窗口回传。
+
+### 怎么验证
+- `cargo test --workspace --no-fail-fast` 全绿：app 76（含新单测）/core 77/platform 50（4 ignored）/plugin_api 4/demo 7/office 11/render 168（8 ignored）/fuzz 1/malformed 9。
+- `cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 干净。
+- `verify-docx` 24 PASS、`verify-pptx` 25 PASS 未回归（单窗路径与改造前一致）。
+- 新增 `scripts/verify-multiwin.ps1`（有桌面才跑 GUI 段）：`qlrust A` → `--pin` → `qlrust B`，断言锁后 A 窗句柄仍在、B 开在**新**窗口、两窗同时存在且各自非空白、两次出帧、无 panic——**9 PASS / 0 FAIL**（本机桌面实测）。为让 GUI 无点击也可脚本化，`ipc::Action` 新增 `Pin` 变体、`cli` 新增 `--pin`、`boot` 派发 `Action::Pin => pin_current()`。
+- 多窗口手动矩阵（需真机桌面）：①开 A→点锁→A 冻结；②选 B 按空格→新窗口显示 B，A 仍在；③悬 A 滚轮/翻页只动 A；④A/B 各自拖边、缩放、表格点选互不影响；⑤关 A 只关 A；⑥关 B（驱动）→ 出新空驱动窗；⑦单窗常规路径不变。
+
+> 局限：`Ctrl+C` 复制热键仍注册在驱动窗（被锁窗复制走“光标在预览上 + Ctrl/C”兜底判据）；新驱动窗在未给文件前不显示（沿用“先不显示，等下次空格/选中给它文件”的实现选择）。
+
+## 2026-11-19 · 1.13.0：Office 优化①：图片懒解码（docx / pptx）
+
+### 做了什么
+- 图片从“解析时全部解码”改为“解析时只记包内条目名 + 显示尺寸；首次绘制该页/张时才重开源 zip 读取并解码，解完缓存”。
+- 模型：`qlr-core::docx::ImageSlot` 由 `bytes: Vec<u8>` 改为 `part: String`（zip 条目名）+ `OnceLock<DocImage>`；`DocDoc` / `PptxDoc` 新增 `source: Option<PathBuf>`。
+- 解析：`qlr-render::docx` 解析图片段不再 `read_part_bytes`，只 `ImageSlot::new(disp_w, disp_h, part)`（`part = ctx.rels[rid]`）；`qlr-render::pptx::parse_pic` 同理（`part = rel.target`）。两者 `parse_*` 末尾设 `source = Some(path.to_path_buf())`。
+- 解码：新增 `qlr-render::docx::decode_slot(doc, index)` / `ensure_page_images(doc, page)`、`qlr-render::pptx::decode_slot(doc, index)` / `ensure_slide_images(doc, slide)`：绘制前按“页/张”开一次 zip 批量读取该页图片并 `decode_image` 到显示尺寸、`set_decoded` 缓存。
+- 应用/平台：`qlr-app::chrome` 在 `Canvas::Document` 的 `paint_page` 前调 `ensure_page_images`、`Canvas::Presentation` 的 `paint_slide` 前调 `ensure_slide_images`；平台 `draw_image`/`draw_picture` 只读 `slot.decoded()`。
+
+### 为什么
+图多的 docx/pptx 打开很慢、内存高：原实现 parse 阶段把所有图片 `image::load_from_memory` 全量解码再缩放到显示尺寸、常驻 RGBA（`image-heavy.docx` 430–440 ms / 峰值 36 MB）。预览场景绝大多数图用户根本没翻到，先解码纯浪费。改为“打开只读元数据、翻到哪页解哪页”，既降冷启又降常驻，且和 `--render`（只解析）口径一致。
+
+### 怎么验证
+- `cargo test`（分 crate 跑，先清残留 qlrust）：core 78 / render 168 + fuzz 1 + malformed 9 / platform 50（4 ignored）/ app 76（1 ignored）全绿；`clippy --workspace --all-targets -- -D warnings`、`fmt --all -- --check` 干净。
+- release `--render`（`bytes=` 为模型 approx 占用，`elapsed=` 为解析耗时，峰值经 psapi 轮询）：`image-heavy.docx` 13.8 MB·430–440 ms → 6.9 KB·1 ms（峰值 36.4→6.7 MB）；`big-report.docx` 540.7 KB·7 ms；`cn-report.docx` 4.2 KB·1 ms；`real-proposal.pptx` 112 KB/8 ms → 53 KB/16 ms（峰值 9.8 MB）；`real-deck-62mb.pptx` 417 KB/37 ms → 396 KB/52 ms（峰值 13.1 MB）。
+- `verify-docx` 24 PASS / `verify-pptx` 25 PASS（结构/退出码/失败原因均未回归）。
+- 说明：`--render` 不做绘制，故不解码；GUI 首帧会解码当前页图片，之后翻页逐页解码并缓存。
+
+> 局限：每翻到一页临时开一次 zip（连续滚动语义下不如逐页翻划算，后续若做连续滚动需配合预取/常开包）；PDF 不涉及。后续 Office 优化（②图表保真、③连续滚动、④格式缺口、⑤沙箱）见计划 §11。
+
+---
+
+## 2026-11-19 · 1.14.0：Office 优化②：pptx 原生图表（柱 / 折线 / 饼）自绘
+
+### 做了什么
+- `qlr-core::pptx`：新增图表数据模型 `Chart{kind,title,categories,series,number_format}`、`ChartKind{Bar,BarStacked,BarPercent,Line,Pie}`、`ChartSeries{name,values:Vec<f64>,color}`、`ChartShape{rect,chart}`；`Shape::Chart` 变体；`Shape`/`Slide` 因含 f64 去掉 `Eq`。
+- `qlr-render::pptx`：`parse_graphic_frame` 增 `pkg:&mut Package` 参数——有 `a:tbl` 走原表格分支，否则读 `c:chart` 的 `r:id`→`ctx.slide_rels`→`pkg.read_optional(chartN.xml)`→`parse_chart`。`parse_chart` 按 `barChart.grouping`/`lineChart`/`pieChart` 判 kind，从 `c:ser` 取系列名(`tx`)/类目(`cat`)/数值(`val`)/`formatCode`/系列色(`spPr` 首个 srgb/schemeClr，缺省调色板)，并取图表标题。
+- `qlr-platform::window::pptx`：`draw_chart` 白卡片+边框+标题+图例+网格与坐标轴；`draw_bar_chart`（分组/堆叠/百分比柱）、`draw_line_chart`（CreatePen+Polyline+节点）、`draw_pie`（GDI Pie 扇区）、`draw_grid_and_axis`、`draw_category_labels`、`draw_legend`。
+
+### 为什么
+原 pptx 的 `graphicFrame` 只识别表格，内嵌原生图表（趋势/占比是演示的关键信息）完全不显示。原生图表 XML 只有数据无回退位图（实测 chartN.xml.rels 只有数据工作簿+主题，无 image），要显示只能自绘；图表数量少、矢量自绘几乎不占内存，故直接进程内绘制。
+
+### 怎么验证
+- `cargo test`（分 crate，先清 qlrust）：core 78 / render 169（8 ignored）/ platform 51（4 ignored）/ app 76（1 ignored）全绿；`clippy --workspace --all-targets -- -D warnings`、`fmt --all -- --check` 干净。
+- 离屏像素测试 `qlr-platform::window::pptx::draw_chart_renders_non_blank`（640×360 画 Bar 图，非白像素>500）。
+- release `--render` + `scripts/verify-pptx.ps1 -NoGui`：**25 PASS / 0 FAIL / 1 SKIP**；`real-deck-62mb.pptx`（55 页）解析出 3 个原生图表（slide4 折线「1-7月销售额同比增幅情况」4 系列 7 类目 fmt 0%；slide10 柱「19年各段数销售增幅情况」2 系列 5 类目），55ms 在预算内、无回归。
+
+> 局限：只还原柱 / 折线 / 饼三类；堆叠/百分比柱按正负累加近似，坐标轴标签与刻度做了简化（不追求与 PowerPoint 像素级一致），渐变填充取首色，动画 / 切换 / SmartArt 仍不还原。后续 Office 优化（③连续滚动、④格式缺口、⑤沙箱）见计划 §11。
