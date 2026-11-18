@@ -46,7 +46,10 @@ const TOC_MIN_WIDTH: i32 = 520;
 /// 单页 PDF 放得下，不画条（`window::ScrollInfo::new` 的规则：`total > visible` 才有），
 /// 这也是唯一需要看页数的地方。
 pub fn reserves_scrollbar(kind: format::Kind, pages: Option<usize>) -> bool {
-    kind == format::Kind::Pdf && pages.is_none_or(|n| n > 1)
+    // PDF 与 docx/pptx 连续滚动视图：多于一页/一张时右侧要留一条滚动条。
+    let scrollable = kind == format::Kind::Pdf
+        || matches!(kind, format::Kind::Document | format::Kind::Presentation);
+    scrollable && pages.is_none_or(|n| n > 1)
 }
 
 /// 滚动条这条信息**从哪来**。

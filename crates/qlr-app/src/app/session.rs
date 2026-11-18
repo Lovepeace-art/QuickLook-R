@@ -197,6 +197,11 @@ pub(crate) struct State {
     pub(crate) zoom: f32,
     /// 文本内容的滚动位置（顶部显示第几行，0 基）。
     pub(crate) scroll: usize,
+    /// 连续纵向滚动的视图偏移（物理像素，0 = 顶部）。docx/pptx 专用；翻页式内容不用。
+    pub(crate) flow_y: f64,
+    /// 连续视图的总高 / 视口高（物理像素），由壳层每帧回写，供滚动条按像素比例用。
+    pub(crate) flow_total: f64,
+    pub(crate) flow_view: f64,
     /// 表格的滚动偏移（像素，`(x, y)`）：表格是二维滚动，跟文本的"第几行"不是一套。
     pub(crate) sheet_scroll: (i32, i32),
     /// 表格的视图内列宽调整（1.9.1）：`(列号, 额外像素)`。只影响这次预览，
@@ -398,6 +403,9 @@ impl State {
             pages: None,
             zoom: 1.0,
             scroll: 0,
+            flow_y: 0.0,
+            flow_total: 0.0,
+            flow_view: 0.0,
             sheet_scroll: (0, 0),
             sheet_col_w: Vec::new(),
             sheet_row_h: Vec::new(),
@@ -881,6 +889,10 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
     // 换了内容就把文本滚动位置归零，否则打开新文件还停在上一个文件的中段
     with_state(|s| {
         s.scroll = 0;
+        // 连续纵向滚动（docx/pptx）：换文件把视图偏移/几何一起归零。
+        s.flow_y = 0.0;
+        s.flow_total = 0.0;
+        s.flow_view = 0.0;
         s.styled_logged = false;
         s.toc = toc;
         s.toc_active = None;
@@ -909,6 +921,14 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
 
 pub(crate) fn get_content() -> Option<Arc<Canvas>> {
     resolve().and_then(|session| session.content.lock().ok().and_then(|guard| guard.clone()))
+}
+
+/// 当前内容是不是 docx/pptx 的**连续纵向滚动**视图（vs 整页翻转）。
+pub(crate) fn is_flow_view() -> bool {
+    matches!(
+        get_content().as_deref(),
+        Some(Canvas::Document(_) | Canvas::Presentation(_))
+    )
 }
 
 /// 当前预览的文件类型（没有预览或路径未知时 `None`）。

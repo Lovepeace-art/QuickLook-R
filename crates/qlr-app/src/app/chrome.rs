@@ -133,6 +133,22 @@ pub(crate) fn scroll_info() -> Option<window::ScrollInfo> {
     if matches!(&*content, Canvas::Sheet(_)) {
         return None;
     }
+    // 连续纵向滚动（docx/pptx，1.15.0）：滚动条按**像素比例**走，而不是按页。
+    // 壳层每帧把 flow_total/flow_view/flow_y 回写到 State，这里直接拿来用；
+    // 首帧几何还没回写时退化为按页（>1 页才有条）。
+    if matches!(&*content, Canvas::Document(_) | Canvas::Presentation(_)) {
+        let (fy, ft, fv) =
+            with_state(|s| (s.flow_y, s.flow_total, s.flow_view)).unwrap_or((0.0, 0.0, 0.0));
+        if ft > 0.0 {
+            return window::ScrollInfo::new(fy as f32, fv as f32, ft as f32);
+        }
+        if let Some(total) = pages
+            && total > 1
+        {
+            return window::ScrollInfo::new(page as f32, 1.0, total as f32);
+        }
+        return None;
+    }
     // PDF：滚动条只看**页数**，和"现在上屏的是占位文字还是真页面"无关。
     // 这一条必须放在 match 之前：`view_size()` 要靠它算出"内容区宽不宽"，
     // 而算渲染尺寸时上屏的往往还是那句"正在渲染…"——按占位文字算出来的
@@ -328,6 +344,20 @@ pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
         let target = (ratio * max_y as f32).round() as i32;
         with_state(|s| {
             s.sheet_scroll.1 = target.clamp(0, max_y);
+        });
+        window::invalidate(hwnd);
+        return;
+    }
+    // 连续纵向滚动（docx/pptx，1.15.0）：滑块比例 × 最大偏移 = 目标 view_y（像素）。
+    if is_flow_view() {
+        let (Some(_bar), Some(info)) = (layout.bar, scroll_info()) else {
+            return;
+        };
+        let ratio = window::scroll_start_at(layout.below_chrome, y, info);
+        let (ft, fv) = with_state(|s| (s.flow_total, s.flow_view)).unwrap_or((0.0, 0.0));
+        let max = (ft - fv).max(0.0);
+        with_state(|s| {
+            s.flow_y = ((ratio as f64) * max).clamp(0.0, max);
         });
         window::invalidate(hwnd);
         return;
@@ -747,38 +777,58 @@ pub(crate) fn repaint(hwnd: HWND) {
                 paint_lens_if_any(hwnd);
                 return;
             }
-            // 文档（1.10.0）：当前页现画。模型带页面坐标，`paint_page` 按内容区缩放居中，
-            // 逐段画字 + 表格 + 内嵌图。翻页只改 `s.page`，不重新解析/排版。
+            // 文档（1.15.0）：连续纵向滚动。单页按内容宽缩放、多页纵向堆叠，
+            // 只画与视口相交的那几页；滚动只改 `s.flow_y`，不重新解析/排版。
             Canvas::Document(doc) => {
-                let page = with_state(|s| s.page).unwrap_or(0);
+                let vy0 = with_state(|s| s.flow_y).unwrap_or(0.0) as i32;
+                let f = window::docx_flow(doc, layout.content, vy0);
+                let vy = vy0.clamp(0, (f.total_h - f.view_h).max(0));
+                with_state(|s| {
+                    s.flow_total = f.total_h as f64;
+                    s.flow_view = f.view_h as f64;
+                    s.flow_y = vy as f64;
+                    s.page = f.top_page;
+                });
+                for p in f.first_page..=f.last_page {
+                    qlr_render::docx::ensure_page_images(doc, p);
+                }
                 log_debug!(
                     SCOPE,
-                    "PAINT docx page={}/{} content={}x{}",
-                    page + 1,
-                    doc.len(),
+                    "PAINT docx view_y={vy} pages={}..={} content={}x{}",
+                    f.first_page + 1,
+                    f.last_page + 1,
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
-                qlr_render::docx::ensure_page_images(doc, page);
-                window::paint_page(hwnd, Some(&chrome), Some(layout.content), doc, page);
+                window::paint_page(hwnd, Some(&chrome), Some(layout.content), doc, vy);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
                 return;
             }
-            // 幻灯片（1.11.0）：当前张现画。模型带幻灯片坐标，`paint_slide` 按内容区缩放居中，
-            // 逐形状画（文字框/图片/色块/表格）。翻页只改 `s.page`，不重新解析。
+            // 幻灯片（1.15.0）：连续纵向滚动。单张按内容宽缩放、多张纵向堆叠，
+            // 只画与视口相交的那几张；滚动只改 `s.flow_y`，不重新解析。
             Canvas::Presentation(doc) => {
-                let page = with_state(|s| s.page).unwrap_or(0);
+                let vy0 = with_state(|s| s.flow_y).unwrap_or(0.0) as i32;
+                let f = window::pptx_flow(doc, layout.content, vy0);
+                let vy = vy0.clamp(0, (f.total_h - f.view_h).max(0));
+                with_state(|s| {
+                    s.flow_total = f.total_h as f64;
+                    s.flow_view = f.view_h as f64;
+                    s.flow_y = vy as f64;
+                    s.page = f.top_slide;
+                });
+                for p in f.first_slide..=f.last_slide {
+                    qlr_render::pptx::ensure_slide_images(doc, p);
+                }
                 log_debug!(
                     SCOPE,
-                    "PAINT pptx slide={}/{} content={}x{}",
-                    page + 1,
-                    doc.len(),
+                    "PAINT pptx view_y={vy} slides={}..={} content={}x{}",
+                    f.first_slide + 1,
+                    f.last_slide + 1,
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
-                qlr_render::pptx::ensure_slide_images(doc, page);
-                window::paint_slide(hwnd, Some(&chrome), Some(layout.content), doc, page);
+                window::paint_slide(hwnd, Some(&chrome), Some(layout.content), doc, vy);
                 paint_overlays(hwnd, &layout);
                 paint_lens_if_any(hwnd);
                 return;

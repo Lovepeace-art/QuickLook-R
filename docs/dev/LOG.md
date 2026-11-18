@@ -3595,3 +3595,42 @@ Excel 报表里"涨红跌绿""占比条""低于阈值标红"是**信息本身**�
 - release `--render` + `scripts/verify-pptx.ps1 -NoGui`：**25 PASS / 0 FAIL / 1 SKIP**；`real-deck-62mb.pptx`（55 页）解析出 3 个原生图表（slide4 折线「1-7月销售额同比增幅情况」4 系列 7 类目 fmt 0%；slide10 柱「19年各段数销售增幅情况」2 系列 5 类目），55ms 在预算内、无回归。
 
 > 局限：只还原柱 / 折线 / 饼三类；堆叠/百分比柱按正负累加近似，坐标轴标签与刻度做了简化（不追求与 PowerPoint 像素级一致），渐变填充取首色，动画 / 切换 / SmartArt 仍不还原。后续 Office 优化（③连续滚动、④格式缺口、⑤沙箱）见计划 §11。
+
+---
+
+## 2026-11-19 · 1.15.0：docx / pptx 连续纵向滚动
+
+### 做了什么
+- 平台层 `qlr-platform::window::docx`：删除 `page_transform`（整页缩放居中），新增 `FlowGeom` + `docx_flow_geom(page_w,page_h,n,content)`（pad=8px、按内容**宽度**定单页缩放 `s=avail_w/page_w`、gap=16px、`total`=页栈总高）、`pub fn docx_flow(doc,&content,view_y)->DocxFlow{total_h,view_h,first_page,last_page,top_page}`、`pub fn docx_page_offset(doc,&content,page)->i32`；`pub fn paint_page(hwnd,chrome,content,doc,view_y:i32)` 重写为连续：内容区裁剪后逐页 `top=pad+i*(ph+gap)-view_y`、跳过不相交页、白纸 + 页矩形裁剪 + 逐段/表格/图片 + 页边框；删除 `page_ref_is_editing`。
+- 平台层 `qlr-platform::window::pptx`：同构改造，`slide_transform`→`pptx_flow_geom` + `PptxFlow{total_h,view_h,first_slide,last_slide,top_slide}` + `pptx_flow` + `pptx_slide_offset`；`draw_slide_page`→`draw_slides_flow(hdc,rc,chrome,content,doc,view_y)`；`paint_slide(hwnd,chrome,content,doc,view_y)`。
+- 壳层 `qlr-app`：`State` 增 `flow_y/flow_total/flow_view`（物理像素）；`chrome::scroll_info` 对 Document/Presentation 按像素比例出滚动条；`chrome::repaint` 的 Document/Presentation 分支每帧算 `docx_flow/pptx_flow`、回写几何、只对可见页调 `ensure_page_images/ensure_slide_images`（惰性解码只解当前可见页的图），再以 `view_y` 绘制；`apply_scroll_y` 对 flow 视图按比例设 `flow_y`；`session::is_flow_view` 辅助。
+- 输入 `qlr-app::input`：`flow_scroll_by`（滚轮，一格约 120px，flow 内容恒吃掉滚轮以免落到翻页）、`flow_scroll_screen`（PageUp/Down 按约一屏）、`flow_goto_page`（页码框跳该页顶，经 `docx_page_offset/pptx_slide_offset` 算偏移）；接入 `on_wheel_inner`/`step_page`/`goto_page`。
+- `layout::reserves_scrollbar`：docx/pptx 多于一页/一张时预留右侧滚动条（同 PDF）。
+
+### 为什么
+用户要求 docx/pptx 像 Word/PDF 那样多页上下连读（整页翻转体验割裂）。整篇模型已在内存，连续滚动只需“按 view_y 平移 + 只画与视口相交的页”，**不增加解析/排版成本、内存基本持平**（只会多解当前可见页的图片）。
+
+### 怎么验证
+- `cargo test`（分 crate，先清 qlrust）：core 78 / render 169（8 ignored）/ platform **53**（4 ignored）/ app 76（1 ignored）全绿；`clippy --workspace --all-targets -- -D warnings`、`fmt --all -- --check` 干净。
+- 新增单测：`docx_flow_geom_fits_width_and_stacks`、`docx_flow_tracks_visible_pages`、`pptx_flow_geom_fits_width_and_stacks`、`draw_slides_flow_scroll_changes_content`（离屏 DIB：view_y=0 与滚到第二张两屏像素必须不同且都非空，直接证明多张堆叠 + view_y 平移生效）。
+- `scripts/verify-docx.ps1` 24 PASS / 0 FAIL、`scripts/verify-pptx.ps1` 25 PASS / 0 FAIL（未回归）。
+
+> 局限：docx/pptx 仍是整篇一次解析（连续滚动只省绘制、不省解析）；滚轮按固定像素步进，无惯性/平滑动画；页码框跳转把目标页“顶对齐”视口（不居中）。
+
+---
+
+## 2026-11-19 · 1.15.1：连续滚动两处手感修复
+
+### 做了什么
+- **修滚轮方向反了**（用户实测）：qlr-app::input::flow_scroll_by 原来 low_y += notches*120，而 
+otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*120，与文本/表格方向一致。
+- **修顶栏悬停提示被内容遮挡**（用户实测"浮层沉底被挡"）：悬停提示/一次性提示（hint/toast）由 paint_chrome 画在顶栏下方、压在内容区上，但连续滚动的白纸在其后绘制把它盖住。改为在 qlr-platform::window::docx::paint_page 与 pptx::draw_slides_flow **画完内容之后、BitBlt 之前**补画一遍顶栏（paint_chrome），使提示浮在内容之上。
+
+### 为什么
+连续纵向滚动（1.15.0）第一版方向与浮层层级有回归，属手感/可见性缺陷，非结构性。
+
+### 怎么验证
+- cargo test：platform **53**（4 ignored）/ app **76**（1 ignored）全绿；clippy -D warnings、mt --check 干净。
+- 滚动几何/离屏像素单测（draw_slides_flow_scroll_changes_content 等）仍通过；方向由 low_scroll_by 符号修正保证。
+
+> 局限：同 1.15.0。

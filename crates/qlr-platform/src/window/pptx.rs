@@ -219,26 +219,88 @@ fn rgb_to_colorref(rgb: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
 }
 
-/// 幻灯片在内容区里的变换：`(缩放 s, 原点 x, 原点 y, 幻灯宽, 幻灯高)`（屏幕像素）。
-/// 保持长宽比整页塞入内容区并居中，`s` 含 DPI 内容缩放因子。
-fn slide_transform(content: RECT, slide_w: u32, slide_h: u32) -> (f32, i32, i32, i32, i32) {
-    let dpi_scale = (dpi::cpx(96) as f32 / 96.0).max(0.1);
-    let cw = (content.right - content.left).max(1) as f32;
-    let ch = (content.bottom - content.top).max(1) as f32;
-    let pw_log = slide_w.max(1) as f32;
-    let ph_log = slide_h.max(1) as f32;
-    let fit = (cw / (pw_log * dpi_scale)).min(ch / (ph_log * dpi_scale));
-    let fit = if fit.is_finite() && fit > 0.0 {
-        fit.min(4.0)
+/// 连续纵向滚动的几何：fit-to-width（按内容宽度定单张缩放），多张纵向堆叠。
+struct SlideGeom {
+    s: f32,
+    pad: i32,
+    pw: i32,
+    ph: i32,
+    gap: i32,
+    total: i32,
+    view: i32,
+}
+
+fn pptx_flow_geom(width: u32, height: u32, n: usize, content: RECT) -> SlideGeom {
+    let pad = dpi::px(8).max(0);
+    let avail_w = ((content.right - content.left) - 2 * pad).max(1);
+    let s = (avail_w as f32 / width.max(1) as f32).max(0.02);
+    let pw = avail_w;
+    let ph = ((height.max(1) as f32) * s).round().max(1.0) as i32;
+    let gap = dpi::px(16).max(1);
+    let n = n as i32;
+    let total = if n <= 0 {
+        0
     } else {
-        1.0
+        2 * pad + n * ph + (n - 1) * gap
     };
-    let s = (dpi_scale * fit).max(0.02);
-    let pw = ((pw_log * s).round() as i32).max(1);
-    let ph = ((ph_log * s).round() as i32).max(1);
-    let ox = content.left + ((content.right - content.left) - pw) / 2;
-    let oy = content.top + ((content.bottom - content.top) - ph) / 2;
-    (s, ox, oy, pw, ph)
+    let view = (content.bottom - content.top).max(1);
+    SlideGeom {
+        s,
+        pad,
+        pw,
+        ph,
+        gap,
+        total,
+        view,
+    }
+}
+
+/// 一帧的滚动态（给壳层算滚动条 + 决定要懒解码哪几张）。
+pub struct PptxFlow {
+    pub total_h: i32,
+    pub view_h: i32,
+    pub first_slide: usize,
+    pub last_slide: usize,
+    pub top_slide: usize,
+}
+
+/// 给定当前纵向偏移 `view_y`，算出总高 / 视口高 / 可见张范围 / 顶部张。
+pub fn pptx_flow(doc: &PptxDoc, content: RECT, view_y: i32) -> PptxFlow {
+    let g = pptx_flow_geom(doc.width, doc.height, doc.len(), content);
+    let max_view = (g.total - g.view).max(0);
+    let vy = view_y.clamp(0, max_view);
+    let n = doc.len();
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    for i in 0..n {
+        let top = content.top + g.pad + (i as i32) * (g.ph + g.gap) - vy;
+        let bot = top + g.ph;
+        if bot > content.top && top < content.bottom {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+        }
+    }
+    let top_slide = first.unwrap_or(0);
+    let (first_slide, last_slide) = match first {
+        Some(f) => (f, last),
+        None => (0, n.saturating_sub(1)),
+    };
+    PptxFlow {
+        total_h: g.total,
+        view_h: g.view,
+        first_slide,
+        last_slide,
+        top_slide,
+    }
+}
+
+/// 让第 `slide`（0 基）张顶对齐视口顶部所需的 `view_y`（页码框跳转用）。
+pub fn pptx_slide_offset(doc: &PptxDoc, content: RECT, slide: usize) -> i32 {
+    let g = pptx_flow_geom(doc.width, doc.height, doc.len(), content);
+    let max_view = (g.total - g.view).max(0);
+    (g.pad + (slide as i32) * (g.ph + g.gap)).clamp(0, max_view)
 }
 
 #[inline]
@@ -965,15 +1027,15 @@ fn draw_image(hdc: HDC, img: &DocImage, rect: &qlr_core::docx::Rect, ox: i32, oy
 
 // ---------------------------------------------------------------- 主入口
 
-/// 画 pptx 的**当前一页（张）**。翻页由壳层改 `page` 后调用本函数重画。
-/// 把一页幻灯片画到任意 HDC 的 `rc` 区域（不依赖 BeginPaint，便于离屏单测复用）。
-fn draw_slide_page(
+/// 把多张幻灯片按**连续纵向滚动**画到任意 HDC 的 `rc` 区域
+/// （不依赖 BeginPaint，便于离屏单测复用）。`view_y` 是相对页面栈顶的像素偏移。
+fn draw_slides_flow(
     hdc: HDC,
     rc: RECT,
     chrome: Option<&Chrome<'_>>,
     content: Option<RECT>,
     doc: &PptxDoc,
-    page: usize,
+    view_y: i32,
 ) {
     unsafe {
         let bg = CreateSolidBrush(COLORREF(TEXT_BACKGROUND_RGB));
@@ -994,47 +1056,72 @@ fn draw_slide_page(
         if content.right <= content.left || content.bottom <= content.top {
             return;
         }
-        let Some(slide) = doc.slide(page) else {
-            return;
-        };
-        let (s, ox, oy, pw, ph) = slide_transform(content, doc.width, doc.height);
-        let slide_rect = RECT {
-            left: ox,
-            top: oy,
-            right: ox + pw,
-            bottom: oy + ph,
-        };
-        // 幻灯片底色：自带背景色优先，否则白底。
-        let bg_rgb = slide.bg.unwrap_or(0x00FF_FFFF);
-        fill_color_rect(hdc, &slide_rect, bg_rgb);
-
+        let g = pptx_flow_geom(doc.width, doc.height, doc.len(), content);
+        let max_view = (g.total - g.view).max(0);
+        let vy = view_y.clamp(0, max_view);
+        let left = content.left + g.pad;
         let saved = SaveDC(hdc);
         IntersectClipRect(
             hdc,
-            slide_rect.left,
-            slide_rect.top,
-            slide_rect.right,
-            slide_rect.bottom,
+            content.left,
+            content.top,
+            content.right,
+            content.bottom,
         );
         FONTS.with(|cell| {
             let mut set = cell.borrow_mut();
-            for shape in &slide.shapes {
-                draw_shape(hdc, &mut set, shape, doc, ox, oy, s);
+            for i in 0..doc.len() {
+                let Some(slide) = doc.slide(i) else { continue };
+                let top = content.top + g.pad + (i as i32) * (g.ph + g.gap) - vy;
+                let bot = top + g.ph;
+                if bot <= content.top || top >= content.bottom {
+                    continue;
+                }
+                let slide_rect = RECT {
+                    left,
+                    top,
+                    right: left + g.pw,
+                    bottom: bot,
+                };
+                // 幻灯片底色：自带背景色优先，否则白底。
+                let bg_rgb = slide.bg.unwrap_or(0x00FF_FFFF);
+                fill_color_rect(hdc, &slide_rect, bg_rgb);
+                let s2 = SaveDC(hdc);
+                IntersectClipRect(
+                    hdc,
+                    slide_rect.left,
+                    slide_rect.top,
+                    slide_rect.right,
+                    slide_rect.bottom,
+                );
+                for shape in &slide.shapes {
+                    draw_shape(hdc, &mut set, shape, doc, left, top, g.s);
+                }
+                if s2 != 0 {
+                    let _ = RestoreDC(hdc, s2);
+                }
+                frame_rect(hdc, &slide_rect, SLIDE_BORDER_RGB);
             }
         });
         if saved != 0 {
             let _ = RestoreDC(hdc, saved);
         }
-        frame_rect(hdc, &slide_rect, SLIDE_BORDER_RGB);
+        // 悬停提示/一次性提示是压在内容区上的顶栏浮层，上面画内容时会被白纸盖住；
+        // 这里在内容之上补画一遍顶栏（连续滚动下提示才不会被"沉底"盖掉）。
+        if let Some(spec) = chrome {
+            let _ = paint_chrome(hdc, rc, spec);
+        }
     }
 }
 
+/// 画 pptx 的**当前纵向视口**（连续纵向滚动，多张堆叠）。
+/// `view_y` 是相对页面栈顶的像素偏移；只画与内容区相交的那几张，不重新解析/排版。
 pub fn paint_slide(
     hwnd: HWND,
     chrome: Option<&Chrome<'_>>,
     content: Option<RECT>,
     doc: &PptxDoc,
-    page: usize,
+    view_y: i32,
 ) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -1050,7 +1137,7 @@ pub fn paint_slide(
         let hdc: HDC = buffer.as_ref().map_or(window_dc, |b| b.dc);
         SetBkMode(hdc, TRANSPARENT);
 
-        draw_slide_page(hdc, rc, chrome, content, doc, page);
+        draw_slides_flow(hdc, rc, chrome, content, doc, view_y);
 
         if let Some(buffer) = &buffer {
             let _ = BitBlt(
@@ -1069,10 +1156,8 @@ pub fn paint_slide(
             let (g, u) = gui_resources();
             qlr_core::log_debug!(
                 SCOPE,
-                "PAINT slide={}/{} shapes={} gdi={g} user={u} {:.2}ms",
-                page + 1,
+                "PAINT pptx view_y={view_y} slides={} gdi={g} user={u} {:.2}ms",
                 doc.len(),
-                doc.slide(page).map(|s| s.shapes.len()).unwrap_or(0),
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -1092,22 +1177,25 @@ mod tests {
     }
 
     #[test]
-    fn slide_transform_fits_and_centers() {
+    fn pptx_flow_geom_fits_width_and_stacks() {
         let content = RECT {
             left: 100,
             top: 50,
             right: 900,
             bottom: 650,
         };
-        // 16:9 幻灯片（1280×720）。
-        let (s, ox, oy, pw, ph) = slide_transform(content, 1280, 720);
-        assert!(s > 0.0);
-        assert!(pw <= 800, "幻灯宽 {pw} 超过内容宽 800");
-        assert!(ph <= 600, "幻灯高 {ph} 超过内容高 600");
-        assert!(ox >= content.left && oy >= content.top);
-        let left_gap = ox - content.left;
-        let right_gap = content.right - (ox + pw);
-        assert!((left_gap - right_gap).abs() <= 2);
+        // 16:9 幻灯片（1280×720），3 张纵向堆叠。
+        let g = pptx_flow_geom(1280, 720, 3, content);
+        // 单张宽度 = 内容宽 - 左右各 8px padding。
+        assert_eq!(g.pw, 800 - 2 * dpi::px(8));
+        assert!(g.s > 0.0 && g.ph > 0);
+        // 3 张总高明显超过一屏 → 可以连续纵向滚动。
+        assert!(
+            g.total > g.view,
+            "3 张总高应超过视口：total={} view={}",
+            g.total,
+            g.view
+        );
     }
 
     #[test]
@@ -1172,7 +1260,7 @@ mod tests {
                 right: 640,
                 bottom: 360,
             };
-            draw_slide_page(mem, rc, None, None, &doc, 0);
+            draw_slides_flow(mem, rc, None, None, &doc, 0);
             let px = std::slice::from_raw_parts(bits as *const u8, 640 * 360 * 4);
             let nonwhite = px
                 .chunks_exact(4)
@@ -1241,7 +1329,7 @@ mod tests {
                 right: 640,
                 bottom: 360,
             };
-            draw_slide_page(mem, rc, None, None, &doc, 0);
+            draw_slides_flow(mem, rc, None, None, &doc, 0);
             let px = std::slice::from_raw_parts(bits as *const u8, 640 * 360 * 4);
             let nonwhite = px
                 .chunks_exact(4)
@@ -1253,5 +1341,85 @@ mod tests {
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
         }
+    }
+
+    /// 连续纵向滚动：滚到第二张后画面必须和第一张不同（证明多张堆叠 + view_y 平移生效）。
+    fn render_flow_bytes(doc: &PptxDoc, rc: RECT, view_y: i32) -> Vec<u8> {
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let w = rc.right - rc.left;
+            let h = rc.bottom - rc.top;
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = w;
+            info.bmiHeader.biHeight = -h;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("CreateDIBSection 失败");
+            let old = SelectObject(mem, bmp.into());
+            draw_slides_flow(mem, rc, None, None, doc, view_y);
+            let v = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            v
+        }
+    }
+
+    #[test]
+    fn draw_slides_flow_scroll_changes_content() {
+        let mk = |txt: &str, n: u32| qlr_core::pptx::Slide {
+            shapes: vec![Shape::Text(TextBox {
+                rect: qlr_core::docx::Rect::new(20, 20, 600, 200),
+                paras: vec![Para {
+                    rect: qlr_core::docx::Rect::new(20, 20, 600, 200),
+                    align: HAlign::Left,
+                    lines: vec![Line {
+                        rect: qlr_core::docx::Rect::new(40, 60, 560, 60),
+                        runs: vec![Run {
+                            text: txt.to_string(),
+                            size_dpt: 320,
+                            ..Run::default()
+                        }],
+                    }],
+                    space_before: 0,
+                    space_after: 0,
+                }],
+                fill: None,
+                line: None,
+            })],
+            bg: Some(0x00FF_FFFF),
+            number: n,
+        };
+        let doc = PptxDoc {
+            slides: vec![mk("AAA111", 1), mk("BBB222", 2), mk("CCC333", 3)],
+            width: 640,
+            height: 360,
+            images: vec![],
+            source: None,
+            title: None,
+        };
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 360,
+        };
+        let a = render_flow_bytes(&doc, rc, 0);
+        let off = pptx_slide_offset(&doc, rc, 1);
+        assert!(off > 0, "第二张偏移应 > 0");
+        let b = render_flow_bytes(&doc, rc, off);
+        let nonwhite = |v: &[u8]| {
+            v.chunks_exact(4)
+                .filter(|p| !(p[0] > 240 && p[1] > 240 && p[2] > 240))
+                .count()
+        };
+        assert!(nonwhite(&a) > 100 && nonwhite(&b) > 100, "两屏都应有内容");
+        assert_ne!(a, b, "滚到第二张后画面应不同");
     }
 }

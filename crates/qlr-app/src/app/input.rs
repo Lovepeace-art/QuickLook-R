@@ -296,6 +296,11 @@ fn on_wheel_inner(delta: i32) {
     if sheet_scroll_by_wheel(notches) {
         return;
     }
+    // 文档/幻灯片 连续纵向滚动（1.15.0）：滚轮 = 上下滚动像素。放在文本/翻页前，
+    // 且只要是 flow 内容就吃掉滚轮（哪怕零头不足），否则会落到下面的翻页分支乱跳。
+    if flow_scroll_by(notches) {
+        return;
+    }
     // 文本：一格 3 行。滚得动就不缩放。
     if scroll_text_by(wheel_text_rows(notches)) {
         return;
@@ -1579,8 +1584,65 @@ pub(crate) fn pan_by(dx: i32, dy: i32) {
     );
 }
 
+/// 连续纵向滚动：鼠标滚轮（按像素）。是 flow 内容就恒 return true（吃掉滚轮以免翻页）。
+fn flow_scroll_by(notches: isize) -> bool {
+    if !is_flow_view() {
+        return false;
+    }
+    if notches == 0 {
+        return true;
+    }
+    let step = notches as f64 * 120.0; // 一格约 120px
+    with_state(|s| {
+        let max = (s.flow_total - s.flow_view).max(0.0);
+        // 与文本/表格方向一致：滚轮往上（notches>0）= 看上面的内容 = flow_y 减小。
+        // （原来写成 `+ step`，方向反了，用户实测"滚轮逻辑反了"。）
+        s.flow_y = (s.flow_y - step).clamp(0.0, max);
+    });
+    if let Some(preview) = preview_raw() {
+        window::invalidate(preview);
+    }
+    true
+}
+
+/// 连续纵向滚动：PageUp/Down = 按约一屏滚动。`delta>0` 向下。
+fn flow_scroll_screen(delta: isize) {
+    with_state(|s| {
+        let max = (s.flow_total - s.flow_view).max(0.0);
+        let step = (s.flow_view * 0.9).max(120.0);
+        s.flow_y = (s.flow_y + delta as f64 * step).clamp(0.0, max);
+    });
+    if let Some(preview) = preview_raw() {
+        window::invalidate(preview);
+    }
+}
+
+/// 连续纵向滚动：跳到第 `page`（1 基）页 → 让该页顶对齐视口顶。
+fn flow_goto_page(hwnd: HWND, page: usize) {
+    let content = super::chrome::frame(hwnd).content;
+    let Some(canvas) = get_content() else { return };
+    let offset = match canvas.as_ref() {
+        Canvas::Document(doc) => window::docx_page_offset(doc, content, page.saturating_sub(1)),
+        Canvas::Presentation(doc) => {
+            window::pptx_slide_offset(doc, content, page.saturating_sub(1))
+        }
+        _ => return,
+    };
+    with_state(|s| {
+        let max = (s.flow_total - s.flow_view).max(0.0);
+        s.flow_y = (offset as f64).clamp(0.0, max);
+        s.page = page.saturating_sub(1);
+    });
+    window::invalidate(hwnd);
+}
+
 /// 在当前文档里翻 delta 页（目前只有 PDF 有页的概念）。
 pub(crate) fn step_page(delta: isize) {
+    // 文档/幻灯片 连续纵向滚动：PageUp/Down = 按一屏滚动（不是整页翻转）。
+    if is_flow_view() {
+        flow_scroll_screen(delta);
+        return;
+    }
     let Some((preview, path, pages, page)) =
         with_state(|s| (s.preview, s.last_path.clone(), s.pages, s.page))
     else {
@@ -1629,6 +1691,12 @@ pub(crate) fn goto_page(page: usize) {
         Some(triple) => triple,
         None => return,
     };
+    // 文档/幻灯片 连续纵向滚动：页码框跳转 = 把目标页顶对齐到视口顶部。
+    if is_flow_view() {
+        let total = pages.unwrap_or(1).max(1);
+        flow_goto_page(preview.raw(), page.clamp(1, total));
+        return;
+    }
     let (Some(path), Some(total)) = (path, pages) else {
         return;
     };

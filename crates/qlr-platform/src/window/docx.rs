@@ -235,28 +235,89 @@ fn rgb_to_colorref(rgb: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
 }
 
-/// 页面在内容区里的变换：`(缩放 s, 原点 x, 原点 y, 页宽, 页高)`（屏幕像素）。
-///
-/// 页面保持长宽比，按"能整页塞进内容区"缩放（可放大到 4 倍以满足小窗口看小字），
-/// 然后居中。`s` 含 DPI 的内容缩放因子（`dpi::cpx`），所以高分屏上整页也按比例变大。
-fn page_transform(content: RECT, page_w: u32, page_h: u32) -> (f32, i32, i32, i32, i32) {
-    let dpi_scale = (dpi::cpx(96) as f32 / 96.0).max(0.1);
-    let cw = (content.right - content.left).max(1) as f32;
-    let ch = (content.bottom - content.top).max(1) as f32;
-    let pw_log = page_w.max(1) as f32;
-    let ph_log = page_h.max(1) as f32;
-    let fit = (cw / (pw_log * dpi_scale)).min(ch / (ph_log * dpi_scale));
-    let fit = if fit.is_finite() && fit > 0.0 {
-        fit.min(4.0)
+/// 连续纵向滚动的几何：fit-to-width（按内容宽度定单页缩放），多页纵向堆叠。
+struct FlowGeom {
+    s: f32,
+    pad: i32,
+    pw: i32,
+    ph: i32,
+    gap: i32,
+    total: i32,
+    view: i32,
+}
+
+/// 按"适应内容宽度"算单页缩放，把 `n` 页纵向堆叠；页面左右各留 `pad`，页间留 `gap`。
+fn docx_flow_geom(page_w: u32, page_h: u32, n: usize, content: RECT) -> FlowGeom {
+    let pad = dpi::px(8).max(0);
+    let avail_w = ((content.right - content.left) - 2 * pad).max(1);
+    let s = (avail_w as f32 / page_w.max(1) as f32).max(0.02);
+    let pw = avail_w;
+    let ph = ((page_h.max(1) as f32) * s).round().max(1.0) as i32;
+    let gap = dpi::px(16).max(1);
+    let n = n as i32;
+    let total = if n <= 0 {
+        0
     } else {
-        1.0
+        2 * pad + n * ph + (n - 1) * gap
     };
-    let s = (dpi_scale * fit).max(0.02);
-    let pw = ((pw_log * s).round() as i32).max(1);
-    let ph = ((ph_log * s).round() as i32).max(1);
-    let ox = content.left + ((content.right - content.left) - pw) / 2;
-    let oy = content.top + ((content.bottom - content.top) - ph) / 2;
-    (s, ox, oy, pw, ph)
+    let view = (content.bottom - content.top).max(1);
+    FlowGeom {
+        s,
+        pad,
+        pw,
+        ph,
+        gap,
+        total,
+        view,
+    }
+}
+
+/// 一帧的滚动态（给壳层算滚动条 + 决定要懒解码哪几页）。
+pub struct DocxFlow {
+    pub total_h: i32,
+    pub view_h: i32,
+    pub first_page: usize,
+    pub last_page: usize,
+    pub top_page: usize,
+}
+
+/// 给定当前纵向偏移 `view_y`，算出总高 / 视口高 / 可见页范围 / 顶部页。
+pub fn docx_flow(doc: &DocDoc, content: RECT, view_y: i32) -> DocxFlow {
+    let g = docx_flow_geom(doc.page_w, doc.page_h, doc.len(), content);
+    let max_view = (g.total - g.view).max(0);
+    let vy = view_y.clamp(0, max_view);
+    let n = doc.len();
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    for i in 0..n {
+        let top = content.top + g.pad + (i as i32) * (g.ph + g.gap) - vy;
+        let bot = top + g.ph;
+        if bot > content.top && top < content.bottom {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+        }
+    }
+    let top_page = first.unwrap_or(0);
+    let (first_page, last_page) = match first {
+        Some(f) => (f, last),
+        None => (0, n.saturating_sub(1)),
+    };
+    DocxFlow {
+        total_h: g.total,
+        view_h: g.view,
+        first_page,
+        last_page,
+        top_page,
+    }
+}
+
+/// 让第 `page`（0 基）页顶对齐视口顶部所需的 `view_y`（页码框跳转用）。
+pub fn docx_page_offset(doc: &DocDoc, content: RECT, page: usize) -> i32 {
+    let g = docx_flow_geom(doc.page_w, doc.page_h, doc.len(), content);
+    let max_view = (g.total - g.view).max(0);
+    (g.pad + (page as i32) * (g.ph + g.gap)).clamp(0, max_view)
 }
 
 #[inline]
@@ -512,16 +573,17 @@ fn draw_image(hdc: HDC, block: &ImageBlock, doc: &DocDoc, ox: i32, oy: i32, s: f
 
 // ---------------------------------------------------------------- 主入口
 
-/// 画 docx 的**当前一页**。
+/// 画 docx 的**当前纵向视口**（连续纵向滚动，多页堆叠）。
 ///
-/// 与 `paint_sheet` 一样是"整窗双缓冲 + BeginPaint/EndPaint"的入口，区别只是内容
-/// 换成了一张白纸 + 段落 run + 表格 + 内嵌图。翻页由壳层改 `page` 后调用本函数重画。
+/// 与 `paint_sheet` 一样是"整窗双缓冲 + BeginPaint/EndPaint"的入口。多页按 fit-to-width
+/// 纵向堆叠，`view_y` 是相对页面栈顶的像素偏移；只画与内容区相交的那几页。
+/// 翻页/滚动只改壳层的 `view_y` 后重跑本函数，**不重新解析/排版**。
 pub fn paint_page(
     hwnd: HWND,
     chrome: Option<&Chrome<'_>>,
     content: Option<RECT>,
     doc: &DocDoc,
-    page: usize,
+    view_y: i32,
 ) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -555,50 +617,76 @@ pub fn paint_page(
             bottom: content.bottom.min(rc.bottom),
         };
 
+        let mut painted = 0usize;
         if content.right > content.left && content.bottom > content.top {
-            let page_ref = doc
-                .len()
-                .checked_sub(1)
-                .and_then(|last| doc.page(page.min(last)));
-            if let Some(page_ref) = page_ref {
-                let (s, ox, oy, pw, ph) = page_transform(content, doc.page_w, doc.page_h);
-                let page_rect = RECT {
-                    left: ox,
-                    top: oy,
-                    right: ox + pw,
-                    bottom: oy + ph,
-                };
-                // 白纸
-                let white = CreateSolidBrush(COLORREF(0x00FF_FFFF));
-                FillRect(hdc, &page_rect, white);
-                let _ = DeleteObject(white.into());
-
-                // 页面内容裁到页面矩形内（页眉/页脚/图片都不会越出纸面）。
-                let saved = SaveDC(hdc);
-                IntersectClipRect(
-                    hdc,
-                    page_rect.left,
-                    page_rect.top,
-                    page_rect.right,
-                    page_rect.bottom,
-                );
-                FONTS.with(|cell| {
-                    let mut set = cell.borrow_mut();
-                    draw_lines_free(hdc, &mut set, &page_ref.header, ox, oy, s);
-                    for block in &page_ref.blocks {
-                        draw_block(hdc, &mut set, block, doc, ox, oy, s);
+            let g = docx_flow_geom(doc.page_w, doc.page_h, doc.len(), content);
+            let max_view = (g.total - g.view).max(0);
+            let vy = view_y.clamp(0, max_view);
+            let page_left = content.left + g.pad;
+            // 页面栈整体裁到内容区，页面滚出视口的部分不会被画到顶栏/滚动条上。
+            let saved = SaveDC(hdc);
+            IntersectClipRect(
+                hdc,
+                content.left,
+                content.top,
+                content.right,
+                content.bottom,
+            );
+            let white = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+            FONTS.with(|cell| {
+                let mut set = cell.borrow_mut();
+                for i in 0..doc.len() {
+                    let Some(page_ref) = doc.page(i) else {
+                        continue;
+                    };
+                    let top = content.top + g.pad + (i as i32) * (g.ph + g.gap) - vy;
+                    let bot = top + g.ph;
+                    if bot <= content.top || top >= content.bottom {
+                        continue;
                     }
-                    draw_lines_free(hdc, &mut set, &page_ref.footer, ox, oy, s);
-                });
-                if saved != 0 {
-                    let _ = RestoreDC(hdc, saved);
+                    painted += 1;
+                    let page_rect = RECT {
+                        left: page_left,
+                        top,
+                        right: page_left + g.pw,
+                        bottom: bot,
+                    };
+                    // 白纸
+                    FillRect(hdc, &page_rect, white);
+                    // 页面内容裁到页面矩形内（页眉/页脚/图片都不会越出纸面）。
+                    let s2 = SaveDC(hdc);
+                    IntersectClipRect(
+                        hdc,
+                        page_rect.left,
+                        page_rect.top,
+                        page_rect.right,
+                        page_rect.bottom,
+                    );
+                    draw_lines_free(hdc, &mut set, &page_ref.header, page_left, top, g.s);
+                    for block in &page_ref.blocks {
+                        draw_block(hdc, &mut set, block, doc, page_left, top, g.s);
+                    }
+                    draw_lines_free(hdc, &mut set, &page_ref.footer, page_left, top, g.s);
+                    if s2 != 0 {
+                        let _ = RestoreDC(hdc, s2);
+                    }
+                    // 纸张边框（1px 灰线）。
+                    let border = CreateSolidBrush(COLORREF(PAGE_BORDER_RGB));
+                    let _ = FrameRect(hdc, &page_rect, border);
+                    let _ = DeleteObject(border.into());
                 }
-
-                // 纸张边框（画在裁剪之外，1px 灰线）。
-                let border = CreateSolidBrush(COLORREF(PAGE_BORDER_RGB));
-                let _ = FrameRect(hdc, &page_rect, border);
-                let _ = DeleteObject(border.into());
+            });
+            let _ = DeleteObject(white.into());
+            if saved != 0 {
+                let _ = RestoreDC(hdc, saved);
             }
+        }
+
+        // 悬停提示（hint）/一次性提示（toast）是顶栏"下方、压在内容区上"的浮层，
+        // 由 `paint_chrome` 画在内容之前；连续滚动的白纸会把它们盖住（用户实测"浮层沉底被挡"）。
+        // 这里在内容画完之后把顶栏浮层补画一遍（标题/页码/按钮重复画一次无副作用）。
+        if let Some(spec) = chrome {
+            let _ = paint_chrome(hdc, rc, spec);
         }
 
         if let Some(buffer) = &buffer {
@@ -618,23 +706,13 @@ pub fn paint_page(
             let (g, u) = gui_resources();
             qlr_core::log_debug!(
                 SCOPE,
-                "PAINT page={}/{} edit={} gdi={g} user={u} {:.2}ms",
-                page + 1,
+                "PAINT docx view_y={view_y} painted={painted}/{} gdi={g} user={u} {:.2}ms",
                 doc.len(),
-                page_ref_is_editing(doc, page),
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
         release_docx_buffer(buffer.take());
         let _ = EndPaint(hwnd, &ps);
-    }
-}
-
-/// 仅用于日志：当前页是否为空（占位诊断用，返回布尔转成 0/1）。
-fn page_ref_is_editing(doc: &DocDoc, page: usize) -> usize {
-    match doc.page(page) {
-        Some(p) => p.blocks.len(),
-        None => 0,
     }
 }
 
@@ -651,23 +729,25 @@ mod tests {
     }
 
     #[test]
-    fn page_transform_fits_inside_content_and_centers() {
+    fn docx_flow_geom_fits_width_and_stacks() {
         let content = RECT {
             left: 100,
             top: 50,
             right: 800,
             bottom: 950,
         };
-        // A4 页在 96 DPI 下：按高度适配。
-        let (s, ox, oy, pw, ph) = page_transform(content, 794, 1123);
-        assert!(s > 0.0);
-        assert!(pw <= 700, "页宽 {pw} 超过内容宽 700");
-        assert!(ph <= 900, "页高 {ph} 超过内容高 900");
-        // 居中：左右、上下留白大致相等。
-        assert!(ox >= content.left && oy >= content.top);
-        let left_gap = ox - content.left;
-        let right_gap = content.right - (ox + pw);
-        assert!((left_gap - right_gap).abs() <= 2);
+        // A4 页，3 页纵向堆叠。
+        let g = docx_flow_geom(794, 1123, 3, content);
+        // 单页宽度 = 内容宽 - 左右各 8px padding。
+        assert_eq!(g.pw, 700 - 2 * dpi::px(8));
+        assert!(g.s > 0.0 && g.ph > 0);
+        // 3 页总高明显超过一屏 → 可以连续纵向滚动。
+        assert!(
+            g.total > g.view,
+            "3 页总高应超过视口：total={} view={}",
+            g.total,
+            g.view
+        );
     }
 
     #[test]
@@ -675,5 +755,50 @@ mod tests {
         assert_eq!(scale_px(0, 100, 1.0), 100);
         assert_eq!(scale_px(50, 100, 2.0), 200);
         assert_eq!(scale_px(10, 0, 0.5), 5);
+    }
+
+    #[test]
+    fn docx_flow_tracks_visible_pages() {
+        use qlr_core::docx::{Block, DocDoc, HAlign, Line, Page, Para, Rect, Run};
+        let mk = |t: &str| Page {
+            blocks: vec![Block::Para(Para {
+                rect: Rect::new(64, 64, 666, 40),
+                align: HAlign::Left,
+                lines: vec![Line {
+                    rect: Rect::new(64, 64, 666, 40),
+                    runs: vec![Run {
+                        text: t.to_string(),
+                        size_dpt: 200,
+                        ..Run::default()
+                    }],
+                }],
+                space_before: 0,
+                space_after: 0,
+            })],
+            header: vec![],
+            footer: vec![],
+        };
+        let doc = DocDoc {
+            pages: vec![mk("page1"), mk("page2"), mk("page3")],
+            page_w: 794,
+            page_h: 1123,
+            ..Default::default()
+        };
+        let content = RECT {
+            left: 100,
+            top: 50,
+            right: 800,
+            bottom: 450,
+        };
+        let f0 = docx_flow(&doc, content, 0);
+        assert_eq!(f0.first_page, 0);
+        assert_eq!(f0.top_page, 0);
+        assert!(f0.total_h > f0.view_h, "3 页应超过一屏");
+        let off1 = docx_page_offset(&doc, content, 1);
+        let off2 = docx_page_offset(&doc, content, 2);
+        assert!(off1 > 0 && off2 > off1, "页偏移应递增：{off1} {off2}");
+        let f1 = docx_flow(&doc, content, off1);
+        assert_eq!(f1.top_page, 1, "滚到第二页顶部时 top_page 应为 1");
+        assert!(f1.first_page >= 1, "第一页应已离开视口");
     }
 }
