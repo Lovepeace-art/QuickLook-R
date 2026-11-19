@@ -1,5 +1,11 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-19 · **Markdown 目录栏"空白太大"根因修复 1.15.3**：真正的 bug 不是宽度参数，而是**绘制层把 `layout.toc`（已算好的面板矩形）又传回 `paint_toc`/`paint_toc_dc`，函数内部再调一次 `toc_rect` 二次收缩**——于是"预留宽度"和"实际画出的面板宽度"不一致：宽窗口下预留 30% 但只画出更窄的一块，中间就是那道空白（也解释了上一版"看着过窄/截断"，其实是二次收缩）。修法：①`chrome` 的 `paint_toc_dc`/`paint_toc` 改为传 `layout.below_chrome`（原始区域），让绘制与 `layout` 用**同一次** `toc_width_for` 求解，宽度严格一致；②`toc_width_for` 区间收紧为「约 22% 窗口宽、196..228px（`dpi::px`）」，贴着常见标题宽度、不再留大片空白。回归 `cargo test`（app 76 / platform 53）全绿、`clippy -D warnings`/`fmt --check` 干净。
+>
+
+> 更新时间：2026-11-19 · **Markdown 目录栏宽度修复 1.15.2**：用户反馈「带目录窗口的目录栏宽度定死过窄、标题被截断」。根因：上一版 `toc_width_for(area_width)=clamp(area*30%, 120, toc_width=200)` 把**上限钉死在 200px**，宽窗口下目录永远只有 200、长标题被 `…` 截断。改为**约 30% 窗口宽、下限 180、上限 360**（均 `dpi::px` 换算），宽窗口目录跟着变宽、不再定死；窄窗口仍有 180 底宽保证标题可读；`layout` 与 `toc_rect` 用同一 `toc_width_for`，正文起点与目录右边严格对齐。回归 `cargo test`（app 76 / platform 53）全绿、`clippy -D warnings`/`fmt --check` 干净。
+>
+
 > 更新时间：2026-11-19 · **连续滚动两处手感修复 1.15.1**：①**滚轮方向反了**——`qlr-app::input::flow_scroll_by` 原 `flow_y += notches*120`，而 `notches>0` 是滚轮往上（应“看上面的内容”），改为 `flow_y -= notches*120`，与文本/表格方向一致。②**顶栏悬停提示被内容遮挡**（“浮层沉底被挡”）——hint/toast 由 `paint_chrome` 画在顶栏下方、压在内容区上，连续滚动的白纸在其后绘制把它盖住；改为在 `qlr-platform::window::docx::paint_page` 与 `pptx::draw_slides_flow` **画完内容之后、BitBlt 之前**再 `paint_chrome` 补画一遍顶栏，使提示浮在内容之上。回归 `cargo test`（platform 53 / app 76）全绿、`clippy -D warnings`/`fmt --check` 干净。
 >
 

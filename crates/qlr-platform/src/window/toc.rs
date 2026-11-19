@@ -9,12 +9,17 @@ pub fn toc_width() -> i32 {
     dpi::px(200)
 }
 
-/// 目录栏目标宽度（随窗口宽度自适应）：窗口越窄目录越窄，避免小窗口被固定 200px
-/// 目录把正文挤扁；下限 120px，上限仍是 [`toc_width`]。
+/// 目录栏目标宽度（随窗口宽度微调）：比历史 200px 略宽、能放全常见标题；
+/// 上限也收窄，避免宽窗口下目录栏出现大片空白。
+///
+/// 说明：上一版 30%/360 太宽（用户反馈"空白太大"），且绘图层把已算好的矩形又
+/// 套了一次 `toc_rect` 导致二次收缩、与 `layout` 预留宽度不一致（那道空白的主因）。
+/// 绘制已改为直接按 `below_chrome` 求解一次，这里再取一个紧凑区间即可：
+/// 约 22% 窗口宽，夹在 196..228px（`dpi::px` 换算）。
 pub fn toc_width_for(area_width: i32) -> i32 {
-    let base = toc_width();
-    let floor = dpi::px(120).min(base);
-    (area_width * 3 / 10).clamp(floor, base)
+    let floor = dpi::px(196);
+    let cap = dpi::px(228);
+    (area_width * 22 / 100).clamp(floor.min(area_width.max(1)), cap)
 }
 
 pub fn toc_row_height() -> i32 {

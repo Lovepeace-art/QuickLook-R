@@ -1106,7 +1106,7 @@ pub(crate) fn toc_following(items: &[(u8, String, usize)], scroll: usize) -> Opt
 /// 所以必须在正文绘制**之后**调用，否则会被正文的 `FillRect` 盖掉。
 /// 把目录栏与滚动条画到**给定 DC** 上（1.5.2：和正文共用内存 DC，整窗一次上屏）。
 pub(crate) fn paint_overlays_dc(hdc: HDC, layout: &Frame, content: RECT) {
-    if let Some(toc) = layout.toc {
+    if layout.toc.is_some() {
         let (items, hovered, scroll) = with_state(|s| (s.toc.clone(), s.toc_active, s.scroll))
             .unwrap_or_else(|| (Vec::new(), None, 0));
         let refs: Vec<window::TocItem<'_>> = items
@@ -1118,7 +1118,7 @@ pub(crate) fn paint_overlays_dc(hdc: HDC, layout: &Frame, content: RECT) {
             .collect();
         let selected = hovered.or_else(|| toc_following(&items, scroll));
         let first_toc = with_state(|s| s.toc_scroll).unwrap_or(0);
-        window::paint_toc_dc(hdc, toc, &refs, selected, first_toc);
+        window::paint_toc_dc(hdc, layout.below_chrome, &refs, selected, first_toc);
     }
     if layout.bar.is_some()
         && let Some(info) = scroll_info()
@@ -1135,7 +1135,7 @@ pub(crate) fn paint_overlays_dc(hdc: HDC, layout: &Frame, content: RECT) {
 }
 
 pub(crate) fn paint_overlays(hwnd: HWND, layout: &Frame) {
-    if let Some(toc) = layout.toc {
+    if layout.toc.is_some() {
         let (items, hovered, scroll) =
             with_state(|s| (s.toc.clone(), s.toc_active, s.scroll)).unwrap_or_default();
         // 悬停优先，否则跟着当前滚动位置高亮（像阅读器那样，滚到哪里目录指到哪里）。
@@ -1148,7 +1148,7 @@ pub(crate) fn paint_overlays(hwnd: HWND, layout: &Frame) {
                 text: text.as_str(),
             })
             .collect();
-        window::paint_toc(hwnd, toc, &refs, selected, first_toc);
+        window::paint_toc(hwnd, layout.below_chrome, &refs, selected, first_toc);
     }
     if layout.bar.is_some()
         && let Some(info) = scroll_info()

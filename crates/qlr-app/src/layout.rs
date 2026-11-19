@@ -315,8 +315,11 @@ mod tests {
             opts(format::Kind::Markdown, None, 1.0, true, Bar::Yes),
         );
         let toc = l.toc.expect("够宽就该有目录");
-        assert_eq!(l.content.left, l.below_chrome.left + window::toc_width());
-        assert_eq!(toc.right, l.below_chrome.left + window::toc_width());
+        // 目录宽度现在随窗口自适应（约 30%，180..360），不再是固定 `toc_width()`。
+        let tw = window::toc_width_for(l.below_chrome.right - l.below_chrome.left);
+        assert!(tw >= window::toc_width(), "宽窗口下目录应不窄于历史 200px");
+        assert_eq!(l.content.left, l.below_chrome.left + tw);
+        assert_eq!(toc.right, l.below_chrome.left + tw);
         assert_eq!(toc.right, l.content.left);
         // 滚动条在最右边，且不压目录。
         assert_eq!(

@@ -1,6 +1,6 @@
 # QLRust
 
-**用 Rust 原生重写quicklook，单进程、无外部运行时依赖、主程序 2.3 MB。**
+**用 Rust 原生重写quicklook，单进程、无外部运行时依赖、主程序约 3 MB。**
 
 
 ## 支持的格式
@@ -43,8 +43,8 @@
 | 字体预览 | 不支持 | **支持（DirectWrite 样本页）** |
 | 视频声音 | 无 | **有** |
 | 表格 xlsx（本机实测） | **内置原生渲染，不需要装 Office**（23,167 格的真实表：解析 17.6 ms、首帧 23 ms、宿主 +6 MB） | 未装 `OfficeViewer-Native` → 打不开 |
-| 文档 docx（本机实测） | **内置原生分页渲染，不需要装 Office**（47 页报告：解析 8–10 ms、峰值常驻 ~11 MB；中文合同 1–2 ms / 8.7 MB） | 未装 `OfficeViewer-Native` → 打不开 |
-| 演示文稿 pptx（本机实测） | **内置原生分页渲染，不需要装 Office**（31 页提案：解析 8 ms；62 MB 演示 37 ms；峰值常驻 ~8–12 MB） | 未装 `OfficeViewer-Native` → 打不开 |
+| 文档 docx（本机实测） | **内置原生分页 + 连续纵向滚动，不需要装 Office**（47 页报告：解析 8–10 ms、峰值常驻 ~11 MB；中文合同 1–2 ms / 8.7 MB；图片重文档懒解码后 1 ms / 6.7 MB，旧 430–440 ms / 36 MB） | 未装 `OfficeViewer-Native` → 打不开 |
+| 演示文稿 pptx（本机实测） | **内置原生分页 + 连续纵向滚动 + 原生图表自绘，不需要装 Office**（31 页提案：解析 8 ms；62 MB 演示 37 ms 且 3 个图表可显示；峰值常驻 ~8–13 MB） | 未装 `OfficeViewer-Native` → 打不开 |
 | 压缩包 | **内置目录树，129 ms** | 插件列表，488 ms |
 
 完整数据、逐夹具明细与测量口径：[docs/dev/COMPARE-live-1.8.3-fix.md](docs/dev/COMPARE-live-1.8.3-fix.md)（上一版：[COMPARE-live-1.8.2.md](docs/dev/COMPARE-live-1.8.2.md)）。
@@ -53,9 +53,23 @@
 > 标 ¹ 的「热切换 / 空闲资源」沿用 1.8.2–1.8.3 口径，未随本次复测；「18 夹具内存均值」比 1.8.3 略高（34.5→37.5 MB）是因为本轮把 Office 三件也走系统预览处理器一起量了，不是回退。
 > 原版的「首帧稳定」对文本/PDF/HTML/Office 类不可比（WPF 光标闪烁、WebView2 动画导致 8 s 内拿不到 3 帧一致），故主口径用「窗口出现 + 内存 + 覆盖」。
 
+### 各格式原生渲染实测（1.15.3，本机）
+
+| 文件 | 解析 | 峰值常驻 | 说明 |
+| --- | ---: | ---: | --- |
+| xlsx 真实月报（23,167 格） | 17.6 ms | 宿主 +6 MB | 逐格网格，冻结窗格 |
+| xlsx 大表（160,008 格） | 104.5 ms | — | 同上，40 万格上限 |
+| docx 47 页报告 | 8–10 ms | ~11 MB | 原生分页 / 连续纵向滚动 |
+| docx 中文合同 | 1–2 ms | 8.7 MB | |
+| docx 图片重（懒解码） | 1 ms | 6.7 MB | 旧「解析即全量解码」430–440 ms / 36 MB |
+| pptx 31 页提案 | 8 ms | ~10 MB | 原生分页 / 连续滚动 / 图表自绘 |
+| pptx 62 MB 演示（3 个原生图表） | 37 ms | ~13 MB | 图表按矢量自绘，非截图 |
+
+> xlsx / docx / pptx 全部为**内置原生渲染，不需要装 Office**。docx / pptx 的连续纵向滚动是整页纵向连读，滚动时只重画可见的 1–3 页，**内存与翻页式持平**（模型本就在内存，不缓存整页位图）。图片改为**按页懒解码**：打开时只读元数据，当前页首次绘制时才解码并缓存，图片重的文档峰值常驻从 36 MB 降到 6.7 MB。
+
 ## 安装
 
-**绿色版（推荐）**：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-1.12.0-win64.zip`，解压到任意目录，双击 `qlrust.exe` 即可。目录里有 `portable.lock` 时数据（配置/日志）写在同目录 `UserData\`，不碰注册表。
+**绿色版（推荐）**：从 [Releases](https://github.com/Lovepeace-art/QuickLook-R/releases) 下载 `qlrust-1.15.3-win64.zip`，解压到任意目录，双击 `qlrust.exe` 即可。目录里有 `portable.lock` 时数据（配置/日志）写在同目录 `UserData\`，不碰注册表。
 
 **安装版**（免管理员，装到 `%LOCALAPPDATA%\Programs\QLRust` 并注册"打开方式"）：
 
@@ -82,3 +96,7 @@ pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"   # 卸载�
 **GPL-3.0-or-later**，全文见 [LICENSE](LICENSE)，来源与第三方组件说明见 [NOTICE.md](NOTICE.md)。
 
 与上游 QuickLook 同许可：本项目为**独立重写**（代码不从上游拷贝），但行为契约（快捷键、便携目录布局、插件语义、系统预览处理器的接入方式）大量参考上游，按衍生作品对待。
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

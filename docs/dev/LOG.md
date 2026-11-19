@@ -3634,3 +3634,33 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 - 滚动几何/离屏像素单测（draw_slides_flow_scroll_changes_content 等）仍通过；方向由 low_scroll_by 符号修正保证。
 
 > 局限：同 1.15.0。
+
+---
+
+## 2026-11-19 · 1.15.2：Markdown 目录栏宽度修复
+
+### 做了什么
+- qlr-platform::window::toc 的 	oc_width_for(area_width) 由「30% 窗口宽、夹在 120..200px」改为「约 30% 窗口宽、夹在 180..360px（dpi::px 换算）」。旧版上限钉死在 	oc_width()=200px，宽窗口下目录永远 200、长标题被截断（用户："宽度定死过窄了"）。	oc_rect 与 qlr-app::layout 都走同一 	oc_width_for，正文左边界与目录右边严格一致。
+
+### 为什么
+上一次「目录随窗口缩放」的修复把上限设成了固定 200，等于把宽度重新钉死。改为真正随窗口宽度增长、并给合理的下限/上限。
+
+### 怎么验证
+- cargo test -p qlr-app layout::（含更新后的 	oc_shifts_content_right_of_the_panel：断言 	w >= toc_width() 且 content.left == below.left + tw）全绿；cargo test -p qlr-app 76 / -p qlr-platform --lib 53 全绿；clippy -D warnings、mt --check 干净。
+
+> 局限：宽度按窗口比例 + 上下限估算，不按最长的目录条目自适应（不做测量排版）。
+
+---
+
+## 2026-11-19 · 1.15.3：Markdown 目录栏"空白太大"根因修复
+
+### 做了什么
+- 根因：paint_toc_dc/paint_toc 收到的是 layout.toc（已算好的面板矩形），但函数内部**又调用一次 	oc_rect(area)**，把宽度再按 	oc_width_for 收缩一次。结果"预留宽度"（layout 用一次 	oc_width_for）与"实际画出的面板宽度"（再算一次）不一致：宽窗口下预留宽、画出窄，中间留下一道空白（此前的"过窄/截断/空白"三种表现都是它）。
+- 修法：qlr-app::chrome 的 paint_toc_dc/paint_toc 改为传 layout.below_chrome（原始区域），绘制与 layout 用同一次 	oc_width_for 求解，宽度严格一致。
+- 	oc_width_for 收紧为「约 22% 窗口宽，196..228px（dpi::px）」：贴常见标题宽度，宽窗口不再大片空白。
+
+### 怎么验证
+- cargo test：app 76 / platform 53 全绿；clippy -D warnings、mt --check 干净。
+- 目录绘制宽度现在 == layout 预留宽度（同一区域、同一函数），不再二次收缩。
+
+> 局限：仍是按窗口比例估算的紧凑区间，不逐一按最长标题测量。
