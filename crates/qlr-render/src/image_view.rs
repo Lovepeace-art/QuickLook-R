@@ -16,9 +16,12 @@ use std::sync::Arc;
 
 use image::imageops::FilterType;
 
-/// 整图解码的像素上限：TIFF/GIF/BMP 等走 `render_via_image` 会整图解码，
-/// 而头部声明的尺寸不可信，超过这个量级直接拒绝（不再尝试分配）。
-const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+/// 整图解码的像素上限：TIFF/GIF/BMP/WebP 等走 `render_via_image` 会**整图**解码，
+/// 解码结果按 RGB(3B/px) 起算、缓存分支再 `to_rgba8`(4B/px)，瞬时峰值能到 ~7B/px。
+/// 100MP 时这种峰值可达 600–800MB，且发生在 `budget` 预留之前（整图解码前无法按画布计费）。
+/// 1.15.x 从 100MP 降到 50MP：峰值腰斩到 ~300–400MB，仍覆盖 8000×6000 量级大图；
+/// 常见的大图（JPEG）另有 DCT 缩放路径不会整图解码。头部声明的尺寸不可信，超过直接拒绝。
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
 use qlr_core::{Error, Result};
 
 use crate::canvas::{Bitmap, Canvas};

@@ -4,6 +4,24 @@
 
 use super::*;
 
+/// 文本重画时一行显示文字的所有权：来自折行缓存（`Arc<Vec<String>>` 里的一行，共享、零拷贝）
+/// 或需要尾部补省略号时的临时拥有串。1.15.x 优化：用共享代替逐行 `String::clone`。
+enum RowText {
+    /// 折行缓存里的第 `usize` 行（`Arc` 只涨引用计数，不复制文字）。
+    Shared(Arc<Vec<String>>, usize),
+    /// 需要改写（补 `…`）时单独拥有的串。
+    Owned(String),
+}
+
+impl RowText {
+    fn as_str(&self) -> &str {
+        match self {
+            RowText::Shared(rows, idx) => rows[*idx].as_str(),
+            RowText::Owned(s) => s.as_str(),
+        }
+    }
+}
+
 /// 内容画完之后再叠一层放大镜（必须在同一次 `WM_PAINT` 内、内容之后调用）。
 pub(crate) fn paint_lens_if_any(hwnd: HWND) {
     let Some(center) = with_state(|s| s.lens).flatten() else {
@@ -859,7 +877,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                 // 量不到（拿 DC 失败）就退回不折行 —— 宁可不折行也不能画错。
                 let measurer = window::Measurer::new(hwnd);
                 // 每行记 `(文本, 样式, 行号)`：折行产生的续行不带行号，只有源行首行带。
-                let mut body: Vec<(String, qlr_render::LineStyle, Option<u32>)> = Vec::new();
+                let mut body: Vec<(RowText, qlr_render::LineStyle, Option<u32>)> = Vec::new();
                 let mut consumed = 0usize;
                 // 折行阶段也要计时：`SLOWPAINT` 只覆盖真正的绘制，
                 // "滚一下卡"很可能是折行里的 GDI 量宽，而不是 DrawText。
@@ -882,11 +900,12 @@ pub(crate) fn repaint(hwnd: HWND) {
                         let style_idx = style.as_index() as u8;
                         let budget = rows - body.len();
                         // 先问折行缓存：滚一格只有最后几行是新的，前 20 多行完全一样。
+                        // 命中直接拿到 `Arc<Vec<String>>`，显示时共享引用、不再逐行 String::clone。
                         let cached = with_state(|s| s.wrap_cache.get(i, style_idx)).flatten();
-                        let mut fresh: Vec<String> = Vec::new();
-                        let wrapped: &[String] = match &cached {
-                            Some(rows) => rows.as_slice(),
+                        let wrapped: Arc<Vec<String>> = match cached {
+                            Some(rows) => rows,
                             None => {
+                                let mut fresh: Vec<String> = Vec::new();
                                 let measure = |s: &str| {
                                     measured.set(measured.get() + 1);
                                     m.width_styled(to_text_style(style), s)
@@ -905,8 +924,9 @@ pub(crate) fn repaint(hwnd: HWND) {
                                 );
                                 // 单行的也存：短行只要一次量宽，但滚一格会有 20 多行重复，
                                 // 存下来等于把那 20 多次量宽全省掉（日志/代码类文档都吃这个）。
-                                with_state(|s| s.wrap_cache.put(i, style_idx, fresh.clone()));
-                                fresh.as_slice()
+                                // put 直接把 fresh 移进缓存并返回同一个 Arc，避免再 clone 一整条折行。
+                                with_state(|s| s.wrap_cache.put(i, style_idx, fresh))
+                                    .unwrap_or_default()
                             }
                         };
                         if wrapped.is_empty() {
@@ -914,12 +934,18 @@ pub(crate) fn repaint(hwnd: HWND) {
                         }
                         consumed += 1;
                         let take = budget.min(wrapped.len());
+                        let wrapped_len = wrapped.len();
                         for k in 0..take {
-                            let mut text = wrapped[k].clone();
                             // 没显示完（预算用完）：末尾补省略号，与旧的"边折边停"一个观感。
-                            if take < wrapped.len() && k + 1 == take {
-                                text.push('…');
-                            }
+                            // 只有这一行需要拥有串，其余行共享缓存里的文字（零拷贝）。
+                            let text = if take < wrapped_len && k + 1 == take {
+                                let mut s = String::with_capacity(wrapped[k].len() + 3);
+                                s.push_str(&wrapped[k]);
+                                s.push('…');
+                                RowText::Owned(s)
+                            } else {
+                                RowText::Shared(Arc::clone(&wrapped), k)
+                            };
                             let number = if plain_doc {
                                 None
                             } else if k == 0 {
@@ -939,7 +965,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                             .and_then(|all| all.get(i).copied())
                             .unwrap_or_default();
                         body.push((
-                            t.lines[i].clone(),
+                            RowText::Owned(t.lines[i].clone()),
                             style,
                             if plain_doc {
                                 None
@@ -1012,7 +1038,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                 for (text, style, number) in &body {
                     styled.push(window::StyledRow {
                         number: *number,
-                        text,
+                        text: text.as_str(),
                         style: to_text_style(*style),
                         bg: line_bg(*style),
                     });

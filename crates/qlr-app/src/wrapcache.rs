@@ -20,14 +20,21 @@ use std::sync::Arc;
 /// 每条最多 `wrap::MAX_ROWS_PER_LINE`（400）行文字的引用，实际占用是几十 KB 量级。
 pub const CAP: usize = 512;
 
-/// 一条折行结果：`(样式下标, 折出来的每一行)`。
-type Entry = (u8, Arc<Vec<String>>);
+/// 一条折行结果：样式下标、折出来的每一行、以及最近一次被访问的逻辑时刻（做 LRU 淘汰用）。
+struct Entry {
+    style: u8,
+    rows: Arc<Vec<String>>,
+    /// 单调递增的"使用时刻"：`get` 命中或 `put` 覆盖时刷新，满了就淘汰它最小的一条。
+    used: u64,
+}
 
 /// 折行缓存。只在 UI 线程上用（`STATE` 里跟着 `State` 走）。
 #[derive(Default)]
 pub struct WrapCache {
     width: u32,
     entries: HashMap<usize, Entry>,
+    /// LRU 时钟：每访问/写入一条就 +1。
+    tick: u64,
     hits: u64,
     misses: u64,
     doc: u64,
@@ -52,26 +59,47 @@ impl WrapCache {
 
     /// 取一条折行结果（`None` = 没缓存过）。
     pub fn get(&mut self, line: usize, style: u8) -> Option<Arc<Vec<String>>> {
-        match self.entries.get(&line) {
-            Some((s, rows)) if *s == style => {
-                self.hits += 1;
-                Some(Arc::clone(rows))
-            }
-            _ => {
-                self.misses += 1;
-                None
-            }
+        // 命中就刷新它的使用时刻（LRU）；样式不符算未命中（保持历史统计口径）。
+        if let Some(e) = self.entries.get_mut(&line)
+            && e.style == style
+        {
+            self.tick += 1;
+            e.used = self.tick;
+            self.hits += 1;
+            return Some(Arc::clone(&e.rows));
         }
+        self.misses += 1;
+        None
     }
 
     /// 存一条折行结果（单行的也存：短行的量宽虽只要一次，但滚一格会有 20 多行重复）。
-    pub fn put(&mut self, line: usize, style: u8, rows: Vec<String>) {
+    ///
+    /// 返回写进缓存的那个 `Arc`，调用方拿去显示即可（1.15.x：免去再 clone 一整条折行）。
+    pub fn put(&mut self, line: usize, style: u8, rows: Vec<String>) -> Arc<Vec<String>> {
+        // 满了且是新行：淘汰**最久没用到**的一条（LRU），而不是整本清空——整本清空会让
+        // 大文档来回滚动时把刚用过的前 20 多行也一起丢掉，命中率当场塌方。
         if self.entries.len() >= CAP && !self.entries.contains_key(&line) {
-            // 简单策略：满了就整本清空。比起 LRU 链表，这里更看重"代码短、没状态"
-            // ——缓存本身只值几毫秒，维护顺序的复杂度不值。
-            self.entries.clear();
+            if let Some(lru) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&lru);
+            }
         }
-        self.entries.insert(line, (style, Arc::new(rows)));
+        self.tick += 1;
+        let used = self.tick;
+        let rows = Arc::new(rows);
+        self.entries.insert(
+            line,
+            Entry {
+                style,
+                rows: Arc::clone(&rows),
+                used,
+            },
+        );
+        rows
     }
 
     /// `(命中, 未命中, 条目数, 内容代际)`：日志用。
@@ -128,5 +156,20 @@ mod tests {
             "缓存条目 {} 超过上限 {CAP}",
             c.stats().2
         );
+    }
+
+    #[test]
+    fn eviction_is_lru_not_whole_wipe() {
+        let mut c = WrapCache::default();
+        for i in 0..CAP {
+            c.put(i, 0, vec!["x".into()]);
+        }
+        // 让 0 成为"最近使用"，1 成为"最久未用"。
+        assert!(c.get(0, 0).is_some());
+        // 再塞一条新行：应只淘汰最久未用的 1，而不是整本清空。
+        c.put(CAP, 0, vec!["y".into()]);
+        assert!(c.get(0, 0).is_some(), "最近用过的行应保留");
+        assert!(c.get(1, 0).is_none(), "最久未用的行应被淘汰");
+        assert_eq!(c.stats().2, CAP, "LRU 逐条淘汰后仍恰好占满 CAP");
     }
 }

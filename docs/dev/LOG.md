@@ -3667,7 +3667,7 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 
 ---
 
-## 2026-11-21 · 图片白边方案B + 表格打开默认自适应列宽行高（未发版）
+## 2026-11-21 · 图片白边方案B + 表格打开默认自适应列宽行高（1.15.4）
 
 ### 做了什么
 
@@ -3702,3 +3702,83 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 
 - 图片方案B 在高 DPI 屏上窗口物理偏小（用户已知并接受）；>100% 初始缩放被忽略（要看更大用滚轮）。
 - 表格自适应单列上限 160px、单行上限 90px、测量格数上限 60000（超大表跳过部分测量、保留原宽）；不按合并单元格内容撑宽（合并被跳过）；第 0 行表头不自动加高（避免长表头把表头行撑得很高）。
+
+---
+
+## 2026-11-21 · 表格自适应移出 UI 线程 + 极小图最小可读窗（1.15.4）
+
+### 做了什么
+
+- **表格自适应（`sheet_autofit`）从 UI 线程移出 + 记忆化**
+  - 新增 `qlr-app::app::render::cached_sheet_fit(&Sheet) -> SheetFit`：按「表内容 + 字体度量（`dpi::cpx(1000)`）」的 FNV-1a 指纹缓存（`SHEET_FIT_CACHE`，LRU 8 条）。命中直接返回、成本≈哈希；未命中才调平台层 `window::sheet_autofit`。
+  - `request_render`（UI 线程）顶部记录 `PREVIEW_DPI = dpi::current()`（新全局 `AtomicU32`）；渲染 worker 在交活（`RESULT.push`）**之前**，对 `Ok(Canvas::Sheet(doc))` 先 `dpi::seed_thread(PREVIEW_DPI)` 再 `cached_sheet_fit` **预热**。于是 2.3 万格 ~120ms 的 GDI 量测发生在渲染线程，UI 上屏时只命中缓存（≈0）。
+  - `apply_sheet_autofit` 改为调 `cached_sheet_fit`（命中→克隆；未命中→UI 内联计算 = 旧行为，正确性不回归）。DPI/内容缩放变化 → 指纹变 → 重新计算，不会错用旧结果。
+- **图片极小图最小可读窗保护（`natural_rect_raw`）**
+  - `qlr-platform::window::natural_rect_raw` 恢复最小可读尺寸：仍按图片**物理像素 1:1**、不 `dpi::px` 放大，但极小图按 `min_scale = max(240/cw,160/ch)` **等比放大到短边最小可读窗**（并受工作区 `fit` 约束，极端长宽比不会顶出屏幕）。客户区仍保持图片宽高比 → `paint_bitmap_at(fill=true)` 铺满、不露白边。
+
+### 为什么
+
+- 表格 autofit 在 `on_render_done`（UI 线程）同步跑 GDI 量测：2.3 万格 ~120ms、6 万格 ~300ms，且发生在首帧 `invalidate` 之前、每次松手 resize 重跑 → 打开/缩放明显卡顿。移出线程 + 记忆化后 UI 只做一次哈希。
+- 方案B（图片客户区=像素 1:1）的副作用：16×16 图标等极小图会开成点不着的针眼窗口、极端长宽比成条状。加最小可读窗兜底。
+
+### 怎么验证
+
+- `cargo fmt --all -- --check` 零输出；`cargo clippy --workspace --all-targets -- -D warnings` EXIT 0；`cargo test --workspace` 全绿（app 79 / core 78 / platform 53 / render 169 等）。
+- 缓存实测（临时单测，96dpi、字体已热）：`real-monthly.xlsx`（97×353，23,167 格）首次 `cached_sheet_fit` **138ms** → 二次缓存命中 **0.45ms**；`big-20k.xlsx`（160,008 格，截 6 万）首次 **350ms** → 命中 **3.2ms**（即 UI 线程成本：小表 ~0.5ms、大表 ~3ms 的指纹哈希，相较原来的 120–350ms）。
+- 新增单测 `image_tiny_gets_min_readable_window_preserving_aspect`（100×80 → 内容 240×192、保持 100:80 比例）；原 `image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump` 改用 1280×720 断言 1:1、并改名 `image_window_is_one_to_one_pixels_no_dpi_scale`。
+
+### 局限
+
+- 缓存指纹对超大表（16 万格）哈希约 3ms，仍远小于 GDI 量测；将来要更快可只哈希可见区。
+- 极小图被等比放大后按位图拉伸（会略糊），这是「最小可读窗」与「严格 1:1」之间按用户意见取的折中；滚轮仍可自由缩放。
+
+---
+
+## 2026-11-22 · 文本重画零拷贝 + 折行缓存 LRU + 图片解码上限 50MP + PDF metadata 去重（1.15.4）
+
+### 做了什么
+
+- **文本重画去掉逐行 `String::clone`（P1，`crates/qlr-app/src/app/chrome.rs`）**：折行缓存值改为 `Arc<Vec<String>>`；新增模块级 `enum RowText { Shared(Arc<Vec<String>>, usize), Owned(String) }`（`as_str()` 借出 `&str`），`body` 元素类型改 `(RowText, qlr_render::LineStyle, Option<u32>)`。命中行用 `RowText::Shared(Arc::clone(&wrapped), k)` 零拷贝，仅"预算截断补省略号"那一行 `RowText::Owned`，无 measurer 分支才 `Owned(t.lines[i].clone())`。每帧不再逐行克隆、未命中时也不再整条折行克隆。
+- **折行缓存改 LRU 逐条淘汰（P4，`crates/qlr-app/src/wrapcache.rs`）**：`Entry{style,rows:Arc<Vec<String>>,used:u64}`，新增 `tick`；`get` 命中刷新 `used`；`put` 返回 `Arc<Vec<String>>`，满 `CAP=512` 且新 key 时用 `min_by_key(used)` 淘汰单条最久未用（原来是 `entries.clear()` 整本清空，超大文档会反复重排）。新增单测 `eviction_is_lru_not_whole_wipe`。
+- **图片整图解码上限 100MP → 50MP（M1，`crates/qlr-render/src/image_view.rs`）**：`MAX_IMAGE_PIXELS = 50_000_000`。注释说明整图解码约 7B/px、100MP 峰值 600–800MB 且发生在 `budget` 计量之前，50MP 腰斩到 300–400MB。
+- **`request_render` metadata 去重（P3，`crates/qlr-app/src/app/render.rs`）**：顶部只取一次 `let stamp = file_stamp(path);`，删掉重复的 `let is_pdf`/第二次 `kind_for_path`；`PageKey::new(...,stamp)` 两处复用；frame key 改用新 `pub(crate) fn frame_key_stamped(path,&stamp,page,w,h,upscale)`（`frame_key` 委托它、内部自取戳）。PDF 一次请求的 `fs::metadata` 从 3 次降为 1 次。
+
+### 为什么
+
+- 逐行 clone + 逐行加锁在长文档滚动时每帧都跑，属纯浪费；`Arc` 共享把每帧克隆降为一次引用计数。
+- `entries.clear()` 整本清空在超过 512 个折行 key 的大文档上会周期性地全量重折，LRU 只淘汰一条。
+- 100MP 整图解码早于 `budget` 记账，是内存峰值绕过 256MB 预算的缺口；50MP 覆盖主流大图（含 4K/8K 屏截图）同时把最坏峰值减半。
+- `file_stamp` 是 `fs::metadata` 系统调用，同一请求算 3 次无意义。
+
+### 怎么验证
+
+- `cargo fmt --all -- --check` 零输出；`cargo clippy --workspace --all-targets -- -D warnings` EXIT 0；`cargo build --release` 47.8s 通过。
+- 各 crate 单跑全绿：app **80 passed / 1 ignored**（含新增 `eviction_is_lru_not_whole_wipe`）、core 78、platform 53（4 ignored）、render 169（8 ignored，另 fuzz 1 / malformed 9）、plugin-api 4 / demo 7 / office 11。
+- **注意**：`cargo test --workspace` 并行跑时 `qlr-platform` 的 `crash::tests::minidump_of_ourselves_is_written`（`crash.rs:159`）偶发 FAILED，单跑必过——是既有的环境性 flake（本机另有用户自己的 `QuickLook` 常驻进程），与本次改动无关；建议 CI 该测串行或单独跑。另：若 `cargo test` 长时间无进展，先 `Get-Process` 清理残留 `cargo`/`qlr_platform-*.exe` 测试进程再跑。
+
+### 局限
+
+- 折行缓存仍是"按行索引"键，跨文档靠 `set_content` 清空，命中率依赖文档结构；LRU 只解决整本清空问题，不提升跨文件命中。
+- image_view 对 TIFF/WebP/GIF/BMP 仍是整图解码（仅 PNG>4MP 流式）；50MP 是护栏不是分块解码，极端单图仍可能几百 MB。
+- 文本重画仍每帧重建 `body` 向量（只省了字符串拷贝），可视行数量级的小分配保留。
+
+---
+
+## 2026-11-22 · 修复 1.15.4 回归：图片"缩放记忆"（窗口尺寸记忆）被方案B 早返回绕过（1.15.4 补丁）
+
+### 做了什么
+
+- **`crates/qlr-app/src/app/show.rs` `window_size_for`**：删掉 `Kind::Image` 那条在取 `remembered` 之前就 `return` 的早返回分支。改为：图片的 `base` 仍用 `window::natural_rect_raw`（保"客户区=真实像素 1:1、不 dpi 放大"的方案B 口径），但**不再提前返回**，而是继续走后面的 `remembered` 尺寸夹取与 `media_window_size` 比例锁定——于是"用户滚轮/右键拖出来的缩放大小"（经 `set_zoom_to` → `remember_size` 存进 `last_sizes`/`config.window_sizes` 的 `remembered`）在下次开同类图片时能照原样恢复。
+- 新增单测 `image_remembers_user_zoom_size`：无记忆 → 1:1（800×600+顶栏）；`remembered=(1600,1200+顶栏)` → 恢复 1600×1200+顶栏（不是退回 1:1）。原有的 `image_window_is_one_to_one_pixels_no_dpi_scale`、`image_tiny_gets_min_readable_window_preserving_aspect`、`image_large_scales_into_work_area_preserving_aspect` 全部保持通过（它们传 `remembered=None`，1:1/最小可读/大图 86% 口径不变）。
+
+### 为什么
+
+- 方案B（1.15.x）把图片改成"客户区=真实像素 1:1"时，为省事在 `window_size_for` 里对 `Kind::Image` 直接 `return` 了 `natural_rect_raw` 的结果，**跳过了函数后半段的"尺寸记忆（1.0.14）"与"比例锁定（1.8.1）"**。结果：用户把图放大到 2×、关掉再开，又退回 100% 真实尺寸——用户报"缩放与记忆模块失效"。把图片只当作"换成 `natural_rect_raw` 的 base"、仍走记忆/比例逻辑即可两全：默认 1:1 无白边（`paint_bitmap_at(fill=true)`），用户改过尺寸/缩放过则记忆生效。
+
+### 怎么验证
+
+- `cargo fmt --all -- --check` 零输出；`cargo clippy -p qlr-app --all-targets -- -D warnings` EXIT 0；`cargo test -p qlr-app` **81 passed / 1 ignored**（含新增 `image_remembers_user_zoom_size`）；四个 `image_*` 尺寸单测全绿。
+
+### 局限
+
+- 记忆是"按格式（`Image`）+ 落盘"的：一旦放大过某张图，之后（含下次启动）所有图片都按那个尺寸开（这是 1.0.14 既有语义，本次只是恢复它）；如要"按文件记"需另行设计。极小图若命中一个很大的 `remembered` 也会被放大（受 `media_window_size` 与工作区夹持，不会越界）。

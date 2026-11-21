@@ -42,12 +42,12 @@ fn window_size_scales_with_dpi() {
     assert!(pdf192.1 >= pdf96.1, "PDF 高度也不该变小");
 }
 
-/// 方案B（1.15.x）：图片客户区 = 图片真实像素 **1:1**，不按 DPI 放大、不抬最小窗。
+/// 方案B（1.15.x）：图片客户区 = 图片真实像素 **1:1**，不按 DPI 放大；正常尺寸不抬最小窗。
 ///
 /// 这是"某些图片预览有白边"的根因修复的自动断言：旧实现 `natural_rect_scaled` 会
 /// `dpi::px(图片像素)` ×1.5/×2 并抬到 240×160，客户区因此大于位图 → 绘制端居中留白。
 #[test]
-fn image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump() {
+fn image_window_is_one_to_one_pixels_no_dpi_scale() {
     let work = RECT {
         left: 0,
         top: 0,
@@ -55,7 +55,7 @@ fn image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump() {
         bottom: 2160,
     };
     let cfg = Config::default(); // image_zoom_percent 默认 100
-    let (w, h) = (100u32, 80u32);
+    let (w, h) = (1280u32, 720u32);
 
     dpi::seed_thread(96);
     let chrome96 = window::chrome_height();
@@ -65,19 +65,79 @@ fn image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump() {
     let (c192w, c192h) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, None);
     dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
 
-    assert_eq!(c96w, 100, "96dpi 宽应等于图片像素，实际 {c96w}");
-    assert_eq!(c192w, 100, "192dpi 宽不应被 DPI 放大，实际 {c192w}");
-    assert!(
-        c96w < 240 && c192w < 240,
-        "不应再有最小窗 240 抬升：{c96w}/{c192w}"
-    );
-    assert_eq!(c96h, 80 + chrome96, "96dpi 高应为 80+顶栏，实际 {c96h}");
+    assert_eq!(c96w, 1280, "96dpi 宽应等于图片像素，实际 {c96w}");
+    assert_eq!(c192w, 1280, "192dpi 宽不应被 DPI 放大，实际 {c192w}");
+    assert_eq!(c96h, 720 + chrome96, "96dpi 高应为 720+顶栏，实际 {c96h}");
     assert_eq!(
         c192h,
-        80 + chrome192,
-        "192dpi 高应为 80+顶栏(随 DPI)，实际 {c192h}"
+        720 + chrome192,
+        "192dpi 高应为 720+顶栏(随 DPI)，实际 {c192h}"
     );
     assert_eq!(chrome192, chrome96 * 2, "顶栏应随 DPI 翻倍");
+}
+
+/// 1.15.x 复评：极小的图不再开成点不着的针眼窗口——按比例抬到最小可读窗（短边按
+/// `MAX(240/宽,160/高)` 的系数放大），且客户区仍保持图片宽高比（绘制端 `fill=true`
+/// 铺满、不露白边）。
+#[test]
+fn image_tiny_gets_min_readable_window_preserving_aspect() {
+    let work = RECT {
+        left: 0,
+        top: 0,
+        right: 3840,
+        bottom: 2160,
+    };
+    let cfg = Config::default();
+    let (w, h) = (100u32, 80u32);
+
+    dpi::seed_thread(96);
+    let chrome = window::chrome_height();
+    let (cw, ch) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, None);
+    dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
+
+    // min_scale = max(240/100, 160/80) = 2.4 → 内容 240 × 192（保持 100:80 比例）。
+    assert_eq!(cw, 240, "小图应抬到最小可读宽 240，实际 {cw}");
+    assert_eq!(ch, 192 + chrome, "高应保持比例(192)+顶栏，实际 {ch}");
+    let ratio = (ch - chrome) as f32 / cw as f32;
+    assert!(
+        (ratio - 0.8).abs() < 0.02,
+        "小图抬升后应保持宽高比(0.8)，实际 {ratio}"
+    );
+}
+
+/// 1.15.4 回归：图片必须仍然遵守"窗口尺寸记忆"（缩放记忆）。
+///
+/// 方案 B 曾在 `window_size_for` 里对 `Kind::Image` 提前 `return`（客户区 = 1:1 真实像素），
+/// 把后面的 `remembered` 尺寸记忆整个绕掉了：用户滚轮把图放大到 2×、关掉再开，又退回
+/// 100% 真实尺寸。这里锁住"没有记忆 → 1:1；有记忆 → 恢复记忆尺寸（比例锁定）"。
+#[test]
+fn image_remembers_user_zoom_size() {
+    let work = RECT {
+        left: 0,
+        top: 0,
+        right: 3840,
+        bottom: 2160,
+    };
+    let cfg = Config::default();
+    dpi::seed_thread(96);
+    let chrome = window::chrome_height();
+    let (w, h) = (800u32, 600u32);
+
+    // 没有记忆：客户区 1:1（800×600），高度再加顶栏。
+    let (bw, bh) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, None);
+    assert_eq!(
+        (bw, bh),
+        (800, 600 + chrome),
+        "无记忆时应 1:1，实际 {bw}x{bh}"
+    );
+
+    // 记住一个 2× 的窗口（宽×高，含顶栏）：应原样恢复，而不是退回 1:1。
+    let remembered = Some((1600, 1200 + chrome));
+    let (rw, rh) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, remembered);
+    assert_eq!(rw, 1600, "应恢复记住的宽度 1600，实际 {rw}");
+    assert_eq!(rh, 1200 + chrome, "应恢复记住的高度 1200+顶栏，实际 {rh}");
+
+    dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
 }
 
 /// 大图仍等比缩进工作区（86%），且内容区保持图片宽高比——不越界、不变形。

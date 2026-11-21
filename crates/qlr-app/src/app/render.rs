@@ -427,6 +427,16 @@ pub(crate) fn spawn_render_worker(
                         continue;
                     }
                     end_lease(epoch, job.generation);
+                    // 表格自适应预热（1.15.x 优化）：把首帧的列宽/行高在渲染线程算好塞进缓存，
+                    // UI 线程上屏时直接命中——2.3 万格 ~120ms 的 GDI 量测绝不压到 UI 线程。
+                    // 先按本窗口 DPI 对齐字体度量，保证与 UI 线程上屏用的字体一致。
+                    if let Ok(Canvas::Sheet(doc)) = &result
+                        && let Some(sheet) = doc.sheet()
+                    {
+                        let d = PREVIEW_DPI.load(Ordering::Relaxed);
+                        dpi::seed_thread(if d == 0 { 96 } else { d });
+                        let _ = cached_sheet_fit(sheet);
+                    }
                     if let Some(slot) = RESULT.get()
                         && let Ok(mut guard) = slot.lock()
                     {
@@ -547,12 +557,18 @@ pub(crate) fn clamp_render_size(w: u32, h: u32) -> (u32, u32) {
 
 /// 投一个渲染任务，返回本次的代际号。
 pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
+    // 记下本窗口此刻的 DPI：渲染线程给表格算自适应列宽/行高时据此把字体度量对齐到 UI
+    // 线程（见 `cached_sheet_fit`），否则在 HiDPI 上渲染线程用默认 96 量出来会偏窄。
+    PREVIEW_DPI.store(dpi::current(), std::sync::atomic::Ordering::Relaxed);
     let (max_w, max_h) = clamp_render_size(max_w, max_h);
     let is_pdf = format::kind_for_path(path) == format::Kind::Pdf;
+    // 文件戳（mtime 秒 + 字节数）本次请求只取一次：`pagecache` / `frame_key` / `pending_key`
+    // 共用。旧实现这里对同一个文件做了 3 次 `fs::metadata`（PDF 时），一次请求 3 次系统调用。
+    let stamp = file_stamp(path);
     // 1.3.0：PDF 页缓存。翻回去看一眼是 PDF 最常见的动作，命中就别再麻烦渲染线程。
     // 注意代际也要 +1：否则先前那一帧算完回来会把刚上屏的这一页顶掉。
     if is_pdf {
-        let key = pagecache::PageKey::new(path, page, max_w, max_h, file_stamp(path));
+        let key = pagecache::PageKey::new(path, page, max_w, max_h, stamp);
         if let Some(canvas) = pagecache::get(&key) {
             let generation = with_state(|s| {
                 s.render_gen = s.render_gen.wrapping_add(1);
@@ -590,24 +606,17 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
     // 1.2.0：新请求发出去之前，先让**正在跑**的那个活自己退出（阶段边界检查点会看到），
     // 否则用户连按方向键时，工作线程要先把前面几个没人要的文件渲染完。
     qlr_render::cancel::cancel();
-    let is_pdf = format::kind_for_path(path) == format::Kind::Pdf;
     // 注意：`with_state` 是普通 `Mutex`，**嵌套调用会自己把自己锁死**（这里踩过：
     // 在闭包里又调 `with_state(|s| s.zoom > 1.0)`，进程卡在开窗那一步，日志只到"开窗尺寸"）。
     // 所以先把要用的值取出来，再进闭包。
     let upscale = with_state(|s| s.zoom > 1.0).unwrap_or(false);
-    let frame = frame_key(path, page, max_w, max_h, upscale);
+    let frame = frame_key_stamped(path, stamp, page, max_w, max_h, upscale);
     with_state(|s| {
         s.render_since = Some(Instant::now());
         s.render_warned = false;
         // PDF 这一帧算完回来要进页缓存，先把 key 记下来（非 PDF 不记）。
         s.pending_key = if is_pdf {
-            Some(pagecache::PageKey::new(
-                path,
-                page,
-                max_w,
-                max_h,
-                file_stamp(path),
-            ))
+            Some(pagecache::PageKey::new(path, page, max_w, max_h, stamp))
         } else {
             None
         };
@@ -623,7 +632,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
         max_width: max_w,
         max_height: max_h,
         page,
-        upscale: with_state(|s| s.zoom > 1.0).unwrap_or(false),
+        upscale,
         target,
     };
     // 1.8.3：登记租约（先登记再投递，顺序理由见 `begin_lease`）。
@@ -846,7 +855,27 @@ pub(crate) fn file_stamp(path: &Path) -> (u64, u64) {
     }
 }
 
-/// 组装一帧的 key。
+/// 用已取好的文件戳组装一帧的 key（避免重复 `fs::metadata`）。
+pub(crate) fn frame_key_stamped(
+    path: &Path,
+    stamp: (u64, u64),
+    page: usize,
+    width: u32,
+    height: u32,
+    upscale: bool,
+) -> FrameKey {
+    FrameKey {
+        path: path.to_path_buf(),
+        mtime: stamp.0,
+        size: stamp.1,
+        page,
+        width,
+        height,
+        upscale,
+    }
+}
+
+/// 组装一帧的 key（内部自取文件戳；要和别处共用戳时用 `frame_key_stamped`）。
 pub(crate) fn frame_key(
     path: &Path,
     page: usize,
@@ -854,16 +883,7 @@ pub(crate) fn frame_key(
     height: u32,
     upscale: bool,
 ) -> FrameKey {
-    let (mtime, size) = file_stamp(path);
-    FrameKey {
-        path: path.to_path_buf(),
-        mtime,
-        size,
-        page,
-        width,
-        height,
-        upscale,
-    }
+    frame_key_stamped(path, file_stamp(path), page, width, height, upscale)
 }
 
 /// 上一帧还在吗（且就是这个 key）？命中就把整帧交出去，调用方直接上屏、不用再渲染。
@@ -1050,15 +1070,88 @@ pub(crate) fn fits_render_box(canvas: &Canvas, width: u32, height: u32) -> bool 
     }
 }
 
+pub(crate) type SheetFit = (Vec<(u32, i32)>, Vec<(u32, i32)>);
+
+/// 最近一次请求渲染的那个窗口的 DPI。渲染线程据此把字体度量对齐到 UI 线程，
+/// 使「渲染线程预先算好的自适应结果」与「UI 线程上屏时用的字体」逐像素一致。
+pub(crate) static PREVIEW_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
+
+struct FitEntry {
+    key: u64,
+    fit: SheetFit,
+}
+
+/// 表格自适应结果缓存。
+///
+/// `sheet_autofit` 走 GDI（实测 2.3 万格约 120 ms、6 万格约 300 ms），但结果只由「表内容 +
+/// 字体度量(DPI/内容缩放)」决定、与窗口尺寸无关。因此按内容指纹缓存后：**resize 松手、
+/// 重开同一张表、切页回来全部命中（成本≈0）**。首帧那一次由渲染线程在交活前算好预热
+/// （见 `render::worker_loop`），UI 线程只做一次哈希 + 查表，绝不把 GDI 量测压到 UI 线程。
+static SHEET_FIT_CACHE: OnceLock<Mutex<std::collections::VecDeque<FitEntry>>> = OnceLock::new();
+const SHEET_FIT_CACHE_CAP: usize = 8;
+
+fn sheet_fit_cache() -> &'static Mutex<std::collections::VecDeque<FitEntry>> {
+    SHEET_FIT_CACHE.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn fnv1a(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// 内容指纹：`cols/rows/格数` + 每格 `(row,col,样式,字号,文本)` + 字体度量(`dpi::cpx(1000)`)。
+/// 只哈希数据、不做任何 GDI，量级远小于一次 `sheet_autofit`。
+fn sheet_fit_key(sheet: &qlr_core::sheet::Sheet) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a(&mut h, &sheet.cols.to_le_bytes());
+    fnv1a(&mut h, &sheet.rows.to_le_bytes());
+    fnv1a(&mut h, &(sheet.cells.len() as u64).to_le_bytes());
+    // 字体度量随 DPI / 内容缩放变化：混进指纹，换屏或调缩放后不会错用旧结果。
+    fnv1a(&mut h, &dpi::cpx(1000).to_le_bytes());
+    for c in &sheet.cells {
+        fnv1a(&mut h, &c.row.to_le_bytes());
+        fnv1a(&mut h, &c.col.to_le_bytes());
+        let flags =
+            (c.style.bold as u8) | ((c.style.italic as u8) << 1) | ((c.style.wrap as u8) << 2);
+        fnv1a(&mut h, &[flags]);
+        fnv1a(&mut h, &c.style.size_dpt.to_le_bytes());
+        fnv1a(&mut h, c.text.as_bytes());
+    }
+    h
+}
+
+/// 取（必要时计算并缓存）某张表的自适应结果。
+pub(crate) fn cached_sheet_fit(sheet: &qlr_core::sheet::Sheet) -> SheetFit {
+    let key = sheet_fit_key(sheet);
+    if let Ok(guard) = sheet_fit_cache().lock()
+        && let Some(e) = guard.iter().find(|e| e.key == key)
+    {
+        return e.fit.clone();
+    }
+    let fit = window::sheet_autofit(sheet);
+    if let Ok(mut guard) = sheet_fit_cache().lock() {
+        guard.push_back(FitEntry {
+            key,
+            fit: fit.clone(),
+        });
+        while guard.len() > SHEET_FIT_CACHE_CAP {
+            guard.pop_front();
+        }
+    }
+    fit
+}
+
 /// 表格（1.15.x）：打开时按真实文字量自适应列宽/行高（只加宽不缩窄、带上限）。
 ///
-/// GDI 量测较重，必须在**不持锁**时算；结果写进 `sheet_col_w / sheet_row_h`，下一帧
-/// `paint_sheet` 就会用上，语义与手动拖拽改大小完全一致（复用既有 `SheetSizes` 通道）。
+/// 结果写进 `sheet_col_w / sheet_row_h`，下一帧 `paint_sheet` 就会用上，语义与手动拖拽
+/// 改大小完全一致（复用既有 `SheetSizes` 通道）。量测基本由渲染线程预热，这里命中即返回。
 fn apply_sheet_autofit(canvas: &Canvas) {
     if let Canvas::Sheet(doc) = canvas
         && let Some(sheet) = doc.sheet()
     {
-        let (col_extra, row_extra) = window::sheet_autofit(sheet);
+        let (col_extra, row_extra) = cached_sheet_fit(sheet);
         with_state(|s| {
             s.sheet_col_w = col_extra;
             s.sheet_row_h = row_extra;

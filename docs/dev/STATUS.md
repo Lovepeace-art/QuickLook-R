@@ -1,6 +1,15 @@
 # 进度（STATUS）
 
-> 更新时间：2026-11-21 · **图片预览白边（方案B：客户区=图片真实像素 1:1）+ 表格打开默认自适应列宽行高（未发版）**：图片不再按 DPI 放大/抬最小窗，绘制端对图片一律铺满（`paint_bitmap_at` 新增 `fill`），根治"某些图片四周白边"；表格打开时按绘制同款字体逐格量宽、只加宽不缩窄（单列上限 160px，含 wrap/表头格都参与量宽）、`wrap` 格（表头行除外）按最终列宽量高（单行上限 90px），复用 `SheetSizes.col_extra/row_extra` 通道。回归 `cargo test -p qlr-app` 78 全绿（含 2 个新图窗尺寸单测）、`clippy -D warnings`/`fmt --check` 干净、`--render` 四夹具 RENDER-CLI ok；真机 GUI e2e（`_bench/fit-check.ps1` 截图）已跑通：图片四边无白、表格数值全显无 `####`。
+> 更新时间：2026-11-22 · **修复 1.15.4 回归：图片"缩放/尺寸记忆"失效**：方案B 曾在 `window_size_for` 里对 `Kind::Image` 提前 `return`（客户区=真实像素 1:1），把后面的 `remembered` 尺寸记忆（1.0.14）与 `media_window_size` 比例锁定整个绕掉——用户放大图片、关掉再开又退回 100%。改为图片 `base` 仍用 `natural_rect_raw`（保 1:1 无白边）但不再早返回、继续走 `remembered` 夹取与比例锁定。新增单测 `image_remembers_user_zoom_size`；`cargo test -p qlr-app` **81 passed / 1 ignored**、clippy `-D warnings`/`fmt --check` 干净。
+>
+
+> 更新时间：2026-11-22 · **优化：文本重画零拷贝 + 折行缓存 LRU + 图片解码上限 50MP + PDF metadata 去重（**1.15.4 已发版**）**：`chrome.rs` 折行结果改 `Arc<Vec<String>>` + `RowText{Shared,Owned}` 逐行零拷贝（不再每帧逐行 `String::clone`、未命中不再整条克隆）；`wrapcache.rs` 满 512 由"整本 clear"改 `min_by_key(used)` 单条 LRU 淘汰（新增 `eviction_is_lru_not_whole_wipe` 单测）；`image_view.rs` `MAX_IMAGE_PIXELS` 100MP→50MP（整图解码峰值 600–800MB→300–400MB，堵住绕过 256MB budget 的缺口）；`render.rs` `request_render` 用一次 `file_stamp` 复用（新增 `frame_key_stamped`），PDF 每请求 metadata 3→1。回归：app 80 / core 78 / platform 53 / render 169 / plugin 4·7·11 全绿、clippy `-D warnings`/`fmt --check` 干净、release 47.8s。注：`crash::minidump_of_ourselves_is_written` 并行 workspace 偶发 flake、单跑必过（与本批无关）。
+>
+
+> 更新时间：2026-11-21 · **优化：表格自适应移出 UI 线程 + 极小图最小可读窗（**1.15.4 已发版**）**：`render::cached_sheet_fit` 按「表内容+字体度量」指纹缓存自动列宽/行高（LRU 8），渲染 worker 在交活前用 `PREVIEW_DPI` 预热，UI 线程只命中缓存——`real-monthly`（2.3 万格）首次 138ms→缓存命中 0.45ms、`big-20k`（16 万格截 6 万）350ms→3.2ms，打开/松手 resize 不再卡 UI。`window::natural_rect_raw` 恢复最小可读窗：极小图仍 1:1 物理像素、不 dpi 放大，但按短边等比抬到 240×160 口径（受工作区 86% 夹持），不再开成针眼/条状窗口。回归 `cargo test --workspace` 全绿（app 79 / core 78 / platform 53 / render 169）、clippy `-D warnings`/`fmt --check` 干净；新增 `image_tiny_gets_min_readable_window_preserving_aspect`。
+>
+
+> 更新时间：2026-11-21 · **图片预览白边（方案B：客户区=图片真实像素 1:1）+ 表格打开默认自适应列宽行高（**1.15.4 已发版**）**：图片不再按 DPI 放大/抬最小窗，绘制端对图片一律铺满（`paint_bitmap_at` 新增 `fill`），根治"某些图片四周白边"；表格打开时按绘制同款字体逐格量宽、只加宽不缩窄（单列上限 160px，含 wrap/表头格都参与量宽）、`wrap` 格（表头行除外）按最终列宽量高（单行上限 90px），复用 `SheetSizes.col_extra/row_extra` 通道。回归 `cargo test -p qlr-app` 78 全绿（含 2 个新图窗尺寸单测）、`clippy -D warnings`/`fmt --check` 干净、`--render` 四夹具 RENDER-CLI ok；真机 GUI e2e（`_bench/fit-check.ps1` 截图）已跑通：图片四边无白、表格数值全显无 `####`。
 >
 
 > 更新时间：2026-11-19 · **Markdown 目录栏"空白太大"根因修复 1.15.3**：真正的 bug 不是宽度参数，而是**绘制层把 `layout.toc`（已算好的面板矩形）又传回 `paint_toc`/`paint_toc_dc`，函数内部再调一次 `toc_rect` 二次收缩**——于是"预留宽度"和"实际画出的面板宽度"不一致：宽窗口下预留 30% 但只画出更窄的一块，中间就是那道空白（也解释了上一版"看着过窄/截断"，其实是二次收缩）。修法：①`chrome` 的 `paint_toc_dc`/`paint_toc` 改为传 `layout.below_chrome`（原始区域），让绘制与 `layout` 用**同一次** `toc_width_for` 求解，宽度严格一致；②`toc_width_for` 区间收紧为「约 22% 窗口宽、196..228px（`dpi::px`）」，贴着常见标题宽度、不再留大片空白。回归 `cargo test`（app 76 / platform 53）全绿、`clippy -D warnings`/`fmt --check` 干净。

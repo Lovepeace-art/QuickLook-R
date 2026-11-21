@@ -709,19 +709,27 @@ pub fn natural_rect_scaled(work: RECT, width: i32, height: i32, factor: f32) -> 
     }
 }
 
-/// 图片专用（1.15.x，方案B）：**按图片真实像素 1:1 开窗**——不按 DPI 放大、不抬最小窗。
+/// 图片专用（1.15.x，方案B）：**按图片真实像素 1:1 开窗**——不按 DPI 放大、正常尺寸不抬最小窗。
 ///
-/// 与 [`natural_rect_scaled`] 的两点关键区别（就是"某些图片预览有白边"的根因）：
+/// 与 [`natural_rect_scaled`] 的关键区别（就是"某些图片预览有白边"的根因）：
 /// - 入参 `width/height` 当作**物理像素**直接使用，不再 `dpi::px` 放大。200% 屏上窗口
 ///   仍显示图片的真实像素数，客户区因此**恒等于位图**，绘制端不会再因"内容区大于图片"
 ///   而居中留白（见 `bitmap.rs::paint_bitmap_at` 的居中分支）；
-/// - 不再把小于 `MIN_WIDTH×MIN_HEIGHT` 的图放大到最小可读窗（那会把小图撑大、四周露白）。
+/// - 正常尺寸的图不再被放大到最小可读窗（那会把小图撑大、四周露白）。
+///
+/// 但仍保留**最小可读窗保护**（1.15.x 复评）：极小的图（如 16×16 图标）若严格 1:1 会开成
+/// 点不着的针眼窗口。此时只把窗口等比放大到恰好 `MIN_WIDTH×MIN_HEIGHT` 的**短边**即可
+/// （客户区仍按图片比例，绘制端 `fill=true` 会铺满、不露白边），并仍受工作区 `fit` 约束——
+/// 极端长宽比最多缩到能塞进工作区，绝不把窗口顶出屏幕。
 ///
 /// 大图仍等比缩进工作区 `NATURAL_FILL`，避免窗口撑出屏幕。`factor` 是初始缩放
 /// （默认 1.0），只往下缩；想看得更大交给滚轮（`zoomed_rect`）。
 pub fn natural_rect_raw(work: RECT, width: i32, height: i32, factor: f32) -> RECT {
     /// 大图最多占工作区的比例（与 `natural_rect_scaled` 一致，留 14% 给桌面）。
     const NATURAL_FILL: f32 = 0.86;
+    /// 最小可读窗（与 `natural_rect_scaled` 一致）：再小的图也不开成针眼窗口。
+    const MIN_WIDTH: i32 = 240;
+    const MIN_HEIGHT: i32 = 160;
 
     let ww = ((work.right - work.left) as f32 * NATURAL_FILL).max(1.0) as i32;
     let wh = ((work.bottom - work.top) as f32 * NATURAL_FILL).max(1.0) as i32;
@@ -732,7 +740,12 @@ pub fn natural_rect_raw(work: RECT, width: i32, height: i32, factor: f32) -> REC
     // 再 `.min(fit)` 确保不会因为 factor<1 之后又被工作区顶出去。
     let fit = (ww as f32 / cw as f32).min(wh as f32 / ch as f32);
     let factor = factor.clamp(0.05, 1.0);
-    let scale = (fit.min(1.0) * factor).min(fit);
+    let mut scale = (fit.min(1.0) * factor).min(fit);
+    // 最小可读窗保护：只放大到恰好满足短边最小尺寸为止，且不超过工作区 `fit`（避免顶出屏幕）。
+    let min_scale = (MIN_WIDTH as f32 / cw as f32).max(MIN_HEIGHT as f32 / ch as f32);
+    if scale < min_scale {
+        scale = min_scale.min(fit);
+    }
 
     let width = ((cw as f32 * scale).round() as i32).clamp(1, ww);
     let height = ((ch as f32 * scale).round() as i32).clamp(1, wh);

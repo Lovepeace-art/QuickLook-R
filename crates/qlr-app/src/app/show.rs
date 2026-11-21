@@ -314,28 +314,28 @@ pub(crate) fn window_size_for(
     } else {
         0
     };
-    // 图片（1.15.x，方案B）：客户区 = 图片真实像素 1:1 开窗——不按 DPI 放大、不抬最小窗、
-    // 不抬最小宽。大图等比缩进工作区。这样内容区恒等于位图，绘制端永不因"内容区大于图片"
-    // 而居中留白（白边根因）。滚轮仍可放大（走 `zoomed_rect`，不经过这里）。
-    if kind == format::Kind::Image {
-        if let Some((w, h)) = natural {
-            let factor = config.image_zoom_percent as f32 / 100.0;
-            let r = window::natural_rect_raw(work, w as i32, h as i32, factor);
-            let cw = (r.right - r.left).max(1);
-            let ch = (r.bottom - r.top).max(1);
-            let wh = (work.bottom - work.top).max(1);
-            return (cw, (ch + reserve).min(wh).max(1));
-        }
-    }
+    // 图片（1.15.x，方案B）：**默认**客户区 = 图片真实像素 1:1 开窗——不按 DPI 放大、不抬最小窗、
+    // 不抬最小宽，大图等比缩进工作区；绘制端 `fill=true` 铺满，故不会因"内容区大于图片"留白
+    //（白边根因）。
+    //
+    // 但**不能因此绕开下面的"尺寸记忆"**（1.0.14）：用户滚轮/右键拖出来的缩放大小会经
+    // `set_zoom_to` → `remember_size` 存进 `remembered`，下次开同类图片要照原样恢复，否则
+    // "缩放与记忆"就失效了（1.15.4 回归）。所以图片只把 base 换成 `natural_rect_raw`（保 1:1
+    // 与方案 B 口径），仍要经过 `remembered` 夹取与 `media_window_size` 比例锁定。
     let base = match natural {
         Some((w, h)) => {
-            // 图片的初始缩放走配置（默认 50%，用户可在设置里改）；PDF 保持"适应窗口"。
+            // 图片的初始缩放走配置（默认 100%，用户可在设置里改）；PDF 保持"适应窗口"。
             let factor = if uses_image_zoom(kind) {
                 config.image_zoom_percent as f32 / 100.0
             } else {
                 1.0
             };
-            let mut b = window::natural_rect_scaled(work, w as i32, h as i32, factor);
+            // 图片按"原样像素"定基准（不 dpi 放大、保 1:1 清晰，方案 B 口径）；其它格式按 DPI 放大。
+            let mut b = if kind == format::Kind::Image {
+                window::natural_rect_raw(work, w as i32, h as i32, factor)
+            } else {
+                window::natural_rect_scaled(work, w as i32, h as i32, factor)
+            };
             b.bottom = (b.bottom + reserve).min(work.bottom);
             b
         }

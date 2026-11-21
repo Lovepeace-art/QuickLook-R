@@ -1828,9 +1828,9 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 2. 渲染端 `upscale = s.zoom>1.0`（`render.rs`），初始 `s.zoom=1.0` → 图片**不放大**，位图 = 素材像素或更小。
 3. `paint_bitmap_at`（`bitmap.rs:233`）先整块 `FillRect` 刷白，再"内容-位图 > FILL_SLACK(4) → 居中 1:1 留白"。→ 白边现形。
 
-**修法（方案B）**：客户区严格 = 图片真实像素 1:1（新 `window::natural_rect_raw`：不 dpi、不抬最小窗、只大图等比缩进工作区 86%）；`window_size_for`/`show_preview` 对 `Kind::Image` 走它；`paint_bitmap_at` 增 `fill:bool`，Image 传 `true`（小于内容也拉伸铺满、不居中）。删掉 `window_aspect_differs` 对图片的"等比居中"判定。
+**修法（方案B）**：客户区严格 = 图片真实像素 1:1（新 `window::natural_rect_raw`：不 dpi、正常尺寸不抬最小窗、只大图等比缩进工作区 86%）；`window_size_for`/`show_preview` 对 `Kind::Image` 走它；`paint_bitmap_at` 增 `fill:bool`，Image 传 `true`（小于内容也拉伸铺满、不居中）。删掉 `window_aspect_differs` 对图片的"等比居中"判定。（后续 1.15.x 复评又恢复了**极小图最小可读窗**：按短边等比抬到 240×160 口径、受工作区夹持，见 #175；不影响本节"不 dpi、绘制铺满"的结论。）
 
-**验法**：`cargo test -p qlr-app` 的 `image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump`（100×80 图在 96/192 dpi 下宽都=100、不抬 240、高=80+顶栏）与 `image_large_scales_into_work_area_preserving_aspect`。**注意**：方案B 的代价是高 DPI 下窗口物理偏小；若哪天又想要"大图小窗也填满"，别回头改 `natural_rect_scaled`（会重新引入白边），应在绘制端保持 `fill=true` 的条件下只放大渲染盒。
+**验法**：`cargo test -p qlr-app` 的 `image_window_is_one_to_one_pixels_no_dpi_scale`（1280×720 图在 96/192 dpi 下宽都=1280、高=720+顶栏）、`image_large_scales_into_work_area_preserving_aspect`、`image_tiny_gets_min_readable_window_preserving_aspect`（100×80 抬到内容 240×192、保 100:80 比例）。**注意**：方案B 的代价是高 DPI 下窗口物理偏小；若哪天又想要"大图小窗也填满"，别回头改 `natural_rect_scaled`（会重新引入白边），应在绘制端保持 `fill=true` 的条件下只放大渲染盒。
 
 ## #174 表格自适应列宽要放平台层量、用 `SheetSizes.col_extra` 回写，别改 xlsx 存的 width
 
@@ -1844,3 +1844,46 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 - 只加宽不缩窄（`max(0, need-base)`）：缩窄会让本来正常的列变差；用户口径就是"只加宽不缩窄"。
 - **`set_content` 会清空 `s.sheet_col_w`/`s.sheet_row_h`（换文件归零）**：autofit 必须在 `set_content` **之后**调用，否则先算的增量被清掉、`PAINT` 里 `resize=(0,0)`，自适应完全不生效（第一版就踩了这个：真机 `SHEETFIT` 日志有值但画面没变）。
 - 图省事别去改 xlsx 存值或 `col_width_px` 常量——那会改变文件语义且影响所有非自适应路径。
+
+## #175 表格自适应要移出 UI 线程并记忆化；极小图要兜最小可读窗
+
+**背景**：`sheet_autofit` 原在 `on_render_done`（UI 线程，`WM_QLR_RENDER` → `boot.rs` 的 `wndproc` 分发）同步跑 GDI：2.3 万格 ~120ms、6 万格 ~300ms，且发生在首帧 `invalidate` 之前、每次松手 resize 重跑 → 卡 UI。
+
+**做法（autofit 移出线程 + 记忆化）**：
+- 结果只由「表内容 + 字体度量」决定、与窗口尺寸无关 → `qlr-app::app::render::cached_sheet_fit(&Sheet) -> SheetFit` 按 `FNV1a(内容) + dpi::cpx(1000)` 指纹缓存（`SHEET_FIT_CACHE`，`VecDeque` LRU 8）。
+- `request_render`（UI 线程）记 `PREVIEW_DPI = dpi::current()`（`AtomicU32`）；渲染 worker 在 `RESULT.push` **之前**对 `Ok(Canvas::Sheet(doc))` `dpi::seed_thread(PREVIEW_DPI)` 再 `cached_sheet_fit` 预热 → UI 上屏只命中缓存。
+- `apply_sheet_autofit` 改为查缓存（未命中回退 UI 内联计算=旧行为，正确性不回归）。DPI/内容缩放变化 → 指纹变 → 重算。
+
+**坑**：
+- 渲染 worker 线程默认 DPI=96（未 `seed_thread`），HiDPI 上量出的字宽偏窄 → 必须**先按窗口 DPI seed 再算**；UI 侧 `wndproc_body` 每条消息 `dpi::enter(hwnd)`，`on_render_done` 里 `current()` 就是窗口 DPI，两侧指纹才对得上。
+- 预热必须在 `RESULT.push` **之前**：push 之后 UI 可能立刻上屏而缓存还没写，就退回内联计算（又卡）。
+- 缓存必须放在 UI 与渲染线程都能访问的 `qlr-app::app::render`（不能塞平台层——平台层没有"窗口会话/当前 DPI"概念）。
+- `set_content` 会清 `s.sheet_col_w/s.sheet_row_h`，autofit 仍必须在 `set_content` **之后**（见 #174）。
+
+**图片极小图**：`window::natural_rect_raw` 需保留 `min_scale = max(240/cw,160/ch)` 等比放大（受工作区 `fit` 夹持），否则 16×16 图标开成针眼窗、极端长宽比成条状。仍不 `dpi::px`、客户区保持图片比例、`paint_bitmap_at(fill=true)` 铺满 → 不露白边。
+
+## #176 折行缓存与文本重画：用 `Arc<Vec<String>>` 共享 + LRU 淘汰，别每帧 clone、别满本清空
+
+**背景**：长文档滚动/缩放时 `crates/qlr-app/src/app/chrome.rs` 每帧把折行结果 `wrapped[k].clone()` 逐行克隆、未命中还 `put(...,fresh.clone())` 再整条克隆；`wrapcache.rs` 满 `CAP=512` 且新 key 时 `entries.clear()` 整本清空，超过 512 个折行 key 的大文档会周期性全量重折。
+
+**做法**：缓存值改 `Arc<Vec<String>>`，`put` 返回 `Arc`；绘制侧用模块级 `enum RowText { Shared(Arc<Vec<String>>, usize), Owned(String) }`（`as_str()->&str`）表达"共享行/自有序"，每行 `RowText::Shared(Arc::clone(&wrapped), k)` 零拷贝，只有"预算截断补省略号"那一行才 `Owned`。淘汰改 `Entry{style,rows,used}`+`tick`，满时 `min_by_key(used)` 单条 LRU（`eviction_is_lru_not_whole_wipe` 单测）。
+
+**坑**：`Arc::clone` 只增引用计数、不要 `(*wrapped).clone()` 复制 Vec；省略号行必须 `Owned`（内容与缓存不同，不能共享）；LRU 的 `used` 要在 `get` 命中时刷新，`tick` 保持单调。
+
+## #177 `request_render` 里 `file_stamp()` 只取一次；图片整图解码上限设 50MP
+
+**背景**：`fs::metadata` 是系统调用，`crates/qlr-app/src/app/render.rs` 的 `request_render` 里为了 `is_pdf`/`PageKey`/`frame_key` 各算一次，PDF 一次请求达 3 次；`image_view.rs` 曾设 `MAX_IMAGE_PIXELS=100MP`，整图解码约 7B/px、峰值 600–800MB，且发生在 `budget::try_reserve` 之前（绕开 256MB 预算）。
+
+**做法**：`request_render` 顶部 `let stamp = file_stamp(path);` 复用；frame 用 `pub(crate) fn frame_key_stamped(path,&stamp,page,w,h,upscale)`（`frame_key` 委托它自取戳）。`MAX_IMAGE_PIXELS` 降 50MP（覆盖 4K/8K 截图同时把最坏峰值减半）。PNG>4MP 已走流式降采样，其余格式仍整图解码——这是护栏不是分块解码，极端单图仍可能几百 MB。
+
+## #178 方案B 图片别在 `window_size_for` 里 early-return：会绕掉"尺寸/缩放记忆"
+
+**背景**：1.15.x 图片"白边方案B"为客户区=真实像素 1:1，曾在 `crates/qlr-app/src/app/show.rs:window_size_for` 里对 `Kind::Image` 直接 `return natural_rect_raw(...)`。这样虽保住了 1:1，但**跳过了函数后半段的 `remembered` 尺寸夹取（1.0.14 尺寸/缩放记忆）和 `media_window_size` 比例锁定（1.8.1）**。用户滚轮/右键把图放大到 2×、关掉再开，又退回 100% 真实尺寸（用户报"缩放与记忆模块失效"）。
+
+**做法**：图片只把 **`base`** 换成 `window::natural_rect_raw`（不 dpi 放大、保 1:1 与方案B 口径），**不要 early-return**；让它和别的格式一样继续走后面的 `remembered` 夹取 + `media_window_size(work, aspect, width, bar)` 比例锁定。即"把图片当作 normal 路径里的一个特殊 base"，而不是"单独一条返回路径"。
+
+**坑**：
+- `remembered` 由 `set_zoom_to`（滚轮/右键缩放）→`remember_size` 写入 `s.last_sizes`+`config.window_sizes`，是"用户改过的尺寸"，**显示时不算**（否则大图会把之后所有图顶到工作区上限）——`remember_size` 只在缩放/拖边路径调用是对的，别改成显示时也记。
+- 恢复记忆后位图按记忆尺寸渲染（放大过的图会略糊，这是"缩放记忆"的应有代价，不是 bug）。
+- 记忆按**格式**（`Image`）落盘、不按文件：一旦放大过某张图，之后所有图（含下次启动）都按那个尺寸开——1.0.14 既有语义，若改成按文件记要另设计。
+- 改完必须保 `image_window_is_one_to_one_pixels_no_dpi_scale`（`remembered=None` 仍 1:1）、`image_tiny_gets_min_readable_window_preserving_aspect`（最小可读窗）、`image_large_scales_into_work_area_preserving_aspect`（大图 86%）三个断言不变，并新增 `image_remembers_user_zoom_size`。

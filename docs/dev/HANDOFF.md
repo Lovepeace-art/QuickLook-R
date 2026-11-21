@@ -860,9 +860,34 @@ media 15 / mediashape 13。
 
 ## 接力说明（2026-11-21 · 图片白边方案B + 表格默认自适应）
 
-- **完成（未发版，工作区改动）**：
-  - 图片预览白边根治（方案B）：`window::natural_rect_raw`（图片像素 1:1、不 dpi 放大、不抬最小窗）+ `window_size_for`/`show_preview` 对 `Kind::Image` 走它 + `paint_bitmap_at(...,fill:bool)` 对图片铺满不居中；删 `shell::window_aspect_differs`。
+- **完成（1.15.4 已发版）**：
+  - 图片预览白边根治（方案B）：`window::natural_rect_raw`（图片像素 1:1、不 dpi 放大；极小图按短边抬到 240×160 最小可读窗，见 2026-11-21 优化接力）+ `window_size_for`/`show_preview` 对 `Kind::Image` 走它 + `paint_bitmap_at(...,fill:bool)` 对图片铺满不居中；删 `shell::window_aspect_differs`。
   - 表格打开默认自适应列宽/行高：`window::sheet::sheet_autofit(&Sheet)->(col_extra,row_extra)`（平台层量文字宽、只加宽、单列上限 160px、单行上限 90px；所有含 wrap/表头的非合并格参与量宽，wrap 格按最终列宽量高、表头行不加高），`render::apply_sheet_autofit` 在 **`set_content` 之后**写 `s.sheet_col_w/s.sheet_row_h`（复用 1.9.1 通道；`set_content` 会清空这两个字段，顺序错了不生效）。
 - **回归**：`cargo test -p qlr-app` **78 passed / 1 ignored**（含 2 个新图窗尺寸单测）；`cargo test -p qlr-render -- --skip media::` 9 passed；fmt/clippy 零输出；`--render` 四夹具 `RENDER-CLI ok`。全量测试仅 4 个 `media::tests` 因本机无会话、Media Foundation 起不来而失败（与本次无关）。
 - **GUI 端到端已跑通**：`_bench/fit-check.ps1`（复制 release 产物→`--show` 启动→`PrintWindow` 截图→统计四边白占比）验证 —— `111.jpg` 四边 white band 全 0（无白边）；`condfmt-demo.xlsx` 数值全显无 `####`、条件格式保留；`real-monthly.xlsx` 表头正常高、数值无 `####`。仍建议发布前在干净真机补跑 `scripts/verify-mediashape.ps1` / `scripts/verify-sheet.ps1` 做契约级回归（本脚本只截图目视）。早期 `NO_WINDOW`/`请求已转交` 是用户自有 qlrust 实例占用单实例互斥所致，关掉即可。
 - **下一步**：① 真机目视确认图片四边无白、表格长文本/大数字不再截断/`####`；② 决定是否发版（当前 `Cargo.toml` 仍 1.15.3，未 bump）；③ 若发版按 AGENTS §10 三处同步版本 + README/RELEASE_NOTES。
+
+## 接力说明（2026-11-21 · 优化：表格自适应移出 UI 线程 + 极小图最小可读窗）
+
+- **完成（1.15.4 已发版）**：
+  - 表格 autofit 移出 UI 线程 + 记忆化：`render::cached_sheet_fit(&Sheet) -> SheetFit`（内容+字体度量 FNV 指纹、LRU 8）；`request_render` 记 `PREVIEW_DPI = dpi::current()`，渲染 worker 交活前 `dpi::seed_thread(PREVIEW_DPI)` 预热；`apply_sheet_autofit` 改为查缓存（未命中回退 UI 内联 = 旧行为）。UI 线程成本：小表 ~0.5ms、大表 ~3ms（指纹哈希），取代原 120–350ms GDI 量测。
+  - 图片极小图最小可读窗：`window::natural_rect_raw` 恢复 `min_scale = max(240/cw,160/ch)` 等比放大（受工作区 `fit` 夹持），仍不 `dpi::px` 放大、客户区保持图片比例、`fill=true` 铺满不露白。
+- **回归**：`cargo test --workspace` 全绿（app 79 / core 78 / platform 53 / render 169，其它同前）；`cargo clippy --workspace --all-targets -D warnings` EXIT 0；`fmt --check` 零输出。单测：新增 `image_tiny_gets_min_readable_window_preserving_aspect`；`image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump` 改名 `image_window_is_one_to_one_pixels_no_dpi_scale`（改用 1280×720）。
+- **缓存实测**（临时单测，已删）：`real-monthly.xlsx` 首次 138ms → 命中 0.45ms；`big-20k.xlsx` 首次 350ms → 命中 3.2ms。
+- **下一步**：① 真机目视确认表格打开/拖窗不再卡、极小图窗可操作；② 决定是否发版（仍 1.15.3 未 bump）；③ 其余旧优化点（文本重画去克隆、markdown 整篇 layout、wrapcache LRU、image_view 100MP 上限）仍在，按需排期。
+
+## 接力说明（2026-11-22 · 优化：文本重画零拷贝 + 折行缓存 LRU + 图片 50MP + metadata 去重）
+
+- **完成（1.15.4 已发版）**：
+  - 文本重画去克隆（P1，`crates/qlr-app/src/app/chrome.rs`）：折行缓存值改 `Arc<Vec<String>>`，新增 `RowText{Shared(Arc<Vec<String>>,usize),Owned(String)}` + `as_str`；逐行 `RowText::Shared(Arc::clone(&wrapped),k)` 零拷贝，仅省略号行 `Owned`；未命中 `wrap_cache.put(...)` 直接拿回 `Arc`，不再整条克隆。
+  - 折行缓存 LRU（P4，`crates/qlr-app/src/wrapcache.rs`）：`Entry{style,rows,used}` + `tick`；`put` 返回 `Arc`，满 `CAP=512` 用 `min_by_key(used)` 淘汰单条（替换 `entries.clear()`）；单测 `eviction_is_lru_not_whole_wipe`。
+  - 图片解码上限（M1，`crates/qlr-render/src/image_view.rs`）：`MAX_IMAGE_PIXELS` 100MP→50MP（整图解码峰值 600–800MB→300–400MB）。
+  - metadata 去重（P3，`crates/qlr-app/src/app/render.rs`）：`request_render` 只取一次 `file_stamp`，新增 `pub(crate) fn frame_key_stamped`，PDF 每请求 `fs::metadata` 3→1。
+- **回归**：app 80/1 ignored、core 78、platform 53(4 ignored)、render 169(8 ignored)+fuzz1/malformed9、plugin-api4/demo7/office11 全绿；clippy `-D warnings` 0、fmt 干净、`cargo build --release` 47.8s。注：`crash::tests::minidump_of_ourselves_is_written` 并行 workspace 偶发 FAILED、单跑必过（既有环境 flake，与本次无关；本机另有用户自有 `QuickLook` 进程）。
+- **下一步**：① 真机目视确认长文档滚动/大图内存；② 决定是否发版（仍 1.15.3 未 bump，发版按 AGENTS §10 三处同步）；③ 剩余：markdown 整篇 layout 虚拟化（暂缓，风险大）、image_view 非 PNG 格式分块解码。
+
+## 接力说明（2026-11-22 · 修 1.15.4 图片"缩放/尺寸记忆"回归）
+
+- **完成（1.15.4）**：`crates/qlr-app/src/app/show.rs` 的 `window_size_for` 删掉 `Kind::Image` 在取 `remembered` 前的早返回分支；图片 `base` 仍用 `window::natural_rect_raw`（客户区=真实像素 1:1、方案B 口径），但继续走 `remembered` 尺寸夹取（1.0.14 尺寸/缩放记忆）+ `media_window_size` 比例锁定（1.8.1）。用户滚轮/右键拖出的缩放大小（`set_zoom_to`→`remember_size` 存 `last_sizes`/`config.window_sizes`）下次开图能恢复。
+- **回归**：新增 `image_remembers_user_zoom_size`（无记忆 1:1、记忆 2× 恢复）；`cargo test -p qlr-app` **81 passed / 1 ignored**、clippy `-D warnings` EXIT 0、`fmt --check` 零输出；原有 3 个 `image_*` 尺寸单测不变仍绿。
+- **下一步**：① 真机确认"放大图片→关闭→重开"回到上次缩放尺寸、且默认仍 1:1 无白边；② 已按 1.15.4 重新打包（zip 已覆盖），可再次真机验收。
