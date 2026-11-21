@@ -3664,3 +3664,41 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 - 目录绘制宽度现在 == layout 预留宽度（同一区域、同一函数），不再二次收缩。
 
 > 局限：仍是按窗口比例估算的紧凑区间，不逐一按最长标题测量。
+
+---
+
+## 2026-11-21 · 图片白边方案B + 表格打开默认自适应列宽行高（未发版）
+
+### 做了什么
+
+- **图片白边（方案B：窗口客户区 = 图片真实像素 1:1）**
+  - `qlr-platform::window` 新增 `natural_rect_raw(work,width,height,factor)`：直接用图片像素，**不再 `dpi::px` 放大、不再抬 240×160 最小窗**，只把超大图等比缩进工作区 86%，`factor`（初始缩放）夹 0.05..1.0。
+  - `qlr-app::app::show::window_size_for` 对 `Kind::Image` 早返回该项尺寸（宽=图片像素；高=图片像素+顶栏，受工作区高度夹持）；`show_preview` 先 `dpi::enter(preview)` 让顶栏口径与绘制一致，Image 的底稿 rect 也走 `natural_rect_raw`。
+  - `chrome.rs`：Image 不再走 `window_aspect_differs` 的"等比居中"分支（`fit_bitmap` 只对 Svg/Video 为真），并对 Image 传 `fill=true`；`bitmap.rs::paint_bitmap_at` 新增 `fill` 参数——`fill=true` 时小于内容区的维度也拉伸铺满、不居中留白（裁剪分支保留）。删除 `shell.rs::window_aspect_differs`。
+  - 根因：旧 `natural_rect_scaled` 把图片像素 `dpi::px` 放大（150% 屏 ×1.5）+ 抬最小窗，客户区常大于位图；渲染又只在 view-zoom>1 才上采样（初始 `zoom=1.0`）→ 位图小于内容区 → `paint_bitmap_at` 居中留白（先整窗刷白 `0x00FFFFFF`）→ 白边。
+- **表格打开默认自适应列宽/行高**
+  - `qlr-platform::window::sheet` 新增 `sheet_autofit(&Sheet) -> (Vec<(u32,i32)>,Vec<(u32,i32)>)`：按绘制同款字体（`FONTS`）用 `GetTextExtentPoint32W` 逐格量文字宽，`col_extra = max(0, 文本宽 + 2*pad + 2 - 原列宽)`，只加宽不缩窄，单列上限 160px；**所有非合并格（含 wrap、含表头）都参与列宽测量**；`wrap` 格（跳过第 0 行表头）再按"最终列宽"用 `DT_CALCRECT|DT_WORDBREAK` 量高得到 `row_extra`（单行上限 90px，表头行不自动加高）；测量格数上限 60000。复用既有 `SheetSizes.col_extra/row_extra`（1.9.1 拖拽改宽同一通道），不碰 `qlr-render`。
+  - `qlr-app::app::render` 新增 `apply_sheet_autofit(canvas)`：`Canvas::Sheet` 时调 `sheet_autofit` 写入 `s.sheet_col_w/s.sheet_row_h`。**必须在 `set_content` 之后调用**（`session.rs::set_content` 里 `s.sheet_col_w.clear(); s.sheet_row_h.clear();` 会把先算的结果清掉——这是首版踩的坑）；两个调用点（`on_render_done` 的 Ok 分支、pagecache 命中的 `present_canvas`）都放在 `set_content(Some(canvas.clone()))` 之后、锁外。
+  - 顺带缓解用户报的"读到的列宽/行高像缩放过的、没有原软件那种窗口大小"：宽度不再只信 xlsx 里存的 `width` 字符数（`chars*7+5`），而是按实际文字宽度撑开。
+
+### 为什么
+
+- 图片预览白边是 1.8.x 之后的长尾 bug，历史上反复补丁（#63/#148/#150）。这次按用户选的方案B 从"开窗不要比图片大"这一条根上堵住：客户区严格等于图片像素，绘制端对图片一律铺满（`fill`），不再有"居中留白"的中间态。
+- 表格宽度问题（截图里 `2026-10` 被截、金额列 `####`）根源是列宽取 xlsx 存值（`width×7+5`），和实际字体渲染宽度不符；打开即按真实文字测宽撑开，最直观。
+
+### 怎么验证
+
+- `cargo build`（dev）、`cargo build --release` 通过；`cargo fmt --all -- --check` 零输出；`cargo clippy --all-targets -- -D warnings` EXIT 0。
+- `cargo test -p qlr-app` **78 passed / 0 failed / 1 ignored**（含新增 `image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump`、`image_large_scales_into_work_area_preserving_aspect`）。
+- 全量 `cargo test`：除 4 个 `media::tests::*`（本机无会话、Media Foundation 起不来，与本次无关）外全绿；`cargo test -p qlr-render -- --skip media::` 9 passed。
+- 无窗口 `--render` 冒烟：`111.jpg`(bitmap 2.98MB)、`shot0.jpg`、`condfmt-demo.xlsx`(sheet 1KB)、`real-monthly.xlsx`(sheet 29KB) 全部 `RENDER-CLI ok`、退出码 0。
+- **GUI 端到端（真机本会话跑通，用 `_bench/fit-check.ps1`：复制 release 产物到临时目录、`--show` 启动、`PrintWindow` 截图、统计内容区四边内缘 6px 白色占比）**：
+  - `111.jpg`：窗口/客户区 800×830、dpi96、顶栏 30，四边 white band `L=0.3/R=0/T=0/B=0` → 图片满铺**无白边**。
+  - `condfmt-demo.xlsx`（与问题截图的 plugin-demo 同版式）：`SHEETFIT 4x5 col_extra=2`，数值 `3480.5/2760/4102.25/10342.75` 全显、无 `####`、条件格式配色保留。
+  - `real-monthly.xlsx`（97×353）：表头行正常高、一屏约 7/12 列、数值无 `####`、商品名列封顶 160（像 Excel 裁剪）、其余横向滚动。
+  - （脚本与截图在仓外 `_bench/`，不入库；早期的 `NO_WINDOW`/`请求已转交` 是用户自有 qlrust 实例占用单实例互斥导致，关掉即可。）仍建议发布前在干净真机补跑 `scripts/verify-mediashape.ps1` / `scripts/verify-sheet.ps1` 做契约级回归。
+
+### 局限
+
+- 图片方案B 在高 DPI 屏上窗口物理偏小（用户已知并接受）；>100% 初始缩放被忽略（要看更大用滚轮）。
+- 表格自适应单列上限 160px、单行上限 90px、测量格数上限 60000（超大表跳过部分测量、保留原宽）；不按合并单元格内容撑宽（合并被跳过）；第 0 行表头不自动加高（避免长表头把表头行撑得很高）。

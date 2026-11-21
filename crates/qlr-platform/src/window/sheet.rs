@@ -1814,6 +1814,31 @@ fn draw_wrapped(
     }
 }
 
+/// 只量一段 `wrap` 文字在给定宽度下要占多高（`DT_CALCRECT`，不画）。行高自适应用。
+fn measure_wrapped_height(hdc: HDC, font: HFONT, text: &str, width: i32) -> i32 {
+    if text.is_empty() || width <= 0 {
+        return 0;
+    }
+    unsafe {
+        let old = SelectObject(hdc, font.into());
+        let mut buf: Vec<u16> = text.encode_utf16().collect();
+        let mut calc = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: 0,
+        };
+        DrawTextW(
+            hdc,
+            &mut buf,
+            &raw mut calc,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
+        (calc.bottom - calc.top).max(0)
+    }
+}
+
 /// 数字放不下时铺满的 `#` 串（按可用宽度算能放几个）。
 fn hash_fill(hdc: HDC, font: HFONT, avail: i32) -> String {
     let (unit, _) = measure_text(hdc, font, "#");
@@ -1827,6 +1852,159 @@ fn hash_fill(hdc: HDC, font: HFONT, avail: i32) -> String {
 // ---------------------------------------------------------------------------
 // 公开 API
 // ---------------------------------------------------------------------------
+
+/// 打开表格时**默认自适应列宽/行高**（1.15.x）。只加宽不缩窄、带上限。
+///
+/// 返回 `(col_extra, row_extra)`，语义与"拖拽改大小"产生的增量完全一致（叠加在文件原宽/
+/// 原高之上），可直接写进 `State.sheet_col_w / sheet_row_h`、复用既有绘制通道。
+///
+/// 为什么放平台层：量文字要走 GDI（`GetTextExtentPoint32W` / `DrawTextW`）且要用与绘制
+/// 同款的 `FONTS` 字体缓存；`qlr-render` 不许碰 Win32。文件里存的是 `<col width>` 换来的
+/// 像素宽，和这张表实际用的字体不一定对得上（用户反馈"读到的列宽/行高像被缩放过、没有原
+/// 软件那种窗口大小"）——按真实文字量一遍，既能消除"数字显示成 ####"，也能修掉错位。
+///
+/// 取舍：列宽量**所有单元格**（含表头、含 wrap 格）的最宽自然宽度，合并区（含左上角）跳过；
+/// 超长文本（商品名）到上限就封顶，仍像 Excel 一样截断/溢出，不会把整列撑到屏幕外。行高只对
+/// **wrap=true** 的数据格按"最终列宽"量需要几行（**表头行不动**，免得长表头把整行撑高）。
+/// 上限：单列 160px、单行 90px、量测总量 6 万格（超大表只量前面这些，防止开窗卡顿）。
+/// 自适应结果：`(列宽增量, 行高增量)`，均为 `(索引, 额外像素)`，叠加在文件原宽/原高之上。
+pub type SheetFit = (Vec<(u32, i32)>, Vec<(u32, i32)>);
+
+pub fn sheet_autofit(sheet: &Sheet) -> SheetFit {
+    const MAX_COL_W: i32 = 160;
+    const MAX_ROW_H: i32 = 90;
+    const MAX_CELLS: usize = 60_000;
+
+    let m = Metrics::current();
+    let pad = m.pad.max(0);
+    let cols = sheet.cols as usize;
+    let rows = sheet.rows as usize;
+    if cols == 0 || rows == 0 || sheet.cells.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut col_need = vec![0i32; cols];
+    let mut row_need = vec![0i32; rows];
+
+    // 第一趟：量宽（顺带记非折行格的自然行高下限）。
+    unsafe {
+        let hdc = GetDC(None);
+        if !hdc.0.is_null() {
+            FONTS.with(|slot| {
+                let mut fonts = slot.borrow_mut();
+                let mut measured = 0usize;
+                for cell in &sheet.cells {
+                    if measured >= MAX_CELLS {
+                        break;
+                    }
+                    if cell.text.is_empty()
+                        || cell.row as usize >= rows
+                        || cell.col as usize >= cols
+                    {
+                        continue;
+                    }
+                    // 合并区（含左上角）不参与：合并区按总宽画，不该单独撑开某一列/行。
+                    if sheet.merge_at(cell.row, cell.col).is_some() {
+                        continue;
+                    }
+                    let font = fonts.get(text_style_for(&cell.style));
+                    let (tw, th) = measure_text(hdc, font, &cell.text);
+                    // 列宽：**所有**单元格都参与（含 wrap、含表头），取最宽自然宽度（封顶）。
+                    // 这样表头不会被挤成多行、数字不再 `####`、日期也不再截断；超长文本
+                    // （商品名之类）到上限就封顶，仍会像 Excel 一样截断/溢出，而不是把整列撑到
+                    // 屏幕外。
+                    let need_w = tw.saturating_add(pad * 2).saturating_add(2).min(MAX_COL_W);
+                    let c = cell.col as usize;
+                    if need_w > col_need[c] {
+                        col_need[c] = need_w;
+                    }
+                    // 行高：非折行格只记单行高度下限（折行格留给第二趟按最终列宽量）。
+                    if !cell.style.wrap {
+                        let need_h = th.saturating_add(pad).min(MAX_ROW_H);
+                        let r = cell.row as usize;
+                        if need_h > row_need[r] {
+                            row_need[r] = need_h;
+                        }
+                    }
+                    measured += 1;
+                }
+            });
+            ReleaseDC(None, hdc);
+        }
+    }
+
+    // 列宽增量：只加宽（need > base 才加），且只对存在的列（`col_widths` 长度内的列）。
+    let mut col_extra: Vec<(u32, i32)> = Vec::new();
+    for (col, &need) in col_need.iter().enumerate() {
+        let Some(&base_u) = sheet.col_widths.get(col) else {
+            continue;
+        };
+        let base = base_u as i32;
+        if need > base {
+            col_extra.push((col as u32, need - base));
+        }
+    }
+
+    // 第二趟：折行格按"最终列宽"（原宽 + 本次增量）量需要几行高。
+    let final_col_w = |col: u32| -> i32 {
+        let base = sheet.col_widths.get(col as usize).copied().unwrap_or(0) as i32;
+        let extra = col_extra
+            .iter()
+            .find(|(c, _)| *c == col)
+            .map(|(_, e)| *e)
+            .unwrap_or(0);
+        base + extra
+    };
+    unsafe {
+        let hdc = GetDC(None);
+        if !hdc.0.is_null() {
+            FONTS.with(|slot| {
+                let mut fonts = slot.borrow_mut();
+                let mut measured = 0usize;
+                for cell in &sheet.cells {
+                    if measured >= MAX_CELLS {
+                        break;
+                    }
+                    if cell.text.is_empty()
+                        || !cell.style.wrap
+                        || cell.row as usize >= rows
+                        || cell.col as usize >= cols
+                    {
+                        continue;
+                    }
+                    if sheet.merge_at(cell.row, cell.col).is_some() {
+                        continue;
+                    }
+                    // 表头行（行 0）不自动加高：长表头折行会把整行撑得极高，得不偿失。
+                    if cell.row == 0 {
+                        continue;
+                    }
+                    let avail = (final_col_w(cell.col) - pad * 2).max(1);
+                    let font = fonts.get(text_style_for(&cell.style));
+                    let text_h = measure_wrapped_height(hdc, font, &cell.text, avail);
+                    let need = text_h.saturating_add(pad).min(MAX_ROW_H);
+                    let r = cell.row as usize;
+                    if need > row_need[r] {
+                        row_need[r] = need;
+                    }
+                    measured += 1;
+                }
+            });
+            ReleaseDC(None, hdc);
+        }
+    }
+
+    let mut row_extra: Vec<(u32, i32)> = Vec::new();
+    for (row, &need) in row_need.iter().enumerate() {
+        let Some(&base_u) = sheet.row_heights.get(row) else {
+            continue;
+        };
+        let base = base_u as i32;
+        if need > base {
+            row_extra.push((row as u32, need - base));
+        }
+    }
+    (col_extra, row_extra)
+}
 
 /// 内容总尺寸（含表头），壳层用它算滚动上限。
 ///

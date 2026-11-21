@@ -1818,3 +1818,29 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 - 排查顺序应是"先量真实 IL"（`OpenProcessToken`+`TokenIntegrityLevel`，注意 `PSID` 里 SubAuthority[0] 在 +8 偏移），再怀疑 API 用法。别拿 PowerShell/C# 版 `Shell_NotifyIcon` 的返回值当证据——封送不对时 `hwnd=0` 都能返回 True。
 
 **推广**：任何"系统级 UI（托盘/任务栏/通知）加不上、报拒绝访问"的场景，先查**两边的完整性级别**，而不是先改参数。
+
+## #173 图片预览白边：根子在"开窗比图片大"，绘制端"居中留白"是最后一刀
+
+**现象**：Win11 上"某些图片"预览四周一圈白边（不是纯色背景，是比内容区小的位图被居中放置后露出的 `BITMAP_BACKGROUND_RGB=0x00FFFFFF`）。
+
+**根因链（三处叠加，缺一不可）**：
+1. `natural_rect_scaled`（`qlr-platform/src/window/mod.rs:673`）把图片像素 `dpi::px` 放大（150% 屏 ×1.5），还有 `min_scale=max(240/cw,160/ch)` 把小图抬到 **240×160** 最小窗；`media_window_size` 又 `content_w.max(min_window_w())`。→ 客户区常大于位图。
+2. 渲染端 `upscale = s.zoom>1.0`（`render.rs`），初始 `s.zoom=1.0` → 图片**不放大**，位图 = 素材像素或更小。
+3. `paint_bitmap_at`（`bitmap.rs:233`）先整块 `FillRect` 刷白，再"内容-位图 > FILL_SLACK(4) → 居中 1:1 留白"。→ 白边现形。
+
+**修法（方案B）**：客户区严格 = 图片真实像素 1:1（新 `window::natural_rect_raw`：不 dpi、不抬最小窗、只大图等比缩进工作区 86%）；`window_size_for`/`show_preview` 对 `Kind::Image` 走它；`paint_bitmap_at` 增 `fill:bool`，Image 传 `true`（小于内容也拉伸铺满、不居中）。删掉 `window_aspect_differs` 对图片的"等比居中"判定。
+
+**验法**：`cargo test -p qlr-app` 的 `image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump`（100×80 图在 96/192 dpi 下宽都=100、不抬 240、高=80+顶栏）与 `image_large_scales_into_work_area_preserving_aspect`。**注意**：方案B 的代价是高 DPI 下窗口物理偏小；若哪天又想要"大图小窗也填满"，别回头改 `natural_rect_scaled`（会重新引入白边），应在绘制端保持 `fill=true` 的条件下只放大渲染盒。
+
+## #174 表格自适应列宽要放平台层量、用 `SheetSizes.col_extra` 回写，别改 xlsx 存的 width
+
+**背景**：表格预览列宽直接取 xlsx 的 `<col width>`（`col_width_px(chars)=chars*7+5`），与真实字体渲染宽度不符 → 文本被截（`2026-10`）、数字列 `####`。
+
+**做法**：`qlr-platform::window::sheet::sheet_autofit(&Sheet)` 用绘制**同款字体**（`FONTS.with(...get(text_style_for(style)))`）+ `GetTextExtentPoint32W` 量每格文字宽，换算成 `col_extra: Vec<(u32,i32)>`（**额外像素**，只加宽不缩窄，`max(0, need-base)`，单列上限 **160**）。**所有非合并格（含 wrap、含表头）都参与列宽测量**（否则 wrap 表头会按窄列宽量高把表头行撑高）。`wrap` 格（**跳过第 0 行表头**）按"最终列宽"用 `DT_CALCRECT|DT_WORDBREAK` 量高给 `row_extra`（单行上限 **90**，表头不自动加高）。`qlr-app::app::render::apply_sheet_autofit` 在 **`set_content` 之后**、锁外算好写进 `s.sheet_col_w/s.sheet_row_h`——这正是 1.9.1 表头拖拽改宽用的同一通道，绘制端 `SheetSizes` 天然认它。
+
+**坑**：
+- 测量必须在**平台层**（只有这里有 GDI 字体与 `FONTS`）；`qlr-render` 不能碰 Win32，否则破坏分层（见 AGENTS §3）。
+- 只量**存在且未被合并覆盖**的格：`merge_at(row,col).is_some()` 要连左上角一起跳过（`covered_by_merge` 只判"被别的合并区吃掉"，左上角会漏）。
+- 只加宽不缩窄（`max(0, need-base)`）：缩窄会让本来正常的列变差；用户口径就是"只加宽不缩窄"。
+- **`set_content` 会清空 `s.sheet_col_w`/`s.sheet_row_h`（换文件归零）**：autofit 必须在 `set_content` **之后**调用，否则先算的增量被清掉、`PAINT` 里 `resize=(0,0)`，自适应完全不生效（第一版就踩了这个：真机 `SHEETFIT` 日志有值但画面没变）。
+- 图省事别去改 xlsx 存值或 `col_width_px` 常量——那会改变文件语义且影响所有非自适应路径。

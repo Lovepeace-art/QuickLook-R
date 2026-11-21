@@ -709,6 +709,45 @@ pub fn natural_rect_scaled(work: RECT, width: i32, height: i32, factor: f32) -> 
     }
 }
 
+/// 图片专用（1.15.x，方案B）：**按图片真实像素 1:1 开窗**——不按 DPI 放大、不抬最小窗。
+///
+/// 与 [`natural_rect_scaled`] 的两点关键区别（就是"某些图片预览有白边"的根因）：
+/// - 入参 `width/height` 当作**物理像素**直接使用，不再 `dpi::px` 放大。200% 屏上窗口
+///   仍显示图片的真实像素数，客户区因此**恒等于位图**，绘制端不会再因"内容区大于图片"
+///   而居中留白（见 `bitmap.rs::paint_bitmap_at` 的居中分支）；
+/// - 不再把小于 `MIN_WIDTH×MIN_HEIGHT` 的图放大到最小可读窗（那会把小图撑大、四周露白）。
+///
+/// 大图仍等比缩进工作区 `NATURAL_FILL`，避免窗口撑出屏幕。`factor` 是初始缩放
+/// （默认 1.0），只往下缩；想看得更大交给滚轮（`zoomed_rect`）。
+pub fn natural_rect_raw(work: RECT, width: i32, height: i32, factor: f32) -> RECT {
+    /// 大图最多占工作区的比例（与 `natural_rect_scaled` 一致，留 14% 给桌面）。
+    const NATURAL_FILL: f32 = 0.86;
+
+    let ww = ((work.right - work.left) as f32 * NATURAL_FILL).max(1.0) as i32;
+    let wh = ((work.bottom - work.top) as f32 * NATURAL_FILL).max(1.0) as i32;
+    let cw = width.max(1);
+    let ch = height.max(1);
+
+    // 只缩不放：`fit.min(1.0)` 保证小图维持原像素；`* factor` 允许用户配置的初始缩放；
+    // 再 `.min(fit)` 确保不会因为 factor<1 之后又被工作区顶出去。
+    let fit = (ww as f32 / cw as f32).min(wh as f32 / ch as f32);
+    let factor = factor.clamp(0.05, 1.0);
+    let scale = (fit.min(1.0) * factor).min(fit);
+
+    let width = ((cw as f32 * scale).round() as i32).clamp(1, ww);
+    let height = ((ch as f32 * scale).round() as i32).clamp(1, wh);
+    let screen_w = (work.right - work.left).max(1);
+    let screen_h = (work.bottom - work.top).max(1);
+    let left = work.left + (screen_w - width) / 2;
+    let top = work.top + (screen_h - height) / 2;
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
 /// 缩放后的窗口矩形：窗口尺寸**跟着缩放走**（内容 = 自然尺寸 × zoom），仍然居中。
 ///
 /// 与 `natural_rect` 的两点区别：

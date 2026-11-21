@@ -857,3 +857,12 @@ media 15 / mediashape 13。
 - 完成：`crates/qlr-core/src/plugins.rs` 的 `PluginHost::scan` 加“仅插件目录内真实文件（`canonicalize` 防符号链接越界）+ 单 DLL 64 MiB + 最多 64 个”边界；插件文本输出加 `MAX_TEXT_OUTPUT_BYTES = 64 MiB` 上限（超限先 `free` 再当无文本）。越界项只记 `host.errors()`，不致命。新增 `oversized_dll_is_skipped` 单测。
 - 回归：`cargo test` **318 passed / 0 failed**、fmt/clippy 零输出、`verify-layers` **14 PASS**、`smoke` 16 PASS·1 SKIP。
 - 下一步：P2 渲染调度完善（非 async，基于已有四态/租约）；插件进程隔离留 v2；字体预览 / office 轻型按你安排。
+
+## 接力说明（2026-11-21 · 图片白边方案B + 表格默认自适应）
+
+- **完成（未发版，工作区改动）**：
+  - 图片预览白边根治（方案B）：`window::natural_rect_raw`（图片像素 1:1、不 dpi 放大、不抬最小窗）+ `window_size_for`/`show_preview` 对 `Kind::Image` 走它 + `paint_bitmap_at(...,fill:bool)` 对图片铺满不居中；删 `shell::window_aspect_differs`。
+  - 表格打开默认自适应列宽/行高：`window::sheet::sheet_autofit(&Sheet)->(col_extra,row_extra)`（平台层量文字宽、只加宽、单列上限 160px、单行上限 90px；所有含 wrap/表头的非合并格参与量宽，wrap 格按最终列宽量高、表头行不加高），`render::apply_sheet_autofit` 在 **`set_content` 之后**写 `s.sheet_col_w/s.sheet_row_h`（复用 1.9.1 通道；`set_content` 会清空这两个字段，顺序错了不生效）。
+- **回归**：`cargo test -p qlr-app` **78 passed / 1 ignored**（含 2 个新图窗尺寸单测）；`cargo test -p qlr-render -- --skip media::` 9 passed；fmt/clippy 零输出；`--render` 四夹具 `RENDER-CLI ok`。全量测试仅 4 个 `media::tests` 因本机无会话、Media Foundation 起不来而失败（与本次无关）。
+- **GUI 端到端已跑通**：`_bench/fit-check.ps1`（复制 release 产物→`--show` 启动→`PrintWindow` 截图→统计四边白占比）验证 —— `111.jpg` 四边 white band 全 0（无白边）；`condfmt-demo.xlsx` 数值全显无 `####`、条件格式保留；`real-monthly.xlsx` 表头正常高、数值无 `####`。仍建议发布前在干净真机补跑 `scripts/verify-mediashape.ps1` / `scripts/verify-sheet.ps1` 做契约级回归（本脚本只截图目视）。早期 `NO_WINDOW`/`请求已转交` 是用户自有 qlrust 实例占用单实例互斥所致，关掉即可。
+- **下一步**：① 真机目视确认图片四边无白、表格长文本/大数字不再截断/`####`；② 决定是否发版（当前 `Cargo.toml` 仍 1.15.3，未 bump）；③ 若发版按 AGENTS §10 三处同步版本 + README/RELEASE_NOTES。

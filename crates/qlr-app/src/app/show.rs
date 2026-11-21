@@ -314,6 +314,19 @@ pub(crate) fn window_size_for(
     } else {
         0
     };
+    // 图片（1.15.x，方案B）：客户区 = 图片真实像素 1:1 开窗——不按 DPI 放大、不抬最小窗、
+    // 不抬最小宽。大图等比缩进工作区。这样内容区恒等于位图，绘制端永不因"内容区大于图片"
+    // 而居中留白（白边根因）。滚轮仍可放大（走 `zoomed_rect`，不经过这里）。
+    if kind == format::Kind::Image {
+        if let Some((w, h)) = natural {
+            let factor = config.image_zoom_percent as f32 / 100.0;
+            let r = window::natural_rect_raw(work, w as i32, h as i32, factor);
+            let cw = (r.right - r.left).max(1);
+            let ch = (r.bottom - r.top).max(1);
+            let wh = (work.bottom - work.top).max(1);
+            return (cw, (ch + reserve).min(wh).max(1));
+        }
+    }
     let base = match natural {
         Some((w, h)) => {
             // 图片的初始缩放走配置（默认 50%，用户可在设置里改）；PDF 保持"适应窗口"。
@@ -398,6 +411,10 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     else {
         return;
     };
+    // 统一窗口 DPI 口径（1.15.x）：开窗尺寸里的顶栏高度必须与绘制时用同一套 DPI。
+    // 否则 200% 屏上"开窗按 96dpi 留 30px 顶栏、绘制按 144dpi 留 45px"，内容区比例漂移，
+    // 图片 `window_aspect_differs` 会误判、退回白边 letterbox。提前 enter 一次对齐。
+    dpi::enter(preview_hwnd.raw());
     let target = path.or(last);
     // 与 hide_preview 的 GDI/USER 计数配对：两个数字一起看，才知道增长发生在 show 还是 hide。
     let (gdi0, user0) = window::gui_resources();
@@ -485,7 +502,12 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
             } else {
                 1.0
             };
-            window::natural_rect_scaled(work, w as i32, h as i32, factor)
+            // 图片用"原样像素"的底稿（与 `window_size_for` / 绘制口径一致），其它格式仍按 DPI 放大。
+            if kind == format::Kind::Image {
+                window::natural_rect_raw(work, w as i32, h as i32, factor)
+            } else {
+                window::natural_rect_scaled(work, w as i32, h as i32, factor)
+            }
         }
         // 文本/Markdown 没有"原始尺寸"（1.0.5）：固定阅读宽度，高度按比例。
         None => window::text_rect(work, config.height_ratio),

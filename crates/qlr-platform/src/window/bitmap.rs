@@ -216,7 +216,7 @@ pub fn paint_bitmap_scaled(
 /// 大图拖动掉帧的问题等 T2（A9.1）再换 flip 模型。`HALFTONE` + `SetBrushOrgEx(0,0)`
 /// 是 `StretchDIBits` 的经典搭配，否则缩放会出现条纹。
 pub fn paint_bitmap(hwnd: HWND, width: u32, height: u32, bgra: &[u8]) {
-    paint_bitmap_at(hwnd, width, height, bgra, 0, 0, None);
+    paint_bitmap_at(hwnd, width, height, bgra, 0, 0, None, false);
 }
 
 /// 画位图，但按 offset 裁剪左上角（放大后用方向键平移时用）。
@@ -230,6 +230,7 @@ pub fn paint_bitmap(hwnd: HWND, width: u32, height: u32, bgra: &[u8]) {
 ///
 /// 放大时**不改绘制缩放**，而是让渲染线程按放大后的像素尺寸重新出图（1:1 上屏），
 /// 这样放大看到的是重新光栅化的清晰图，不是把位图拉伸。
+#[allow(clippy::too_many_arguments)]
 pub fn paint_bitmap_at(
     hwnd: HWND,
     width: u32,
@@ -238,6 +239,7 @@ pub fn paint_bitmap_at(
     offset_x: i32,
     offset_y: i32,
     chrome: Option<&Chrome<'_>>,
+    fill: bool,
 ) {
     if width == 0 || height == 0 || bgra.len() < (width as usize * height as usize * 4) {
         return;
@@ -275,6 +277,8 @@ pub fn paint_bitmap_at(
         // 是**正常留白**；把它拉伸到铺满则是每帧整张重采样（HALFTONE），页面还会
         // 被纵向拉长几毫米。所以只有"差几像素"才铺满，差得多就居中 1:1（不重采样）。
         const FILL_SLACK: i32 = 4;
+        // `fill=true`（图片方案B）：小于内容区的维度也**拉伸铺满**，不居中留白——白边上屏的
+        // 根治手段；裁剪分支（位图大于内容区，放大后平移）两种模式都保留。
         let (dw, dx, sx, sw) = if bw > cw {
             let pan = offset_x.clamp(0, bw - cw);
             // 坑：本函数的 DIB 是 top-down（biHeight 取负），但 StretchDIBits 的
@@ -282,7 +286,7 @@ pub fn paint_bitmap_at(
             // 图像的另一端——实测表现是"放大后窗口里一片纯白"（其实画的是页面底部
             // 的空白），平移几步才偶然露出一点字。所以这里换算成从底部量。
             (cw, content.left, bw - cw - pan, cw)
-        } else if cw - bw > FILL_SLACK {
+        } else if !fill && cw - bw > FILL_SLACK {
             // 居中 1:1：目的尺寸 = 源尺寸，不插值。
             (bw, content.left + (cw - bw) / 2, 0, bw)
         } else {
@@ -291,7 +295,7 @@ pub fn paint_bitmap_at(
         let (dh, dy, sy, sh) = if bh > ch {
             let pan = offset_y.clamp(0, bh - ch);
             (ch, content.top, bh - ch - pan, ch)
-        } else if ch - bh > FILL_SLACK {
+        } else if !fill && ch - bh > FILL_SLACK {
             (bh, content.top + (ch - bh) / 2, 0, bh)
         } else {
             (ch, content.top, 0, bh)

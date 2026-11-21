@@ -745,7 +745,11 @@ pub(crate) fn on_render_done() {
             if let Some(key) = with_state(|s| s.pending_frame.take()).flatten() {
                 remember_last_frame(key, canvas.clone());
             }
-            set_content(Some(canvas));
+            // 表格自适应列宽/行高必须在**上屏前**算好（否则首帧还是按文件原宽画、出现 ####）。
+            // 注意：必须放在 `set_content` **之后**——`set_content` 会清空 `sheet_col_w/row_h`
+            // （换文件归零语义），先算会被它清掉。
+            set_content(Some(canvas.clone()));
+            apply_sheet_autofit(canvas.as_ref());
             // 两段式首帧收尾（1.8.3）：全清帧把占位帧原地替换掉，两个时间打一条日志。
             if let Some((first_ms, shown_at)) = take_quick_shown() {
                 log_debug!(
@@ -1046,6 +1050,22 @@ pub(crate) fn fits_render_box(canvas: &Canvas, width: u32, height: u32) -> bool 
     }
 }
 
+/// 表格（1.15.x）：打开时按真实文字量自适应列宽/行高（只加宽不缩窄、带上限）。
+///
+/// GDI 量测较重，必须在**不持锁**时算；结果写进 `sheet_col_w / sheet_row_h`，下一帧
+/// `paint_sheet` 就会用上，语义与手动拖拽改大小完全一致（复用既有 `SheetSizes` 通道）。
+fn apply_sheet_autofit(canvas: &Canvas) {
+    if let Canvas::Sheet(doc) = canvas
+        && let Some(sheet) = doc.sheet()
+    {
+        let (col_extra, row_extra) = window::sheet_autofit(sheet);
+        with_state(|s| {
+            s.sheet_col_w = col_extra;
+            s.sheet_row_h = row_extra;
+        });
+    }
+}
+
 pub(crate) fn present_canvas(canvas: Arc<Canvas>) {
     let Some(preview) = with_state(|s| s.preview) else {
         return;
@@ -1053,7 +1073,9 @@ pub(crate) fn present_canvas(canvas: Arc<Canvas>) {
     let visible = with_state(|s| s.visible).unwrap_or(false);
     let opaque = matches!(canvas.as_ref(), Canvas::Bitmap(_) | Canvas::Text(_));
     with_state(|s| s.zoom_preview = false);
-    set_content(Some(canvas));
+    // 必须在 set_content 之后（它会清空 sheet_col_w/row_h），否则自适应结果被清掉。
+    set_content(Some(canvas.clone()));
+    apply_sheet_autofit(canvas.as_ref());
     let _ = opaque;
     win11::clear_backdrop(preview.raw());
     if visible {

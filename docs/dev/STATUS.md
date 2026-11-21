@@ -1,5 +1,8 @@
 # 进度（STATUS）
 
+> 更新时间：2026-11-21 · **图片预览白边（方案B：客户区=图片真实像素 1:1）+ 表格打开默认自适应列宽行高（未发版）**：图片不再按 DPI 放大/抬最小窗，绘制端对图片一律铺满（`paint_bitmap_at` 新增 `fill`），根治"某些图片四周白边"；表格打开时按绘制同款字体逐格量宽、只加宽不缩窄（单列上限 160px，含 wrap/表头格都参与量宽）、`wrap` 格（表头行除外）按最终列宽量高（单行上限 90px），复用 `SheetSizes.col_extra/row_extra` 通道。回归 `cargo test -p qlr-app` 78 全绿（含 2 个新图窗尺寸单测）、`clippy -D warnings`/`fmt --check` 干净、`--render` 四夹具 RENDER-CLI ok；真机 GUI e2e（`_bench/fit-check.ps1` 截图）已跑通：图片四边无白、表格数值全显无 `####`。
+>
+
 > 更新时间：2026-11-19 · **Markdown 目录栏"空白太大"根因修复 1.15.3**：真正的 bug 不是宽度参数，而是**绘制层把 `layout.toc`（已算好的面板矩形）又传回 `paint_toc`/`paint_toc_dc`，函数内部再调一次 `toc_rect` 二次收缩**——于是"预留宽度"和"实际画出的面板宽度"不一致：宽窗口下预留 30% 但只画出更窄的一块，中间就是那道空白（也解释了上一版"看着过窄/截断"，其实是二次收缩）。修法：①`chrome` 的 `paint_toc_dc`/`paint_toc` 改为传 `layout.below_chrome`（原始区域），让绘制与 `layout` 用**同一次** `toc_width_for` 求解，宽度严格一致；②`toc_width_for` 区间收紧为「约 22% 窗口宽、196..228px（`dpi::px`）」，贴着常见标题宽度、不再留大片空白。回归 `cargo test`（app 76 / platform 53）全绿、`clippy -D warnings`/`fmt --check` 干净。
 >
 

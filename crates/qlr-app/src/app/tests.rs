@@ -42,6 +42,71 @@ fn window_size_scales_with_dpi() {
     assert!(pdf192.1 >= pdf96.1, "PDF 高度也不该变小");
 }
 
+/// 方案B（1.15.x）：图片客户区 = 图片真实像素 **1:1**，不按 DPI 放大、不抬最小窗。
+///
+/// 这是"某些图片预览有白边"的根因修复的自动断言：旧实现 `natural_rect_scaled` 会
+/// `dpi::px(图片像素)` ×1.5/×2 并抬到 240×160，客户区因此大于位图 → 绘制端居中留白。
+#[test]
+fn image_window_is_one_to_one_pixels_no_dpi_scale_no_min_bump() {
+    let work = RECT {
+        left: 0,
+        top: 0,
+        right: 3840,
+        bottom: 2160,
+    };
+    let cfg = Config::default(); // image_zoom_percent 默认 100
+    let (w, h) = (100u32, 80u32);
+
+    dpi::seed_thread(96);
+    let chrome96 = window::chrome_height();
+    let (c96w, c96h) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, None);
+    dpi::seed_thread(192);
+    let chrome192 = window::chrome_height();
+    let (c192w, c192h) = window_size_for(work, format::Kind::Image, Some((w, h)), &cfg, None);
+    dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
+
+    assert_eq!(c96w, 100, "96dpi 宽应等于图片像素，实际 {c96w}");
+    assert_eq!(c192w, 100, "192dpi 宽不应被 DPI 放大，实际 {c192w}");
+    assert!(
+        c96w < 240 && c192w < 240,
+        "不应再有最小窗 240 抬升：{c96w}/{c192w}"
+    );
+    assert_eq!(c96h, 80 + chrome96, "96dpi 高应为 80+顶栏，实际 {c96h}");
+    assert_eq!(
+        c192h,
+        80 + chrome192,
+        "192dpi 高应为 80+顶栏(随 DPI)，实际 {c192h}"
+    );
+    assert_eq!(chrome192, chrome96 * 2, "顶栏应随 DPI 翻倍");
+}
+
+/// 大图仍等比缩进工作区（86%），且内容区保持图片宽高比——不越界、不变形。
+#[test]
+fn image_large_scales_into_work_area_preserving_aspect() {
+    let work = RECT {
+        left: 0,
+        top: 0,
+        right: 3840,
+        bottom: 2160,
+    };
+    let cfg = Config::default();
+    dpi::seed_thread(96);
+    let (cw, ch) = window_size_for(work, format::Kind::Image, Some((4000, 3000)), &cfg, None);
+    let chrome = window::chrome_height();
+    let content_h = ch - chrome;
+
+    assert!(cw <= (3840.0f32 * 0.86) as i32 + 1, "宽越界 {cw}");
+    assert!(
+        content_h <= (2160.0f32 * 0.86) as i32 + 1,
+        "内容高越界 {content_h}"
+    );
+    let ar = cw as f64 / content_h as f64;
+    assert!(
+        (ar - 4000.0 / 3000.0).abs() < 0.02,
+        "内容区应保持 4:3，实际 {ar}"
+    );
+}
+
 /// 预热与上屏必须给出**逐字相同**的渲染盒。
 ///
 /// 1.8.3 的现场 bug：`maybe_prewarm` 调 `render_box` 时传的是整窗高，而上屏传的是

@@ -619,20 +619,17 @@ pub(crate) fn repaint(hwnd: HWND) {
                     }
                 );
                 // SVG / 视频首帧：**只等比缩放**（1.7.8 用户要求"定死长宽比"）。
-                // 图片（1.8.1）改由"窗口比例锁死图片比例"来保证不变形，所以这里铺满。
+                // 图片（1.15.x 方案B）：开窗时客户区就是图片真实像素 1:1，内容区恒等于位图；
+                // 走"铺满"分支并带 `fill`——即使最大化/系统改大小把内容区和位图拉开一点，
+                // 也是拉伸铺满而不是居中留白，**永不露白边**（代价：极端比例下略有拉伸）。
                 // PDF/文本/Office 是"页面"语义，继续铺满内容区（比例由渲染尺寸保证）。
-                let fit_bitmap = with_state(|s| s.last_path.clone())
+                let kind = with_state(|s| s.last_path.clone())
                     .flatten()
-                    .map(|p| match format::kind_for_path(&p) {
-                        // SVG / 视频：窗口比例本身是自由的，等比居中留白。
-                        format::Kind::Svg | format::Kind::Video => true,
-                        // 图片（1.8.1）：窗口比例已在开窗时锁成图片比例，铺满即等比。
-                        // 1.8.2 起拖边改大小对图片关掉了，但**最大化/系统改大小**仍可能
-                        // 把窗口变成别的比例——这时退回等比居中，别把图拉变形。
-                        format::Kind::Image => window_aspect_differs(hwnd, b.width, b.height),
-                        _ => false,
-                    })
-                    .unwrap_or(false);
+                    .map(|p| format::kind_for_path(&p));
+                let fit_bitmap =
+                    matches!(kind, Some(format::Kind::Svg) | Some(format::Kind::Video));
+                // 图片：小于内容区的维度也拉伸铺满，绝不居中留白（方案B 的核心）。
+                let fill = matches!(kind, Some(format::Kind::Image));
                 if fit_bitmap {
                     // 视频（1.7.9）：播放时 `s.video` 里有"当前这一帧"，它比渲染出来的首帧新。
                     // 用帧画（而不是首帧位图），窗口改大小/被别的窗口盖住后重画才不会"倒带"。
@@ -704,6 +701,7 @@ pub(crate) fn repaint(hwnd: HWND) {
                         pan.0,
                         pan.1,
                         Some(&chrome),
+                        fill,
                     );
                 }
                 paint_overlays(hwnd, &layout);

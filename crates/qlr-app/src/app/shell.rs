@@ -370,17 +370,6 @@ pub(crate) fn focus_shell_content() {
     }
 }
 
-/// 窗口内容区的比例和位图比例差得多不多（>2% 算"不一样"）。
-///
-/// 1.8.2：图片/视频不再拖边改大小，但最大化、`SetWindowPos`、系统 DPI 变化仍可能让窗口
-/// 变成别的比例；那种时候铺满会把图拉变形，所以退回"等比居中"。
-pub(crate) fn window_aspect_differs(hwnd: HWND, w: u32, h: u32) -> bool {
-    if w == 0 || h == 0 {
-        return false;
-    }
-    let content = window::chrome_rects(window::client_rect(hwnd)).content;
-    let cw = (content.right - content.left).max(1) as f64;
-    let ch = (content.bottom - content.top).max(1) as f64;
-    let bitmap = w as f64 / h as f64;
-    ((cw / ch) - bitmap).abs() / bitmap > 0.02
-}
+// 1.15.x（方案B）起，图片不再"比例不符就等比居中留白"：开窗客户区 = 图片真实像素 1:1，
+// 绘制端走 `paint_bitmap_at(fill=true)` 铺满，永不露白边。原 `window_aspect_differs`
+// 判定与 `chrome.rs` 的图片分支一并移除（函数无其它调用者）。
