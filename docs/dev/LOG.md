@@ -3930,7 +3930,7 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 ### 局限
 - 重载走完整 `show_preview`，会回到首页（PDF/pptx 翻页状态不保留）；仅在窗口可见时轮询；默认关；未 bump 版本（仍 1.15.4）。
 
-## 2026-11-23 设置页两栏重做 + 检查更新默认源（1.16.1）
+## 2026-11-23 设置页两栏重做 + 检查更新默认源（1.15.5）
 
 - **设置页显示问题**：旧版所有分组拼成单栏 `layout()`，10 组把窗口撑到 1100+ px，1080p 屏底部（更新/窗口与启动/文件）被挤出且无滚动。
 - `crates/qlr-platform/src/window/settings.rs`：新增 `settings_sidebar_width()/settings_sidebar_item_height()/settings_sidebar_padding_top()/settings_title_height()`、`SidebarItem`、`paint_settings_two_pane`（左栏 + 右单页；保留旧 `paint_settings`）。
@@ -3948,9 +3948,9 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 ### 局限
 - 设置页固定 430dip 高；两栏未加键盘左右切换分类。更新清单仍靠 GitHub API，需联网、无签名校验（只读清单+打开下载页，不自动替换）。
 
-## 2026-11-23 修复滚动条拖动（全格式）1.16.2
+## 2026-11-23 修复滚动条拖动（全格式）1.15.5
 ### 为什么
-用户反馈 1.16.1 后"滚动还是拖不动"。真机截图+模拟鼠标复现：滚轮正常，但点在 x=cw-6（滑条中点）完全无反应；同一操作改 x=cw-10 就能把 PDF 点到 8/8。根因=右侧滚动条 12px 与拖边改大小热区 8px 重叠，`WM_LBUTTONDOWN` 先判 `edges_at`，滑条中段被当拖窗口。
+用户反馈上一版后"滚动还是拖不动"。真机截图+模拟鼠标复现：滚轮正常，但点在 x=cw-6（滑条中点）完全无反应；同一操作改 x=cw-10 就能把 PDF 点到 8/8。根因=右侧滚动条 12px 与拖边改大小热区 8px 重叠，`WM_LBUTTONDOWN` 先判 `edges_at`，滑条中段被当拖窗口。
 ### 怎么改
 `chrome.rs` 新增 `scrollbar_drag_at(hwnd,lparam)`（命中区与绘制区同口径：表格用 `sheet_area`）；`on_chrome_click` 复用；`boot.rs` `WM_LBUTTONDOWN` 在 `edges_at` 之前先调它，命中即 `scroll_drag`+`set_capture`+`apply_scroll_y` 并 return。代价=可滚动格式失去右边缘拖宽（改从左/上/下/角）。
 ### 怎么验证

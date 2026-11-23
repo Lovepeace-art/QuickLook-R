@@ -950,17 +950,17 @@ media 15 / mediashape 13。
   - `qlr-app/src/settings.rs`：`Row::AutoReload` + 「文件」分组开关。
 - **回归**：`cargo build` 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 84/87/56 全绿、0 failed（core +1）；clippy `-D warnings` 0、fmt 干净。原理/坑见 CONVENTIONS #183。
 - **下一步**：① 局限=重载后回首页（PDF/pptx 翻页不保留），如需保留要先存 viewport；② 真机验证「改文件再存→预览自动刷新」（本无 GUI 环境只做编译级 + config 单测）；③ 路线图剩余：更重设置项（关窗失焦/字体字号/主题/扩展名黑白名单）→ 英文 UI → 视频出声（用户定「最后再说」）。
-## 接力说明（2026-11-23 · 设置页两栏重做 + 检查更新默认源 1.16.1）
+## 接力说明（2026-11-23 · 设置页两栏重做 + 检查更新默认源 1.15.5）
 
 - **完成**：设置页由「超长单栏」改「左分类 + 右单页」两栏，窗口固定 766×446（1080p 屏内，修掉底部被挤出屏的显示问题）；检查更新默认源改用 `DEFAULT_UPDATE_URL`（GitHub releases/latest），修掉「尚未配置更新源」。
 - **实现**：`qlr-platform/src/window/settings.rs` 新增 `SidebarItem` + `paint_settings_two_pane` + `settings_sidebar_*` 常量；`qlr-app/src/settings.rs` 重写为 `Section`/`sections()`/`Ui.section`/两栏 paint/on_click；`qlr-core/src/update.rs` 加 `DEFAULT_UPDATE_URL`，`config.rs` 默认值改它，`app/update.rs` 空值回落。
 - **回归**：`cargo build` dev/release 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 82/87/56 全绿；clippy `-D warnings` 0、fmt 干净；截图核验导航与开关正常。原理/坑见 CONVENTIONS #184。
-- **版本**：1.16.0 → 1.16.1（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.16.1-win64.zip`。
+- **版本**：1.15.5（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.15.5-win64.zip`。
 - **下一步**：① 真机确认两栏在低分屏（如 1366×768）也放得下；② 路线图剩余：英文 UI、视频出声（用户定「最后再说」，需 MF MediaSession+EVR/WASAPI，非本环境可验）。
 
-## 接力说明（2026-11-23 · 修复滚动条拖动 1.16.2）
-- **问题**：1.16.1 后用户仍报"滚动条拖不动"。
+## 接力说明（2026-11-23 · 修复滚动条拖动 1.15.5）
+- **问题**：上一版后用户仍报"滚动条拖不动"。
 - **根因**：右侧滚动条 12px 与窗口拖边热区 8px 重叠，`boot.rs` `WM_LBUTTONDOWN` 先判 `edges_at`，滑条中点被当成拖窗口。
 - **改法**：`chrome::scrollbar_drag_at(hwnd,lparam)` 命中滚动条即开始拖动；`boot.rs` 在 `edges_at` 前先调用它；`on_chrome_click` 复用。代价=可滚动格式不再右边缘拖宽。
 - **回归**：`target/shot-scroll.ps1 -XOff 6` 对 pdf/md/toml/docx/xlsx 全部验证通过；`cargo test` 82/87/56 全绿、clippy/fmt 干净、build dev+release 绿。
-- **版本**：1.16.1 → 1.16.2（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.16.2-win64.zip`。
+- **版本**：1.15.5（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.15.5-win64.zip`。

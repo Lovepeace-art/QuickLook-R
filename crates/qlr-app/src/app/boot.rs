@@ -830,7 +830,7 @@ unsafe extern "system" fn wndproc_body(
                 // 1) 先看是不是按在窗口边缘（拖边改大小，1.0.10 加回来）。
                 let (x, y) = client_xy(lparam);
                 let hit_rect = window::client_rect(hwnd);
-                // 滚动条优先于拖边（1.16.2）：右侧滚动条 12px 与外层拖边热区 8px 重叠，
+                // 滚动条优先于拖边（1.15.5）：右侧滚动条 12px 与外层拖边热区 8px 重叠，
                 // 先判边缘会把滑条中段当成拖窗口/改大小 → 用户反馈"滚动条拖不动"。
                 if scrollbar_drag_at(hwnd, lparam) {
                     return LRESULT(0);
