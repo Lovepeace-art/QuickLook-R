@@ -69,6 +69,7 @@ pub mod menu {
     pub const SETTINGS: usize = 101;
     pub const ABOUT: usize = 102;
     pub const EXIT: usize = 103;
+    pub const CHECK_UPDATE: usize = 104;
 }
 
 /// 添加托盘图标。`callback_msg` 建议传 `qlr_core::ipc::WM_TRAY_CALLBACK`。
@@ -121,10 +122,17 @@ pub fn show_menu(hwnd: HWND) -> usize {
             return 0;
         };
         let settings = to_wide("设置…");
+        let check_update = to_wide("检查更新…");
         let about = to_wide("关于");
         let exit = to_wide("退出");
 
         let _ = AppendMenuW(menu, MF_STRING, menu::SETTINGS, PCWSTR(settings.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            menu::CHECK_UPDATE,
+            PCWSTR(check_update.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_STRING, menu::ABOUT, PCWSTR(about.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, menu::EXIT, PCWSTR(exit.as_ptr()));

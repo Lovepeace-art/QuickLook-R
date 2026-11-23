@@ -233,6 +233,66 @@ static PLUGIN: PluginBackend = PluginBackend;
 /// 按优先级排好的后端表（`resolve` 取首个 `can_handle`）。
 static BACKENDS: [&'static dyn PreviewBackend; 4] = [&NATIVE, &ARCHIVE, &SHELL, &PLUGIN];
 
+/// 进程级的后端偏好缓存（与 `Config` 同步，由宿主在每次读到配置后灌一次）。
+///
+/// 为什么不用 `with_state(|s| s.config...)`：`resolve` 被渲染线程、预热线程到处调用，
+/// 若在里面再拿会话锁，既可能和已持有的 `State` 锁冲突（std `Mutex` 不可重入），
+/// 又要处理"后台线程没有会话"。偏好是进程级、只读、极小，单独放一把短锁最干净。
+#[derive(Default, Clone)]
+struct RuntimePrefs {
+    /// 被设为「保真」的格式 kind 名（`format::Kind::name()`）。
+    shell_kinds: std::collections::HashSet<String>,
+    /// 未知格式也尝试系统处理器。
+    shell_for_unsupported: bool,
+}
+
+static PREFS: std::sync::OnceLock<std::sync::Mutex<RuntimePrefs>> = std::sync::OnceLock::new();
+
+fn prefs() -> &'static std::sync::Mutex<RuntimePrefs> {
+    PREFS.get_or_init(|| std::sync::Mutex::new(RuntimePrefs::default()))
+}
+
+/// 宿主在每次读到配置后调用：把「保真」偏好灌进进程级缓存。
+///
+/// 调用点：`boot.rs` 启动读配置、`on_settings_saved` 热更新读配置各一次。
+pub(crate) fn apply_config(config: &qlr_core::config::Config) {
+    let want = RuntimePrefs::from_config(config);
+    *prefs().lock().unwrap_or_else(|e| e.into_inner()) = want;
+}
+
+impl RuntimePrefs {
+    /// 从配置算出进程级偏好快照（纯函数，便于单测，不碰全局）。
+    fn from_config(config: &qlr_core::config::Config) -> Self {
+        let mut shell_kinds = std::collections::HashSet::new();
+        for (kind, pref) in &config.backend_prefs {
+            if *pref == qlr_core::config::BackendPref::Shell {
+                shell_kinds.insert(kind.clone());
+            }
+        }
+        Self {
+            shell_kinds,
+            shell_for_unsupported: config.shell_for_unsupported,
+        }
+    }
+}
+
+/// 该格式是否被用户设为「保真」。
+fn prefers_shell(kind: format::Kind) -> bool {
+    prefs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .shell_kinds
+        .contains(kind.name())
+}
+
+/// 未知格式是否也交给系统处理器。
+fn shell_for_unsupported() -> bool {
+    prefs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .shell_for_unsupported
+}
+
 /// 选出接管这个文件的后端；`None` = 不支持（壳层响铃、不画）。
 pub(crate) fn resolve(path: &Path, kind: format::Kind) -> Option<&'static dyn PreviewBackend> {
     // 压缩包是**按扩展名**判定的容器：即使内容被嗅探成文本（例如一个假的 `.zip`
@@ -240,6 +300,14 @@ pub(crate) fn resolve(path: &Path, kind: format::Kind) -> Option<&'static dyn Pr
     // 这条必须排在按 `Kind` 判定的后端前面，等价于旧逻辑里 `archive` 先于渲染分支。
     if is_archive(path) {
         return Some(&ARCHIVE);
+    }
+    // 「保真」偏好：用户按格式显式要求走系统处理器时，让 Shell 抢在 Native 前。
+    // 只有系统确实注册了处理器才让路，否则回落到正常优先级（内置兜底，不留空白窗）。
+    let want_shell = (prefers_shell(kind)
+        || (kind == format::Kind::Unsupported && shell_for_unsupported()))
+        && shellpreview::has_handler(path);
+    if want_shell {
+        return Some(&SHELL);
     }
     // 表顺序必须与 `priority` 一致；改表忘了改优先级会在 debug/test 里立刻炸出来。
     debug_assert!(
@@ -300,6 +368,22 @@ mod tests {
         // `.zzz` 既不是内置、也不是压缩包、也没插件注册 → 应当没有后端。
         let p = PathBuf::from(r"C:\x\a.zzz");
         assert!(resolve(&p, format::kind_for_path(&p)).is_none());
+    }
+
+    #[test]
+    fn runtime_prefs_from_config_collects_shell_kinds() {
+        // 纯函数：默认配置 = 全内置、未知格式不试处理器。
+        let empty = RuntimePrefs::from_config(&qlr_core::config::Config::default());
+        assert!(empty.shell_kinds.is_empty());
+        assert!(!empty.shell_for_unsupported);
+
+        let mut cfg = qlr_core::config::Config::default();
+        cfg.set_backend_pref("document", qlr_core::config::BackendPref::Shell);
+        cfg.shell_for_unsupported = true;
+        let p = RuntimePrefs::from_config(&cfg);
+        assert!(p.shell_kinds.contains("document"));
+        assert!(!p.shell_kinds.contains("sheet"));
+        assert!(p.shell_for_unsupported);
     }
 
     #[test]

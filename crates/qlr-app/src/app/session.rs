@@ -71,6 +71,10 @@ pub(crate) const TIMER_SHEET_KEYS: usize = 0x78;
 /// 裸启动提示窗显示时长（毫秒）。
 /// Ctrl+C 轮询间隔（毫秒）。25 ms 足够抓到一次正常按键（人手按下通常 ≥80 ms）。
 pub(crate) const SHEET_KEYS_POLL_MS: u32 = 25;
+/// 文件变更自动重载轮询定时器（1.15.x）：默认常驻，`Config::auto_reload` 关着时空转返回。
+pub(crate) const TIMER_RELOAD: usize = 0x79;
+/// 自动重载轮询间隔（毫秒）：800 ms 足够"改完再存一眼就看到"，又不至于频繁读盘。
+pub(crate) const RELOAD_POLL_MS: u32 = 800;
 /// 视频取帧间隔（毫秒）。40 ms ≈ 25 fps：720p 解码一帧只要几毫秒，
 /// 剩下的时间留给"到点该显示哪一帧"的判断（落后就跳帧，见 `video_tick`）。
 pub(crate) const VIDEO_TICK_MS: u32 = 40;
@@ -175,6 +179,8 @@ pub(crate) struct State {
     pub(crate) shadow: Option<Hwnd>,
     pub(crate) visible: bool,
     pub(crate) last_path: Option<PathBuf>,
+    /// 自动重载用：上次看到的 `(路径, mtime)`。文件变了就 `show_preview` 重开。
+    pub(crate) reload_stamp: Option<(PathBuf, std::time::SystemTime)>,
     /// §7 第二刀：本次预览由哪个后端、以什么表面承载（`backend::resolve` 一处给出）。
     ///
     /// `repaint` 的顶层通道据此路由：`List`→压缩包列表、`ChildWindow`→系统处理器子窗口、
@@ -396,6 +402,7 @@ impl State {
             shadow,
             visible: false,
             last_path: None,
+            reload_stamp: None,
             surface: None,
             request_started,
             render_gen: 0,

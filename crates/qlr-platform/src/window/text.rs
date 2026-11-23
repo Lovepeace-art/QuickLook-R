@@ -424,6 +424,7 @@ pub fn paint_list(
     chrome: Option<&Chrome<'_>>,
     content: Option<RECT>,
     rows: &[ListRow<'_>],
+    overlay: Option<&dyn Fn(HDC, RECT)>,
 ) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -531,6 +532,11 @@ pub fn paint_list(
                 y += list_row_height();
             }
         });
+
+        // 叠加层（滚动条）画进同一块内存 DC，整窗一次上屏（消侧栏频闪）。
+        if let Some(draw) = overlay {
+            draw(hdc, content);
+        }
 
         if let Some(buffer) = &buffer {
             let _ = BitBlt(

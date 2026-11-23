@@ -18,6 +18,7 @@ pub mod paths;
 pub mod plugins;
 pub mod pptx;
 pub mod sheet;
+pub mod update;
 pub mod version;
 
 pub use config::Config;

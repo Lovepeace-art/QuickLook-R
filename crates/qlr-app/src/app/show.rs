@@ -405,6 +405,47 @@ pub(crate) fn remembered_size(kind_key: &str) -> Option<(i32, i32)> {
     .flatten()
 }
 
+/// 文件变更自动重载（1.15.x）：`TIMER_RELOAD` 每 `RELOAD_POLL_MS` 调一次。
+///
+/// 只在 `Config::auto_reload` 且窗口可见时工作；比较当前文件 mtime，变了就用
+/// `show_preview` 重新打开同一路径（走完整预览管线，各格式一致）。首次看到某文件只
+/// 记录基线、不重载，避免每次开预览都白白重画一次。
+pub(crate) fn on_reload_timer() {
+    let Some((enabled, visible, path)) =
+        with_state(|s| (s.config.auto_reload, s.visible, s.last_path.clone()))
+    else {
+        return;
+    };
+    if !enabled || !visible {
+        return;
+    }
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return;
+    };
+    let changed = with_state(|s| match &s.reload_stamp {
+        Some((p, m)) if p == &path => {
+            if *m != mtime {
+                s.reload_stamp = Some((path.clone(), mtime));
+                true
+            } else {
+                false
+            }
+        }
+        _ => {
+            s.reload_stamp = Some((path.clone(), mtime));
+            false
+        }
+    })
+    .unwrap_or(false);
+    if changed {
+        log_info!(SCOPE, "文件已变，自动重载：{}", path.display());
+        show_preview(Some(path));
+    }
+}
+
 pub(crate) fn show_preview(path: Option<PathBuf>) {
     let Some((config, preview_hwnd, last)) =
         with_state(|s| (s.config.clone(), s.preview, s.last_path.clone()))

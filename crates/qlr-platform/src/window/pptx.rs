@@ -1122,6 +1122,7 @@ pub fn paint_slide(
     content: Option<RECT>,
     doc: &PptxDoc,
     view_y: i32,
+    overlay: Option<&dyn Fn(HDC, RECT)>,
 ) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -1138,6 +1139,11 @@ pub fn paint_slide(
         SetBkMode(hdc, TRANSPARENT);
 
         draw_slides_flow(hdc, rc, chrome, content, doc, view_y);
+
+        // 叠加层（滚动条/目录）画进同一块内存 DC，整窗一次上屏（消侧栏频闪）。
+        if let Some(draw) = overlay {
+            draw(hdc, content.unwrap_or(rc));
+        }
 
         if let Some(buffer) = &buffer {
             let _ = BitBlt(

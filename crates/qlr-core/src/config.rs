@@ -90,6 +90,85 @@ where
     })
 }
 
+/// 某个格式类别用「内置渲染」还是「保真」(系统 IPreviewHandler) 承载。
+///
+/// 默认 [`BackendPref::Native`]：QLRust 自己画（快、省内存、观感一致）。选 `Shell`
+/// 时交给系统预览处理器（真排版，但要装 Office/对应程序，慢、占上百 MB）。系统没有
+/// 对应处理器时后端解析会自动回退内置，不会出现空白窗——见 `app::backend::resolve`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendPref {
+    /// 内置渲染（默认，与历史行为一致）。
+    #[default]
+    Native,
+    /// 保真：交给系统预览处理器（IPreviewHandler）。
+    Shell,
+}
+
+impl BackendPref {
+    /// 写进 `config.json` 的字符串形式。
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendPref::Native => "native",
+            BackendPref::Shell => "shell",
+        }
+    }
+
+    /// 设置页/日志用的短标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendPref::Native => "内置",
+            BackendPref::Shell => "保真",
+        }
+    }
+
+    /// 设置页点一下换一档（内置 ↔ 保真）。
+    pub fn cycle(self) -> Self {
+        match self {
+            BackendPref::Native => BackendPref::Shell,
+            BackendPref::Shell => BackendPref::Native,
+        }
+    }
+}
+
+/// 设置页里可按格式切换后端的固定清单：`(format::Kind::name(), 显示名)`。
+///
+/// 只收「有内置渲染、值得做保真对照」的族；长尾（无内置）统一由
+/// `shell_for_unsupported` 一个开关控制，避免每加一种格式就往设置页塞一行。
+pub const BACKEND_KINDS: &[(&str, &str)] = &[
+    ("document", "Word 文档（docx）"),
+    ("presentation", "演示文稿（pptx）"),
+    ("sheet", "电子表格（xlsx）"),
+    ("pdf", "PDF"),
+];
+
+/// 宽容地读「每格式后端偏好」：未知 kind 或写坏的档位一律跳过，**绝不让它炸掉整份配置**。
+///
+/// 与 [`de_prewarm`] 同一个理由：一个手改错的小字段不该把快捷键/窗口尺寸全打回默认。
+fn de_backend_prefs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<std::collections::BTreeMap<String, BackendPref>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<std::collections::BTreeMap<String, String>>::deserialize(deserializer)?;
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(map) = raw {
+        for (kind, value) in map {
+            match value.to_ascii_lowercase().as_str() {
+                "native" => {
+                    out.insert(kind, BackendPref::Native);
+                }
+                "shell" => {
+                    out.insert(kind, BackendPref::Shell);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -112,6 +191,12 @@ pub struct Config {
     /// 是否启用全局空格热键（关掉后只能用 CLI / 托盘触发）。
     /// 关闭场景：与别的按键增强工具冲突、或管理员进程间 UIPI 收不到按键时。
     pub hotkey_enabled: bool,
+
+    /// 预览的文件被外部程序改动时是否自动重新加载（默认 false）。
+    ///
+    /// 只在窗口可见时由 `TIMER_RELOAD`（800 ms 轮询文件 mtime）触发；改了文件再存一次，
+    /// 预览会自己刷新，不用重新按空格。默认关：轮询虽轻，但多数人文件不会被改。
+    pub auto_reload: bool,
 
     /// 快捷键绑定（1.0.7 起可配置，见 `qlr_core::keymap`）。
     ///
@@ -167,6 +252,41 @@ pub struct Config {
     #[serde(default, deserialize_with = "de_prewarm")]
     pub prewarm: Prewarm,
 
+    /// 每个格式类别用「内置渲染」还是「保真」(系统 IPreviewHandler)。
+    ///
+    /// 键是 `format::Kind::name()`（`document`/`presentation`/`sheet`/`pdf`）；缺省（空表）
+    /// = 全部内置，与历史行为一致。缺省内置是刻意的：保真会退回"上百 MB / 数百 ms"的
+    /// 资源画像，跟 32 ms / 30 MB 的卖点相反，只应作为用户按格式显式 opt-in 的出口。
+    /// 反序列化用 [`de_backend_prefs`] 做宽容解析。
+    #[serde(default, deserialize_with = "de_backend_prefs")]
+    pub backend_prefs: std::collections::BTreeMap<String, BackendPref>,
+
+    /// 未知格式（`Kind::Unsupported`，没有内置查看器）是否也尝试系统预览处理器。
+    ///
+    /// 默认 `false` = 现状（不支持就响铃、不画）；`true` 时只要系统真注册了处理器就交给它，
+    /// 对应"长尾格式先套用 QuickLook 原版"的需求。没有处理器时仍按不支持处理。
+    pub shell_for_unsupported: bool,
+
+    /// 启动时自动检查更新（默认开）。
+    ///
+    /// 检查只做"拉一份几 KB 的清单 + 版本比较"，**不自动下载、不替换自身**；发现新版本时
+    /// 只弹托盘提示并让用户点开下载页。理由见 [`qlr_core::update`] 与 `docs/dev/RELEASE.md`
+    /// （无代码签名 + in-process 内容，静默自替换坑多）。清单地址见 `update_manifest_url`。
+    pub update_check: bool,
+
+    /// 更新清单地址（自托管 `latest.json` 或 GitHub `releases/latest` API 均可）。
+    ///
+    /// 默认指向发布仓的 GitHub `releases/latest`（见 [`crate::update::DEFAULT_UPDATE_URL`]），
+    /// 开箱即可检查更新。维护者可改成自托管源；也可用环境变量 `QLRUST_UPDATE_URL` 覆盖，
+    /// 便于本地/内测指向测试源。`parse` 能兼容两种 JSON 形状，见 [`crate::update`]。
+    pub update_manifest_url: String,
+
+    /// 上次检查更新完成的时间（Unix 秒；`None` = 从没查过）。用来做「一天最多查一次」节流。
+    pub last_update_check: Option<i64>,
+
+    /// 用户选择"跳过此版本"的版本号；等于清单版本时不再提示（直到更新的版本出现）。
+    pub skipped_version: Option<String>,
+
     /// 语言：`auto` 或具体 locale（如 `zh-CN`）。
     pub language: String,
 
@@ -183,12 +303,19 @@ impl Default for Config {
             height_ratio: 0.72,
             hold_key_ms: 0,
             hotkey_enabled: true,
+            auto_reload: false,
             hotkeys: Hotkeys::default(),
             image_zoom_percent: 100,
             content_scale_percent: 0,
             window_pos: None,
             window_sizes: std::collections::BTreeMap::new(),
             prewarm: Prewarm::default(),
+            backend_prefs: std::collections::BTreeMap::new(),
+            shell_for_unsupported: false,
+            update_check: true,
+            update_manifest_url: crate::update::DEFAULT_UPDATE_URL.to_string(),
+            last_update_check: None,
+            skipped_version: None,
             language: "auto".to_string(),
             log_level: "info".to_string(),
         }
@@ -280,10 +407,41 @@ impl Config {
         self.window_sizes.insert(kind.to_string(), size);
     }
 
+    /// 取某格式类别希望的后端（缺省 = 内置）。
+    pub fn backend_pref(&self, kind: &str) -> BackendPref {
+        self.backend_prefs.get(kind).copied().unwrap_or_default()
+    }
+
+    /// 设置某格式类别的后端偏好。
+    pub fn set_backend_pref(&mut self, kind: &str, pref: BackendPref) {
+        self.backend_prefs.insert(kind.to_string(), pref);
+    }
+
+    /// 后端的日志摘要：`native` 表示全内置，否则列出被设为保真的格式。
+    fn backend_summary(&self) -> String {
+        if self.backend_prefs.is_empty() && !self.shell_for_unsupported {
+            return "native".to_string();
+        }
+        let mut parts: Vec<String> = self
+            .backend_prefs
+            .iter()
+            .filter(|(_, v)| **v == BackendPref::Shell)
+            .map(|(k, _)| format!("{k}=shell"))
+            .collect();
+        if self.shell_for_unsupported {
+            parts.push("unsupported=shell".to_string());
+        }
+        if parts.is_empty() {
+            "native".to_string()
+        } else {
+            parts.join(",")
+        }
+    }
+
     /// 给 UI/日志看的摘要。
     pub fn summary(&self) -> String {
         format!(
-            "topmost={} size={:.2}x{:.2} hold={}ms hotkey={} [{}] img={}% pos={:?} sizes={} prewarm={} lang={} log={}",
+            "topmost={} size={:.2}x{:.2} hold={}ms hotkey={} [{}] img={}% pos={:?} sizes={} prewarm={} backend={} lang={} log={}",
             self.topmost,
             self.width_ratio,
             self.height_ratio,
@@ -294,6 +452,7 @@ impl Config {
             self.window_pos,
             self.window_sizes.len(),
             self.prewarm.name(),
+            self.backend_summary(),
             self.language,
             self.log_level
         )
@@ -394,6 +553,73 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"prewarm":"瞎写","log_level":"debug"}"#).unwrap();
         assert_eq!(c.prewarm, Prewarm::Adaptive);
         assert_eq!(c.log_level, "debug", "别的字段不能被牵连");
+    }
+
+    /// 每格式后端偏好：缺失 → 全内置；写坏的档位/未知 kind 被跳过而不炸整份配置。
+    #[test]
+    fn backend_prefs_default_native_and_tolerate_garbage() {
+        assert_eq!(BackendPref::default(), BackendPref::Native);
+        assert_eq!(
+            Config::default().backend_pref("document"),
+            BackendPref::Native
+        );
+        assert_eq!(Config::default().backend_summary(), "native");
+
+        let c: Config = serde_json::from_str(r#"{"topmost":false}"#).unwrap();
+        assert!(c.backend_prefs.is_empty());
+        assert!(!c.shell_for_unsupported);
+
+        // 正常读到保真。
+        let c: Config = serde_json::from_str(r#"{"backend_prefs":{"document":"shell"}}"#).unwrap();
+        assert_eq!(c.backend_pref("document"), BackendPref::Shell);
+        assert_eq!(c.backend_pref("presentation"), BackendPref::Native);
+        assert_eq!(c.backend_summary(), "document=shell");
+
+        // 写坏的档位字符串被跳过，其它字段不受牵连。
+        let c: Config = serde_json::from_str(
+            r#"{"backend_prefs":{"pdf":"瞎写","sheet":"shell"},"log_level":"debug"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.backend_pref("pdf"), BackendPref::Native);
+        assert_eq!(c.backend_pref("sheet"), BackendPref::Shell);
+        assert_eq!(c.log_level, "debug");
+    }
+
+    #[test]
+    fn backend_pref_cycles_between_two_modes() {
+        assert_eq!(BackendPref::Native.cycle(), BackendPref::Shell);
+        assert_eq!(BackendPref::Shell.cycle(), BackendPref::Native);
+    }
+
+    /// 更新检查相关字段：默认开启、地址为空、从未检查、未跳过；老配置缺这些字段也要能读。
+    #[test]
+    fn auto_reload_defaults_false_and_survives_old_configs() {
+        let c: Config = serde_json::from_str(r#"{"topmost":false}"#).unwrap();
+        assert!(!c.auto_reload, "旧配置没有 auto_reload 时应默认 false");
+        let c2: Config = serde_json::from_str(r#"{"auto_reload":true}"#).unwrap();
+        assert!(c2.auto_reload);
+    }
+
+    #[test]
+    fn update_fields_default_and_survive_old_configs() {
+        let c = Config::default();
+        assert!(c.update_check);
+        assert_eq!(c.update_manifest_url, crate::update::DEFAULT_UPDATE_URL);
+        assert_eq!(c.last_update_check, None);
+        assert_eq!(c.skipped_version, None);
+
+        // 老配置里没有这些字段 → 用默认值，且不影响其它字段。
+        let old: Config = serde_json::from_str(r#"{"topmost":false}"#).unwrap();
+        assert!(old.update_check);
+        assert_eq!(old.update_manifest_url, crate::update::DEFAULT_UPDATE_URL);
+
+        // 新字段能正常往返。
+        let s = r#"{"update_check":false,"update_manifest_url":"https://x/latest.json","last_update_check":1700000000,"skipped_version":"1.16.0"}"#;
+        let c: Config = serde_json::from_str(s).unwrap();
+        assert!(!c.update_check);
+        assert_eq!(c.update_manifest_url, "https://x/latest.json");
+        assert_eq!(c.last_update_check, Some(1_700_000_000));
+        assert_eq!(c.skipped_version.as_deref(), Some("1.16.0"));
     }
 
     /// 设置页点一下换一档，转一圈回到原点。

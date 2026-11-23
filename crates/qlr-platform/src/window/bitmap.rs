@@ -216,7 +216,7 @@ pub fn paint_bitmap_scaled(
 /// 大图拖动掉帧的问题等 T2（A9.1）再换 flip 模型。`HALFTONE` + `SetBrushOrgEx(0,0)`
 /// 是 `StretchDIBits` 的经典搭配，否则缩放会出现条纹。
 pub fn paint_bitmap(hwnd: HWND, width: u32, height: u32, bgra: &[u8]) {
-    paint_bitmap_at(hwnd, width, height, bgra, 0, 0, None, false);
+    paint_bitmap_at(hwnd, width, height, bgra, 0, 0, None, false, None);
 }
 
 /// 画位图，但按 offset 裁剪左上角（放大后用方向键平移时用）。
@@ -240,6 +240,7 @@ pub fn paint_bitmap_at(
     offset_y: i32,
     chrome: Option<&Chrome<'_>>,
     fill: bool,
+    overlay: Option<&dyn Fn(HDC, RECT)>,
 ) {
     if width == 0 || height == 0 || bgra.len() < (width as usize * height as usize * 4) {
         return;
@@ -342,6 +343,12 @@ pub fn paint_bitmap_at(
             DIB_RGB_COLORS,
             SRCCOPY,
         );
+
+        // 叠加层（PDF 翻页滚动条）与正文同在一次 BeginPaint 内画完，
+        // 不再事后 GetDC 补画——那是"正文先上屏、侧栏后补"的频闪来源。
+        if let Some(draw) = overlay {
+            draw(hdc, content);
+        }
 
         let _ = EndPaint(hwnd, &ps);
     }

@@ -1887,3 +1887,83 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 - 恢复记忆后位图按记忆尺寸渲染（放大过的图会略糊，这是"缩放记忆"的应有代价，不是 bug）。
 - 记忆按**格式**（`Image`）落盘、不按文件：一旦放大过某张图，之后所有图（含下次启动）都按那个尺寸开——1.0.14 既有语义，若改成按文件记要另设计。
 - 改完必须保 `image_window_is_one_to_one_pixels_no_dpi_scale`（`remembered=None` 仍 1:1）、`image_tiny_gets_min_readable_window_preserving_aspect`（最小可读窗）、`image_large_scales_into_work_area_preserving_aspect`（大图 86%）三个断言不变，并新增 `image_remembers_user_zoom_size`。
+
+## #179 滚动条"频闪"= 事后 GetDC 补画；叠加层必须进各路绘制的同一个双缓冲（且光标命中矩形要与绘制区同口径）
+
+**背景**：用户报"拖动右侧滚动条时侧边栏频闪，像渲染问题"。根因=五类绘制入口 `paint_sheet`(sheet.rs)/`paint_page`(docx.rs)/`paint_slide`(pptx.rs)/`paint_bitmap_at`(bitmap.rs)/`paint_list`(text.rs) 都"先整窗铺底→BitBlt/直画→EndPaint"，而滚动条由 `crates/qlr-app/src/app/chrome.rs` 的 repaint 在 `EndPaint` **之后**用另一个 `GetDC` 的 `paint_scrollbar` 补画——两次不在同一帧缓冲，快速重绘（拖动）时槽区先被铺底刷白、再补滑块，肉眼即"频闪"。这就是 #169（"事后 GetDC 画的像素 `PrintWindow`/重绘拿不到，要长期存在的绘制必须进 `WM_PAINT` 双缓冲"）没贯彻到滚动条的后果。
+
+**做法**：给上述五个绘制函数加末参 `overlay: Option<&dyn Fn(HDC, RECT)>`，在 `BitBlt` 前（`paint_bitmap_at` 在 `EndPaint` 前、同一次 `BeginPaint`）用**同一块内存 DC** 回调 `draw(hdc, content)` 把叠加层（滚动条/目录 toc）画进去，整窗一次上屏。调用侧由 `chrome.rs`/`archive.rs` 传 `|hdc,content| paint_overlays_dc(hdc,&layout,content)`（`paint_overlays_dc` 画 toc+滚动条+音视频进度条、不含窗框），叠加后再单独 `window::paint_window_frame(hwnd)` 补 1px 发丝边。文本分支早就是这么做的（`paint_styled_with`/`paint_text_with` 的 `overlay`，1.5.2 注释"消掉侧栏闪"），照抄即可。
+
+**坑**：
+- 光标命中矩形必须与**绘制**同口径：表格滚动条画在 `sheet_area(&layout)`（`below_chrome` 扣底部标签栏），`on_chrome_click`/`apply_scroll_y` 也必须用 `sheet_area(&layout)`，否则"滑块按 682px 画、命中/拖动按 718px 算"→滑块偏长、拖到底还差一截。
+- `paint_bitmap_at` 无离屏缓冲（直接 `BeginPaint` 的 window_dc），叠加层在同一次 `BeginPaint` 内画即可，别为它单开 `GetDC`。
+- 新增 `overlay` 参数后，所有旧调用点（含 `paint_bitmap` 便利函数）都要补 `None` 或实际闭包；PDF 走 `paint_bitmap_at` 时必须传真实 overlay 才能画翻页滚动条。
+- 叠加层画进缓冲后，窗框（三条灰边）不在 `paint_overlays_dc` 里，必须另调 `paint_window_frame`。
+
+## #180 「内置/保真」后端偏好别塞进会话锁：用进程级 `OnceLock<Mutex<RuntimePrefs>>`，resolve 各处线程都能无锁冲突地读
+
+**背景**：要做「每格式 内置/保真」开关，最直觉是在 `backend::resolve` 里 `with_state(|s| s.config.backend_prefs…)`。但 `resolve` 被 UI 线程、渲染 worker、预热线程到处调用——在持着 `State` 锁的调用栈里再拿同一把 std `Mutex` 会死锁（不可重入），且后台线程可能根本没有会话。
+
+**做法**：`crates/qlr-app/src/app/backend.rs` 加 `static PREFS: OnceLock<Mutex<RuntimePrefs>>`（只放 `shell_kinds: HashSet<String>` + `shell_for_unsupported: bool`，小、只读）。`pub(crate) fn apply_config(&Config)` 在每次 `Config::load` 后调用（`boot.rs` 启动一次、`on_settings_saved` 热更新一次）覆盖写入；`resolve` 只在 `prefers_shell(kind) && shellpreview::has_handler(path)` 时抢在 Native 前返回 `&SHELL`，无处理器自动回落原生（不留空白窗）。`RuntimePrefs::from_config` 写成纯函数，单测不碰全局、避免并行测试互相污染。
+
+**坑**：
+- 偏好配置字段必须宽容反序列化（`de_backend_prefs` 只认 `native`/`shell`，其余跳过），否则手改错一个 kind 会把整份配置打回默认（同 `de_prewarm` 的理由）。
+- 别在 `resolve` 里加 `&Config` 参数顺着 7 处调用点传——渲染/预热路径拿不到会话配置；进程级只读缓存最省事。
+- `Row::Backend(key,label)` 在 `paint`（`for row in rows`，`row: Row` 拥有）拿到的是 `&'static str`；在 `on_click`（`rows.get()` → `row: &Row`）经 match 人体工学拿到的是 `&&'static str`，取值时要 `*key`/`*label` 再 `get`/`format!`。
+
+## #181 自动更新只「提示 + 打开下载页」，绝不静默自替换；HWND 不进后台线程，搬 `isize` 重建
+
+**背景**：加「检查更新」。当前无代码签名 + 进程内渲染，静默下载并替换正在运行的 exe 风险极高（文件占用写不进去、被 SmartScreen 拦、坏包无法回滚）。所以只做「后台查清单 → 托盘气泡 → 用户点了用默认浏览器打开下载页」，替换仍由用户手动完成。
+
+**做法**：
+- 纯逻辑（解析清单/比版本/判到期）放 `qlr-core/src/update.rs`，可单测、零 windows 依赖；网络与打开网址放 `qlr-platform/src/net.rs`（FFI 薄封装）；「何时查、怎么提示」放 `qlr-app/src/app/update.rs`。
+- 网络层**手写 `winhttp.dll` 导出**做 GET，不开 `windows` crate 的 `Win32_Networking_WinHttp` feature（为一个几 KB 的清单不值得）；响应体封顶 1MB、默认 8s 超时。
+- 清单字段全 `serde(default)` + 别名（`version|tag_name`、`url|html_url`、`notes|body`），自建清单与 GitHub Releases 两种形状都能解析；URL 支持 `http(s)://host[:port]/path?query`。
+
+**坑**：
+- `HWND` 不是 `Send`，不能直接 move 进 `std::thread::spawn`。做法：进线程前 `let host_raw = host.0 as isize;`，线程内 `HWND(host_raw as *mut core::ffi::c_void)` 重建（托盘 `notify` 要用）。
+- 后台线程别 `with_state` 改会话态（会抢锁、且可能无会话）；记录「上次检查时间」直接 `Config::load(&paths::config_path())` → 改 `last_update_check` → `config.save()`，让「配置只有一个写者」的约定在磁盘层成立。
+- `update_manifest_url` 默认空 = 惰性：不填地址就永远「未配置更新源」，发布前必须维护者填或让用户设环境变量 `QLRUST_UPDATE_URL`。
+- 别信「查到就自动装」：无签名自替换是更新器最危险的一档；本项目明确只做「提示 + 打开下载页」。
+
+## #182 把既有 `Config` 字段补进设置页时，UI 的「生效时机」说明必须与实际一致
+
+**背景**：补设置项时最容易犯的错，是把一个「启动时读一次」的字段（`hotkey_enabled` 决定是否装热键、`content_scale_percent` 在 `boot.rs` 启动时 `dpi::set_content_percent`）当成「点一下立即生效」展示。用户点完看不到变化，会以为开关坏了。
+
+**做法**：先弄清每个字段真正在哪读：
+- `topmost` 每次 `show.rs` `show_at(...,config.topmost)` 都读 → 下一次打开预览即生效，标注「下一次打开预览起生效」。
+- `hotkey_enabled` / `content_scale_percent` 只在 `boot.rs` 启动读一次 → 标注「重启后生效」（想 live 生效得改启动路径，别只想当然）。
+- 设置页的新增行统一走 `Row` 枚举 + `layout()` + `paint` + `on_click` + `save_and_close` 五处，缺一处要么不显示、要么点了不保存。
+- `save_and_close` 是「重新 `Config::load` 再逐字段覆盖」，新字段必须同时出现在 ①Ui 字段 ②saved 元组 ③destruct ④`config.xxx=` 四处，漏一处就静默丢改动。
+
+**坑**：
+- 数值档位（如内容缩放 自动/100/125/150/200）做成「点一下换档」比自由输入更省心；用 `const PRESETS` + `cycle` + `label` 三个小函数，配一个「走一圈回到起点」的单测。
+- 加 Header 会改变 `layout_has_one_row_per_category_header` 的期望值（`Category::ALL.len()+N`），别忘同步 +1。
+
+## #183 文件变更自动重载＝轮询 mtime → show_preview 重开，不要另写增量刷新
+
+**背景**：给「自动重载」做增量刷新要按格式各自处理（文本改行、sheet 重算、docx 重排……），代价大且易不一致。
+
+**做法**：`TIMER_RELOAD`（800 ms）只在 `Config::auto_reload && visible` 时读当前 `last_path` 的 mtime，变了就 `show_preview(Some(path))` 整个重开——复用既有完整预览管线，各格式天然一致。
+
+**坑**：
+- 首次看到某文件只记基线（`State.reload_stamp`）、不重载，否则每次开预览都白重画一次。
+- 重开会回首页（PDF/pptx 翻页状态丢失）——这是 MVP 取舍，要保留状态得另存 viewport 再恢复，别指望 `show_preview` 自动保。
+- 定时器常驻（`start_timer` 一次），靠 handler 判 `config.auto_reload` 空转，别在开关里动态 start/kill timer（多线程/句柄时序易错）。
+
+## #184 设置页两栏＝左分类 + 右单页；超长单栏必须改，别靠滚动条
+
+**背景**：设置项一多（10 个分组）就把单栏窗口撑到 1100+ px，1080p 屏装不下、底部够不到，且原本没有滚动条。
+
+**做法**：`qlr-app/src/settings.rs` 用 `Section{title,rows}` + `sections()` 把分组拆成一页页；平台 `window::paint_settings_two_pane(hwnd,&[SidebarItem],title,&[SettingsRow])` 只画当前一个分类（左栏分类 + 右侧单页）。窗口固定高 `dpi::px(430)`、宽 `sidebar_width()+dpi::px(560)`，不再随项数增长。
+
+**坑**：
+- 左栏与内容区命中要各减各的偏移：左栏 `(y - settings_sidebar_padding_top()) / settings_sidebar_item_height()`；内容区 `(y - (settings_padding_top()+settings_title_height())) / settings_row_height()`，否则点错行。
+- `Row` 去掉 Spacer/Header 后要 `#[derive(Clone,Copy)]`，命中测试才能 `rows[index].copied()` 再 match。
+- 平台 hex 颜色常量不能写 `0x00FA_F8_F7` 这类不等分组（clippy `unusual_byte_groupings` 报错），写成 `0x00FAF8F7`。
+
+## #185 滚动条命中必须优先于「拖边改大小」热区
+- 现象：滚动条能滚（滚轮 OK），但鼠标拖滑条"拖不动"。根因：客户区右侧滚动条只有 12px（`scrollbar_w()`），而窗口"拖边改大小"热区 `resize_margin` 默认 8px（`dpi::scaled(hwnd,8).max(dpi::px(6))`），两者在最右侧 8px 重叠。`WM_LBUTTONDOWN` 先 `edges_at` 再 `on_chrome_click`，于是滑条中段（cw-6）被当成拖窗口，只剩内侧 4px 能拖。
+- 规矩：命中滚动条要**先于**拖边判断。用 `chrome::scrollbar_drag_at(hwnd,lparam)`（命中区与绘制区同口径：表格用 `sheet_area` 扣掉标签栏），`WM_LBUTTONDOWN` 在 `edges_at` 之前调用它，命中即开始 `scroll_drag` 并 `return`。
+- 代价与取舍：可滚动格式不再支持"从右边缘拖宽"，改从左/上/下/角拖；这是有意的（滚动条优先）。
+- 验证：`target/shot-scroll.ps1 -File <f> -XOff 6`（点击点落在原来拖不动的滑条中点），看 hash 变化 + 目视页码/行号；pdf/md/toml/docx/xlsx 均通过。

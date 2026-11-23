@@ -891,3 +891,76 @@ media 15 / mediashape 13。
 - **完成（1.15.4）**：`crates/qlr-app/src/app/show.rs` 的 `window_size_for` 删掉 `Kind::Image` 在取 `remembered` 前的早返回分支；图片 `base` 仍用 `window::natural_rect_raw`（客户区=真实像素 1:1、方案B 口径），但继续走 `remembered` 尺寸夹取（1.0.14 尺寸/缩放记忆）+ `media_window_size` 比例锁定（1.8.1）。用户滚轮/右键拖出的缩放大小（`set_zoom_to`→`remember_size` 存 `last_sizes`/`config.window_sizes`）下次开图能恢复。
 - **回归**：新增 `image_remembers_user_zoom_size`（无记忆 1:1、记忆 2× 恢复）；`cargo test -p qlr-app` **81 passed / 1 ignored**、clippy `-D warnings` EXIT 0、`fmt --check` 零输出；原有 3 个 `image_*` 尺寸单测不变仍绿。
 - **下一步**：① 真机确认"放大图片→关闭→重开"回到上次缩放尺寸、且默认仍 1:1 无白边；② 已按 1.15.4 重新打包（zip 已覆盖），可再次真机验收。
+
+## 接力说明（2026-11-23 · 修滚动条：xlsx 拖不到底 + 全格式拖动频闪）
+
+- **完成（未发版，仍 1.15.4）**：
+  - xlsx：`crates/qlr-app/src/app/chrome.rs` `apply_scroll_y` 表格分支改 `scroll_start_at(sheet_area(&layout),…)`（原来误传 `below_chrome`，与滑块长度/上限的 `sheet_area` 口径不一致→拖不到底、滑块偏长）；`on_chrome_click` 表格命中改 `scrollbar_rect(sheet_area(&layout))`。
+  - 频闪：`paint_sheet/paint_page/paint_slide/paint_bitmap_at/paint_list` 加末参 `overlay: Option<&dyn Fn(HDC,RECT)>`，滚动条/目录叠进同一次上屏的缓冲；`chrome.rs`（Sheet/Document/Presentation/Bitmap 四分支）+`archive.rs`（paint_archive）改传 overlay 闭包、叠后 `paint_window_frame`，删掉 `EndPaint` 后 `GetDC` 二次补画。原理见 CONVENTIONS #169/#179。
+- **回归**：`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 81/78/53 全绿、0 failed；clippy `-D warnings` 0、fmt 干净、`cargo build` 绿。qlr-render 4 个 media 用例因缺 `video-demo.mp4` 环境性失败（与本改无关）。
+- **下一步**：① 真机目视：拖动滚动条不频闪、xlsx 拖到底、PDF/docx/pptx/图片滚动条正常；② 确认无误后按 AGENTS §10 三处同步 bump + 发版；③ 之后回到路线图：内置/保真后端开关 → 视频出声 → 设置项+英文 → 自动更新+崩溃诊断包。
+
+## 接力说明（2026-11-23 · 新功能：格式后端「内置 / 保真」）
+
+- **完成（未发版，仍 1.15.4）**：
+  - 设置页新增「格式后端（内置 / 保真）」分组：docx/pptx/xlsx/pdf 可逐类切「内置」（自渲染、默认）↔「保真」（系统 `IPreviewHandler`，需装 Office）；另有「其他格式（未知）」开关。
+  - `qlr-core/src/config.rs`：`BackendPref` + `Config.backend_prefs: BTreeMap` + `Config.shell_for_unsupported` + `de_backend_prefs`（宽容反序列化）+ `BACKEND_KINDS` + `backend_pref/set_backend_pref/backend_summary`。
+  - `qlr-app/src/app/backend.rs`：进程级 `PREFS: OnceLock<Mutex<RuntimePrefs>>`；`resolve` 在该 kind 偏好 shell 且 `shellpreview::has_handler` 为真时抢在 Native 前返回 `&SHELL`，无处理器回退内置。原理与坑见 CONVENTIONS #180。
+  - `qlr-app/src/app/boot.rs`：启动 + `on_settings_saved` 两处 `apply_config`。
+  - `qlr-app/src/settings.rs`：`Row::Backend`/`Row::ShellUnsupported`（Ui 草稿、layout、paint、on_click、save_and_close）。
+- **回归**：`cargo build` 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 83/80/53 全绿、0 failed；clippy `-D warnings` 0、fmt 干净。
+- **下一步**：① 真机验证保真（Office 机器切 docx=保真走系统处理器；无 Office 静默回退内置）；② 顶栏标「当前后端」为可选项；③ 回到路线图：视频出声 → 设置项+英文 → 自动更新+崩溃诊断包。
+
+## 接力说明（2026-11-23 · 改进：现场诊断包 collect-diag.ps1）
+
+- **完成（未发版，仍 1.15.4）**：`scripts/collect-diag.ps1` 重写为一条命令出一个 zip 的现场诊断包。
+  - 新增 `param([string]$OutDir="", [switch]$NonInteractive)`；`-NonInteractive` 跳过 7 问（写空 answers.txt），`-OutDir` 指定输出（默认桌面）。
+  - 新增 `Find-CrashDirs`（收集 `<data>\crashes` 下 `.dmp`+`.txt` 到 zip 的 `crashes/`）、`Find-Configs`（复制 config.json）、`Get-VersionText`（exe FileVersion+OS+PS 版本→version.txt）、`Get-GdiCounters`（→gdi.txt）。
+  - 6 步：版本→显示→日志→崩溃现场→配置+句柄→问答；`Compress-Archive` 打 `qlrust-diag-<stamp>.zip`。
+- **已验证**：`-NonInteractive -OutDir target\diag-test` 生成 28662B zip，含 dmp/txt/log/config/display/gdi/version/answers，本机真实命中 2 个崩溃文件。
+- **下一步**：① 若要做「一键」，可在设置/托盘加「收集诊断包」调用脚本 + `powershell -File`（注意无控制台窗口要 `-WindowStyle Hidden`）；② 回到路线图：视频出声（需 MF MediaSession+EVR/WASAPI，需真机音频验证）→ 设置项+英文 → 自动更新。
+
+## 接力说明（2026-11-23 · 新功能：自动更新检查）
+
+- **完成（未发版，仍 1.15.4）**：查新版本，只提示不自动替换。
+  - `qlr-core/src/update.rs`（新）：`UpdateManifest::parse`（兼容自建/GitHub 两种 JSON 形状）+ `is_newer`/`should_check`/`now_unix`/`ENV_UPDATE_URL`。
+  - `qlr-core/src/config.rs`：`update_check`(默认 true)/`update_manifest_url`/`last_update_check`/`skipped_version`。
+  - `qlr-platform/src/net.rs`（新）：手写 `winhttp` GET（≤1MB、8s）+ `ShellExecuteW` 打开网址；未启 `Win32_Networking_WinHttp` feature。
+  - `qlr-app/src/app/update.rs`（新）：`startup_check`/`manual_check`/`check_or_open`，进程内 `AVAILABLE` 缓存 + `tray::notify`；`mark_checked` 回写时间。
+  - `tray.rs` 加 `CHECK_UPDATE=104`「检查更新…」；`boot.rs` 启动 `startup_check` + `on_tray` 分发；`settings.rs` 加「更新」分组开关。原理与坑见 CONVENTIONS #181。
+- **回归**：`cargo build` 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 83/86/56 全绿、0 failed；clippy `-D warnings` 0、fmt 干净。
+- **下一步**：① 发布前填 `update_manifest_url`（或让用户设 `QLRUST_UPDATE_URL`），否则检查恒返回「未配置更新源」；② 真机验证拉清单→托盘气泡→打开下载页（本无网/无 GUI 环境只做了编译级 + URL 单测）；③ 回到路线图：视频出声（用户已定「最后再说」）→ 设置项补齐 → 英文 UI。
+
+## 接力说明（2026-11-23 · 新功能：设置项补齐 · 窗口与启动）
+
+- **完成（未发版，仍 1.15.4）**：把三个「早有 `Config` 字段、设置页没暴露」的项补进设置。
+  - `settings.rs`：`Row::Topmost/HotkeyEnabled/ContentScale` + `Ui{topmost,hotkey_enabled,content_scale}` + `open/create/layout/paint/on_click/save_and_close` 五处全套；辅助 `content_scale_label()`（0→自动）/`cycle_content_scale()`。
+  - 对应 `Config::topmost` / `hotkey_enabled` / `content_scale_percent`；`save_and_close` 会写回。
+- **生效时机**：置顶=下一次打开预览（`show.rs` 每次读 `config.topmost`）；全局热键 / 内容缩放=重启后（只在 `boot.rs` 启动读一次）。设置页 Note 行已写明。
+- **回归**：`cargo build` 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 84/86/56 全绿、0 failed（app 83→84，新增内容缩放单测）；clippy `-D warnings` 0、fmt 干净。原理/坑见 CONVENTIONS #182。
+- **下一步**：① 若想让热键 / 内容缩放 live 生效，需改 `boot.rs` 启动路径（当前只重启生效）；② 继续路线图剩余：英文 UI（较大，需全局 i18n 取舍）与视频出声（用户定「最后再说」）。
+
+## 接力说明（2026-11-23 · 新功能：文件变更自动重载）
+
+- **完成（未发版，仍 1.15.4）**：预览窗口可见且开启时，文件外部改动 800 ms 内自动重新加载。
+  - `qlr-core/src/config.rs`：`auto_reload: bool`（默认 false）。
+  - `qlr-app/src/app/session.rs`：`TIMER_RELOAD=0x79` / `RELOAD_POLL_MS=800` / `State.reload_stamp`。
+  - `qlr-app/src/app/show.rs`：`on_reload_timer()`（比对 mtime→`show_preview`）。
+  - `qlr-app/src/app/boot.rs`：启动 `start_timer(TIMER_RELOAD)` + WM_TIMER 分发。
+  - `qlr-app/src/settings.rs`：`Row::AutoReload` + 「文件」分组开关。
+- **回归**：`cargo build` 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 84/87/56 全绿、0 failed（core +1）；clippy `-D warnings` 0、fmt 干净。原理/坑见 CONVENTIONS #183。
+- **下一步**：① 局限=重载后回首页（PDF/pptx 翻页不保留），如需保留要先存 viewport；② 真机验证「改文件再存→预览自动刷新」（本无 GUI 环境只做编译级 + config 单测）；③ 路线图剩余：更重设置项（关窗失焦/字体字号/主题/扩展名黑白名单）→ 英文 UI → 视频出声（用户定「最后再说」）。
+## 接力说明（2026-11-23 · 设置页两栏重做 + 检查更新默认源 1.16.1）
+
+- **完成**：设置页由「超长单栏」改「左分类 + 右单页」两栏，窗口固定 766×446（1080p 屏内，修掉底部被挤出屏的显示问题）；检查更新默认源改用 `DEFAULT_UPDATE_URL`（GitHub releases/latest），修掉「尚未配置更新源」。
+- **实现**：`qlr-platform/src/window/settings.rs` 新增 `SidebarItem` + `paint_settings_two_pane` + `settings_sidebar_*` 常量；`qlr-app/src/settings.rs` 重写为 `Section`/`sections()`/`Ui.section`/两栏 paint/on_click；`qlr-core/src/update.rs` 加 `DEFAULT_UPDATE_URL`，`config.rs` 默认值改它，`app/update.rs` 空值回落。
+- **回归**：`cargo build` dev/release 绿；`cargo test -p qlr-app -p qlr-core -p qlr-platform` = 82/87/56 全绿；clippy `-D warnings` 0、fmt 干净；截图核验导航与开关正常。原理/坑见 CONVENTIONS #184。
+- **版本**：1.16.0 → 1.16.1（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.16.1-win64.zip`。
+- **下一步**：① 真机确认两栏在低分屏（如 1366×768）也放得下；② 路线图剩余：英文 UI、视频出声（用户定「最后再说」，需 MF MediaSession+EVR/WASAPI，非本环境可验）。
+
+## 接力说明（2026-11-23 · 修复滚动条拖动 1.16.2）
+- **问题**：1.16.1 后用户仍报"滚动条拖不动"。
+- **根因**：右侧滚动条 12px 与窗口拖边热区 8px 重叠，`boot.rs` `WM_LBUTTONDOWN` 先判 `edges_at`，滑条中点被当成拖窗口。
+- **改法**：`chrome::scrollbar_drag_at(hwnd,lparam)` 命中滚动条即开始拖动；`boot.rs` 在 `edges_at` 前先调用它；`on_chrome_click` 复用。代价=可滚动格式不再右边缘拖宽。
+- **回归**：`target/shot-scroll.ps1 -XOff 6` 对 pdf/md/toml/docx/xlsx 全部验证通过；`cargo test` 82/87/56 全绿、clippy/fmt 干净、build dev+release 绿。
+- **版本**：1.16.1 → 1.16.2（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.16.2-win64.zip`。

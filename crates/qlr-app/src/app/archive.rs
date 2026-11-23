@@ -446,13 +446,23 @@ pub(crate) fn paint_archive(hwnd: HWND) {
         toast: toast.as_deref(),
         pinned,
     };
-    window::paint_list(hwnd, Some(&chrome), Some(layout.content), &page);
-    // 滚动条（1.7.3）：`paint_overlays` 里的那条是按 `scroll_info()`（文本行/PDF 页）算的，
-    // 压缩包的"内容单位"是自己展平后的行，所以这里单独画一条。
-    if layout.bar.is_some()
-        && let Some(info) = archive_scroll_info(layout.below_chrome)
-    {
-        window::paint_scrollbar(hwnd, layout.below_chrome, info, false);
-    }
-    paint_overlays(hwnd, &layout);
+    // 滚动条（1.7.3）：`paint_overlays` 里的那条按 `scroll_info()`（文本行/PDF 页）算，
+    // 压缩包的"内容单位"是展平后的行，所以单独画一条；并和列表内容画进同一块内存 DC、
+    // 整窗一次上屏（1.5.2 同款修法，消除侧栏频闪）。最外圈发丝边另画。
+    let overlay = |hdc: HDC, content: RECT| {
+        if layout.bar.is_some()
+            && let Some(info) = archive_scroll_info(layout.below_chrome)
+        {
+            window::paint_scrollbar_dc(hdc, layout.below_chrome, info, false);
+        }
+        paint_overlays_dc(hdc, &layout, content);
+    };
+    window::paint_list(
+        hwnd,
+        Some(&chrome),
+        Some(layout.content),
+        &page,
+        Some(&overlay),
+    );
+    window::paint_window_frame(hwnd);
 }

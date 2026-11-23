@@ -17,6 +17,9 @@ pub fn run() -> ExitCode {
     let _ = paths::ensure_dirs();
 
     let (config, config_err) = Config::load(&paths::config_path());
+    // 后端偏好（内置/保真）是进程级只读缓存：`resolve` 在 UI/渲染/预热线程都会读，
+    // 启动时先灌一次，之后由 `on_settings_saved` 每次热更新再灌。
+    backend::apply_config(&config);
     // 1.8.3：内容缩放（正文/目录/列表）与外壳分开——见 `Config::content_scale_percent`。
     // 必须在读配置之后设（默认 0 = 自动，200% 下按 1.41 倍而不是 2 倍）。
     dpi::set_content_percent(config.content_scale_percent);
@@ -295,9 +298,13 @@ pub fn run() -> ExitCode {
 
     // 配置马上要被移进 State，热键摘要与绑定表先留一份出来（下面装钩子要用）。
     let hotkeys = config.hotkeys.clone();
+    // 自动更新检查要用一份独立副本（config 下面会被移进 State）。
+    let update_conf = config.clone();
 
     // 对比模式：首个预览窗 = 初始驱动窗；会话登记在按窗口表里，并设它为 DRIVER。
     let _session = new_session(preview, host, config, shadow, started);
+    // 启动检查更新（后台线程，不阻塞、不抢焦点）。
+    super::update::startup_check(host, update_conf);
     set_driver(Some(preview.0 as isize));
     sync_hotkey_previews();
     let _ = RESULT.set(Mutex::new(Vec::new()));
@@ -358,6 +365,8 @@ pub fn run() -> ExitCode {
     window::start_timer(preview, TIMER_WATCHDOG, WATCHDOG_INTERVAL_MS);
     // 表格 Ctrl+C 轮询（1.9.4）：25 ms 一拍，只在光标在预览上时才认这个键。
     window::start_timer(preview, TIMER_SHEET_KEYS, SHEET_KEYS_POLL_MS);
+    // 文件变更自动重载（1.15.x）：常驻 800 ms 一拍，`Config::auto_reload` 关着时空转。
+    window::start_timer(preview, TIMER_RELOAD, RELOAD_POLL_MS);
 
     // 全局空格热键（A1.5）。失败不致命：还可以用 CLI / 托盘触发。
     let mut hotkey_guard = if hotkey_enabled {
@@ -679,6 +688,11 @@ pub(crate) fn on_tray(lparam: LPARAM) {
             paths::data_dir()
         ),
         tray::menu::EXIT => quit(),
+        tray::menu::CHECK_UPDATE => {
+            if let Some((h, c)) = with_state(|s| (s.host, s.config.clone())) {
+                super::update::check_or_open(h.raw(), c);
+            }
+        }
         _ => {}
     }
 }
@@ -704,6 +718,8 @@ pub(crate) fn on_settings_saved() {
     }
     hotkey::set_bindings(config.hotkeys.packed());
     with_state(|s| s.config = config.clone());
+    // 后端偏好热更新：设置里刚改的「内置/保真」下一次预览就生效。
+    backend::apply_config(&config);
     log_info!(SCOPE, "配置已热更新：{}", config.summary());
 }
 
@@ -814,6 +830,11 @@ unsafe extern "system" fn wndproc_body(
                 // 1) 先看是不是按在窗口边缘（拖边改大小，1.0.10 加回来）。
                 let (x, y) = client_xy(lparam);
                 let hit_rect = window::client_rect(hwnd);
+                // 滚动条优先于拖边（1.16.2）：右侧滚动条 12px 与外层拖边热区 8px 重叠，
+                // 先判边缘会把滑条中段当成拖窗口/改大小 → 用户反馈"滚动条拖不动"。
+                if scrollbar_drag_at(hwnd, lparam) {
+                    return LRESULT(0);
+                }
                 let edges = edges_at(hit_rect, x, y, resize_margin(hwnd));
                 // 1.7.4 起埋点：`按下 (x, y) 客户区 WxH 边=?`——"拖边不生效"这类反馈
                 // 全看这一条就能分清是"点没到边缘"还是"点根本没进来"。
@@ -927,6 +948,11 @@ unsafe extern "system" fn wndproc_body(
             }
             WM_TIMER if wparam.0 == TIMER_SHEET_KEYS => {
                 sheet_poll_ctrl_c(hwnd);
+                LRESULT(0)
+            }
+            // 文件变更自动重载（1.15.x）：开了 auto_reload 才真正干活，否则空转返回。
+            WM_TIMER if wparam.0 == TIMER_RELOAD => {
+                on_reload_timer();
                 LRESULT(0)
             }
             // 音频进度条（1.7.9）：只重画进度条那一条，整窗不动。

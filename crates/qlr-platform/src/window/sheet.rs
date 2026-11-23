@@ -2204,6 +2204,7 @@ pub fn paint_sheet(
     scroll_x: i32,
     scroll_y: i32,
     sel: Option<(u32, u32, u32, u32)>,
+    overlay: Option<&dyn Fn(HDC, RECT)>,
 ) {
     let mut ps = PAINTSTRUCT::default();
     let window_dc: HDC = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -2232,6 +2233,11 @@ pub fn paint_sheet(
     if content.right > content.left && content.bottom > content.top {
         check_sheet_health(sheet);
         Painter::new(hdc, sheet, *sizes, content, scroll_x, scroll_y, sel).paint();
+    }
+
+    // 叠加层（竖直滚动条）画进同一块内存 DC，再整窗一次 BitBlt 上屏（消侧栏频闪）。
+    if let Some(draw) = overlay {
+        draw(hdc, content);
     }
 
     if let Some(buf) = &buffer {

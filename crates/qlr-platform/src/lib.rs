@@ -12,6 +12,7 @@ pub mod dpi;
 pub mod hotkey;
 pub mod instance;
 pub mod integrity;
+pub mod net;
 pub mod selection;
 pub mod shellpreview;
 pub mod thumbnail;

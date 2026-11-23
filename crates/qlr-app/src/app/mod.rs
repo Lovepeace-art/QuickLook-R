@@ -47,6 +47,7 @@ mod render;
 mod session;
 mod shell;
 mod show;
+pub(crate) mod update;
 
 #[cfg(test)]
 mod tests;

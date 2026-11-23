@@ -584,6 +584,7 @@ pub fn paint_page(
     content: Option<RECT>,
     doc: &DocDoc,
     view_y: i32,
+    overlay: Option<&dyn Fn(HDC, RECT)>,
 ) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -687,6 +688,11 @@ pub fn paint_page(
         // 这里在内容画完之后把顶栏浮层补画一遍（标题/页码/按钮重复画一次无副作用）。
         if let Some(spec) = chrome {
             let _ = paint_chrome(hdc, rc, spec);
+        }
+
+        // 叠加层（滚动条/目录）画进同一块内存 DC，整窗一次上屏（消侧栏频闪）。
+        if let Some(draw) = overlay {
+            draw(hdc, content);
         }
 
         if let Some(buffer) = &buffer {

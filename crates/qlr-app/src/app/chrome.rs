@@ -246,6 +246,31 @@ pub(crate) fn open_external() {
     log_info!(SCOPE, "在其他应用打开：{shown} ok={ok}");
 }
 
+/// 命中滚动条就开始拖动；命中区与绘制区同口径（表格用 `sheet_area`，扣掉底部标签栏）。
+///
+/// **必须在 `edges_at` 之前调用**：右侧滚动条只有 12 px，而外层"拖边改大小"的热区有
+/// 8 px，两者重叠。若先判边缘，滑条中段会被当成"拖窗口/改大小"，表现就是用户说的
+/// "滚动条拖不动"。给出滚动条的完整 12 px 优先权，右侧改大小改从左/上/下/角进行。
+pub(crate) fn scrollbar_drag_at(hwnd: HWND, lparam: LPARAM) -> bool {
+    let (x, y) = client_xy(lparam);
+    let layout = frame(hwnd);
+    let bar = if is_sheet_view() {
+        Some(window::scrollbar_rect(sheet_area(&layout)))
+    } else {
+        layout.bar
+    };
+    let Some(bar) = bar else {
+        return false;
+    };
+    if !point_in(x, y, bar) {
+        return false;
+    }
+    with_state(|s| s.scroll_drag = true);
+    window::set_capture(hwnd);
+    apply_scroll_y(hwnd, y);
+    true
+}
+
 /// 顶栏/目录/滚动条的点击。返回 `true` 表示这次点击已被消费（不要再去拖窗口）。
 pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
     let (x, y) = client_xy(lparam);
@@ -315,12 +340,9 @@ pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
     }
 
     let layout = frame(hwnd);
-    if let Some(bar) = layout.bar
-        && point_in(x, y, bar)
-    {
-        with_state(|s| s.scroll_drag = true);
-        window::set_capture(hwnd);
-        apply_scroll_y(hwnd, y);
+    // 滚动条优先于"拖边改大小"：右侧滚动条 12px 与外层拖边热区（8px）重叠，
+    // 若先判边缘，滑条中段会被当成拖窗口/改大小（用户反馈"拖不动"）。命中区与绘制区同口径。
+    if scrollbar_drag_at(hwnd, lparam) {
         return true;
     }
     if let Some(toc) = layout.toc
@@ -358,7 +380,9 @@ pub(crate) fn apply_scroll_y(hwnd: HWND, y: i32) {
         let Some((_, max_y)) = sheet_scroll_max(sheet_area(&layout)) else {
             return;
         };
-        let ratio = window::scroll_start_at(layout.below_chrome, y, info);
+        // 滑块长/位置都按 sheet_area（扣掉底部标签栏）算，拖动映射也必须用同一块，
+        // 否则按 below_chrome 的轨道反推会和画出来的滑块错位（拖不到底、滑块不跟手）。
+        let ratio = window::scroll_start_at(sheet_area(&layout), y, info);
         let target = (ratio * max_y as f32).round() as i32;
         with_state(|s| {
             s.sheet_scroll.1 = target.clamp(0, max_y);
@@ -679,6 +703,9 @@ pub(crate) fn repaint(hwnd: HWND) {
                 }
                 if preview {
                     window::paint_bitmap_scaled(hwnd, b.width, b.height, &b.bgra, Some(&chrome));
+                    paint_overlays(hwnd, &layout);
+                    paint_lens_if_any(hwnd);
+                    return;
                 } else {
                     // 1.4.3：位图尺寸和内容区尺寸不一致时 `paint_bitmap_at` 会**拉伸**，
                     // 每一帧都要重采样整张图 —— 表现就是"画面发虚 + 拖动跟不上 + 滚动频闪"。
@@ -711,6 +738,9 @@ pub(crate) fn repaint(hwnd: HWND) {
                             cy = ch
                         );
                     }
+                    // 内容 + 滚动条画进同一次 BeginPaint，消除"正文先上屏、侧栏后补"的频闪。
+                    let overlay =
+                        |hdc: HDC, content: RECT| paint_overlays_dc(hdc, &layout, content);
                     window::paint_bitmap_at(
                         hwnd,
                         b.width,
@@ -720,11 +750,12 @@ pub(crate) fn repaint(hwnd: HWND) {
                         pan.1,
                         Some(&chrome),
                         fill,
+                        Some(&overlay),
                     );
+                    window::paint_window_frame(hwnd);
+                    paint_lens_if_any(hwnd);
+                    return;
                 }
-                paint_overlays(hwnd, &layout);
-                paint_lens_if_any(hwnd);
-                return;
             }
             // 表格（1.9.0）：帧里只有数据，每次重画都按当前滚动偏移逐格现画。
             // 这样"滚一行"只花几毫秒，也不需要把整张表渲成一张大位图（2 万行的表
@@ -769,6 +800,13 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.bottom - layout.content.top
                 );
                 log_debug!(SCOPE, "PAINT sel={sel:?}");
+                // 竖直滚动条（1.9.1）：滑块按**像素**算。和表格内容画进同一块内存 DC、
+                // 整窗一次上屏，拖动/滚动时侧栏不再"先白一下再补滑块"（1.5.2 同款修法）。
+                let sheet_overlay = |hdc: HDC, _content: RECT| {
+                    if let Some(info) = sheet_scroll_info(sheet_area(&layout)) {
+                        window::paint_scrollbar_dc(hdc, sheet_area(&layout), info, false);
+                    }
+                };
                 window::paint_sheet(
                     hwnd,
                     Some(&chrome),
@@ -778,12 +816,8 @@ pub(crate) fn repaint(hwnd: HWND) {
                     sx,
                     sy,
                     sel,
+                    Some(&sheet_overlay),
                 );
-                // 竖直滚动条（1.9.1）：滑块按**像素**算，画在内容区右侧那条上。
-                // `paint_sheet` 内部已经 `EndPaint`，这里再用 `GetDC` 那版不冲突。
-                if let Some(info) = sheet_scroll_info(sheet_area(&layout)) {
-                    window::paint_scrollbar(hwnd, sheet_area(&layout), info, false);
-                }
                 // 底部工作表标签栏（1.9.2）：点标签切表，当前页高亮。
                 if let Some(tabs) = layout.tabs {
                     let active = with_state(|s| s.page).unwrap_or(0);
@@ -816,8 +850,17 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
-                window::paint_page(hwnd, Some(&chrome), Some(layout.content), doc, vy);
-                paint_overlays(hwnd, &layout);
+                // 滚动条/目录叠进同一块内存 DC 一次上屏（消侧栏频闪）；最外圈发丝边另画。
+                let overlay = |hdc: HDC, content: RECT| paint_overlays_dc(hdc, &layout, content);
+                window::paint_page(
+                    hwnd,
+                    Some(&chrome),
+                    Some(layout.content),
+                    doc,
+                    vy,
+                    Some(&overlay),
+                );
+                window::paint_window_frame(hwnd);
                 paint_lens_if_any(hwnd);
                 return;
             }
@@ -844,8 +887,17 @@ pub(crate) fn repaint(hwnd: HWND) {
                     layout.content.right - layout.content.left,
                     layout.content.bottom - layout.content.top
                 );
-                window::paint_slide(hwnd, Some(&chrome), Some(layout.content), doc, vy);
-                paint_overlays(hwnd, &layout);
+                // 滚动条/目录叠进同一块内存 DC 一次上屏（消侧栏频闪）；最外圈发丝边另画。
+                let overlay = |hdc: HDC, content: RECT| paint_overlays_dc(hdc, &layout, content);
+                window::paint_slide(
+                    hwnd,
+                    Some(&chrome),
+                    Some(layout.content),
+                    doc,
+                    vy,
+                    Some(&overlay),
+                );
+                window::paint_window_frame(hwnd);
                 paint_lens_if_any(hwnd);
                 return;
             }
