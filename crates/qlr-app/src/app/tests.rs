@@ -140,6 +140,32 @@ fn image_remembers_user_zoom_size() {
     dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
 }
 
+/// #8 回归：极端竖长图（如 1:40 的长截图）不能被等比压成一根细针——宽度必须保留最小可读
+/// 宽度，否则顶栏的关闭按钮会被挤没。代价是高度方向不再严格等比（绘制端 `fill=true` 会
+/// 横向拉伸填满），这是"能看见、能关掉"优先于"绝对等比"的有意取舍。
+#[test]
+fn image_extreme_tall_keeps_min_width() {
+    let work = RECT {
+        left: 0,
+        top: 0,
+        right: 3840,
+        bottom: 2160,
+    };
+    let cfg = Config::default();
+    dpi::seed_thread(96);
+    let chrome = window::chrome_height();
+    let (cw, ch) = window_size_for(work, format::Kind::Image, Some((100, 4000)), &cfg, None);
+    dpi::seed_thread(96); // 别把 DPI 留给同线程的其它测试
+
+    assert!(cw >= 240, "超高图宽度不应被压到 240 以下，实际 {cw}");
+    assert!(ch <= 2160, "高度不应超过工作区，实际 {ch}");
+    assert!(
+        ch - chrome > 1500,
+        "高度应尽量铺满工作区，内容高实际 {}",
+        ch - chrome
+    );
+}
+
 /// 大图仍等比缩进工作区（86%），且内容区保持图片宽高比——不越界、不变形。
 #[test]
 fn image_large_scales_into_work_area_preserving_aspect() {

@@ -362,6 +362,12 @@ pub(crate) fn window_size_for(
             }
         }
     }
+    // #8 极端高图：`media_window_size` 为把内容塞进工作区会把宽度压到 `min_window_w()` 以下，
+    // 这里在"没有用户尺寸记忆"时抬回最小可读宽（≤工作区），保证顶栏关闭按钮可见；
+    // 绘制端 `fill=true` 兜底不会露白。有记忆时尊重用户缩放结果，不强行抬宽。
+    if kind == format::Kind::Image && remembered.is_none() && width < min_window_w() {
+        width = min_window_w().min((work.right - work.left).max(1));
+    }
     (width, height)
 }
 
@@ -626,12 +632,30 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     let zoom = 1.0_f32;
     with_state(|s| {
         s.page = first_page;
+        s.pdf_page = first_page;
         s.pages = pages;
         // 1.9.4：换文件时清掉上一个文件留下的单元格选中。
         s.sheet_sel = None;
         s.sheet_sel_focus = None;
         s.sheet_dragging = false;
+        // 换文件先清掉上一份 PDF 的大纲（非 PDF 文件保持空 → 不显示目录栏）。
+        s.pdf_outline = Vec::new();
     });
+
+    // PDF 目录（有书签就显示目录栏，没有就空着不显示）。必须在 `set_content(None)` 之前写入：
+    // 否则 `set_content` 会把 PDF 的 toc 当成"普通图片"清空。
+    if kind == format::Kind::Pdf {
+        if let Some(p) = target.as_deref() {
+            let outline: Vec<(u8, String, usize)> = qlr_render::pdf::outline(p)
+                .into_iter()
+                .map(|e| (e.level, e.title, e.page))
+                .collect();
+            with_state(|s| {
+                s.pdf_outline = outline.clone();
+                s.toc = outline;
+            });
+        }
+    }
 
     clear_archive_view();
     if let Some(p) = target.as_deref()
@@ -675,7 +699,11 @@ pub(crate) fn show_preview(path: Option<PathBuf>) {
     // "把占位页面直接删掉"）：窗口先空着，处理器第一帧到了直接铺满，中间不闪一页文字。
     // 只有走我们自己渲染的格式才留"正在渲染…"那一行。
     let shell = backend.is_some_and(|b| b.id() == "shell");
-    if shell {
+    // 图片（png/jpg/gif/webp/tiff/psd… 都是 `Kind::Image`）也**不留**占位页：
+    // 大图解码要几百毫秒，这期间露出整页"正在渲染…／文件信息"很不干净（用户反馈
+    // "预览 png 还是有占位页，之前不是全部删掉了么"）。窗口已按素材比例开好，先空着，
+    // 渲染帧一到直接铺满。
+    if shell || kind == format::Kind::Image {
         lines.clear();
     } else if renderable {
         lines.insert(2, "正在渲染…".to_string());

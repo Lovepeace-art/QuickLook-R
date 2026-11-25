@@ -2188,6 +2188,59 @@ pub fn sheet_divider_at(
     None
 }
 
+/// 行/列号表头点选（#10）：点在列号条上选整列、点在行号条上选整行。
+///
+/// 与 [`sheet_cell_at`] 同一套坐标口径（`px`/`py` 相对 content 左上角、冻结区不滚动），
+/// 但把"落在表头上"从"返回 None"改成"返回点中的行/列索引"，供壳层做整行/整列选择。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderHit {
+    Row(usize),
+    Col(usize),
+}
+
+pub fn sheet_header_at(
+    sheet: &Sheet,
+    sizes: &SheetSizes<'_>,
+    scroll_x: i32,
+    scroll_y: i32,
+    px: i32,
+    py: i32,
+) -> Option<HeaderHit> {
+    if sheet.rows == 0 || sheet.cols == 0 {
+        return None;
+    }
+    let m = Metrics::current();
+    let frozen_w = sizes.col_x(sheet, sheet.frozen_cols.min(sheet.cols));
+    let frozen_h = sizes.row_y(sheet, sheet.frozen_rows.min(sheet.rows));
+    // 列号条：顶部 `header_h` 高、且在表头右侧（`px >= header_w`）。
+    if py >= 0 && py < m.header_h && px >= m.header_w {
+        let body_x = i64::from(px - m.header_w);
+        let content_x = if body_x < frozen_w {
+            body_x
+        } else {
+            body_x.saturating_add(i64::from(scroll_x.max(0)))
+        };
+        let col = sizes.col_at(sheet, content_x);
+        if col < sheet.cols {
+            return Some(HeaderHit::Col(col as usize));
+        }
+    }
+    // 行号条：左侧 `header_w` 宽、且在表头下方（`py >= header_h`）。
+    if px >= 0 && px < m.header_w && py >= m.header_h {
+        let body_y = i64::from(py - m.header_h);
+        let content_y = if body_y < frozen_h {
+            body_y
+        } else {
+            body_y.saturating_add(i64::from(scroll_y.max(0)))
+        };
+        let row = sizes.row_at(sheet, content_y);
+        if row < sheet.rows {
+            return Some(HeaderHit::Row(row as usize));
+        }
+    }
+    None
+}
+
 /// 画一张工作表。
 ///
 /// `scroll_x`/`scroll_y` 是"内容已经滚走的像素"，由壳层维护；`content` 是扣除边框和
@@ -2316,6 +2369,35 @@ mod tests {
         }
     }
 
+    /// #10：点列号条选整列、点行号条选整行；正文点仍交给 `sheet_cell_at`（这里返回 None）。
+    #[test]
+    fn header_hit_selects_row_or_col() {
+        let s = wide_sheet(); // 100 列 × 1000 行，列宽 50、行高 20
+        let sizes = SheetSizes::EMPTY;
+        let m = Metrics::current();
+        // 列号条：落在第 1 列（索引 1，body_x=75 落在 [50,100)）。
+        let px = m.header_w + 75;
+        let py = m.header_h / 2;
+        assert_eq!(
+            sheet_header_at(&s, &sizes, 0, 0, px, py),
+            Some(HeaderHit::Col(1))
+        );
+        // 行号条：落在第 2 行（索引 2，body_y=50 落在 [40,60)）。
+        let px2 = m.header_w / 2;
+        let py2 = m.header_h + 50;
+        assert_eq!(
+            sheet_header_at(&s, &sizes, 0, 0, px2, py2),
+            Some(HeaderHit::Row(2))
+        );
+        // 正文区域不归表头管（应返回 None，由 sheet_cell_at 处理）。
+        assert_eq!(
+            sheet_header_at(&s, &sizes, 0, 0, m.header_w + 5, m.header_h + 5),
+            None
+        );
+        // 空表不 panic。
+        assert_eq!(sheet_header_at(&Sheet::default(), &sizes, 0, 0, 0, 0), None);
+    }
+
     #[test]
     fn column_labels_follow_excel_base26() {
         assert_eq!(column_label(0), "A");
@@ -2408,6 +2490,41 @@ mod tests {
         assert_eq!(overflow_last_col(&s, 1, 0), 2);
         // 最后一列没有右邻
         assert_eq!(overflow_last_col(&s, 1, 4), 4);
+    }
+
+    #[test]
+    fn col_row_hit_honours_autofit_extra() {
+        // 3 列基准宽 10、2 行基准高 20；自动列宽把第 0 列加宽 +40。
+        // 显示坐标：A=0..50、B=50..60、C=60..70 —— 点 B 中间必须命中 B（不是 A）。
+        let s = Sheet {
+            cols: 3,
+            rows: 2,
+            col_widths: vec![10, 10, 10],
+            row_heights: vec![20, 20],
+            ..Default::default()
+        };
+        let col_extra = [(0u32, 40i32)];
+        let sizes = SheetSizes {
+            col_extra: &col_extra,
+            row_extra: &[],
+        };
+        assert_eq!(sizes.col_at(&s, 5), 0, "加宽后的 A 左半仍是 A");
+        assert_eq!(sizes.col_at(&s, 49), 0, "加宽后的 A 右缘仍是 A");
+        assert_eq!(
+            sizes.col_at(&s, 55),
+            1,
+            "视觉 B 中间点是 B（旧 bug 会落回 A）"
+        );
+        assert_eq!(sizes.col_at(&s, 65), 2, "视觉 C 是 C");
+        // 行同理：第 0 行加高 +25，显示 0..45 是第 0 行，45 之后是第 1 行。
+        let row_extra = [(0u32, 25i32)];
+        let rsizes = SheetSizes {
+            col_extra: &[],
+            row_extra: &row_extra,
+        };
+        assert_eq!(rsizes.row_at(&s, 40), 0, "加高后的第 0 行仍是第 0 行");
+        assert_eq!(rsizes.row_at(&s, 44), 0);
+        assert_eq!(rsizes.row_at(&s, 46), 1, "越过加高行后是第 1 行");
     }
 
     #[test]

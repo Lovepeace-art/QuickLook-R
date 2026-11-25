@@ -46,6 +46,11 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 
+# 批 B（2026-11-25）#2：PSD/PSB（Photoshop）原生解码。纯 Rust，`image` 不解 8BPS 容器。
+psd = "0.3"
+# 批 B（2026-11-25）#3：老式二进制 Excel `.xls` 解析（BIFF8）。纯 Rust，不依赖 Office。
+calamine = "0.38"
+
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

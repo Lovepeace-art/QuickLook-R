@@ -81,7 +81,7 @@ pwsh -NoProfile -File "%LOCALAPPDATA%\Programs\QLRust\uninstall.ps1"   # 卸载�
 
 首次运行会有 SmartScreen 提示（无代码签名证书），选"更多信息 → 仍要运行"即可。
 
-**系统要求**：Windows 10 / Windows 11，x64。表格（xlsx/xlsm/xltx/xltm）**不需要装 Office**（内置原生渲染，见 [ADR-0011](docs/adr/0011-native-sheet-preview.md)）；文档（docx/docm/dotx/dotm）也已改为**内置原生分页渲染，不需要装 Office**（见 [docx 方案](docs/plans/docx-native-preview.md)）；演示文稿（pptx/pptm/potx/potm/ppsx/ppsm）也已改为**内置原生分页渲染，不需要装 Office**；仅其余 ODF（odt/ods/odp）仍走系统 `IPreviewHandler`，需要本机装了字处理软件；PDF 需要随包提供的 `pdfium.dll`。
+**系统要求**：Windows 10 / Windows 11，x64。表格（xlsx/xlsm/xltx/xltm/**xls**）**不需要装 Office**（内置原生渲染，见 [ADR-0011](docs/adr/0011-native-sheet-preview.md)；`.xls` 老式 BIFF 由纯 Rust `calamine` 解析）；文档（docx/docm/dotx/dotm）也已改为**内置原生分页渲染，不需要装 Office**（见 [docx 方案](docs/plans/docx-native-preview.md)）；演示文稿（pptx/pptm/potx/potm/ppsx/ppsm）也已改为**内置原生分页渲染，不需要装 Office**；图片新增 **PSD/PSB** 内置解码（纯 Rust `psd`，不依赖 Photoshop）；**EPUB** 也已内置（解包按 spine 逐章排版，归 HTML 族）；仅其余 ODF（odt/ods/odp）与老式 `.doc/.ppt` 仍走系统 `IPreviewHandler`，需要本机装了字处理软件；PDF 需要随包提供的 `pdfium.dll`。
 
 ## 致谢
 

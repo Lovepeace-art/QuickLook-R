@@ -208,6 +208,9 @@ pub(crate) struct State {
     /// 连续视图的总高 / 视口高（物理像素），由壳层每帧回写，供滚动条按像素比例用。
     pub(crate) flow_total: f64,
     pub(crate) flow_view: f64,
+    /// PDF 连续滚动：屏幕上这张 `Canvas::Bitmap` 代表第几页（0 基）。逐页贴图时靠它
+    /// 区分"这张 b 是哪一页"——滚动时 `s.page` 会被改写成顶部页，不能再当"已渲染页"用。
+    pub(crate) pdf_page: usize,
     /// 表格的滚动偏移（像素，`(x, y)`）：表格是二维滚动，跟文本的"第几行"不是一套。
     pub(crate) sheet_scroll: (i32, i32),
     /// 表格的视图内列宽调整（1.9.1）：`(列号, 额外像素)`。只影响这次预览，
@@ -287,6 +290,9 @@ pub(crate) struct State {
     pub(crate) toc: Vec<(u8, String, usize)>,
     /// 目录里鼠标悬停/选中的下标。
     pub(crate) toc_active: Option<usize>,
+    /// PDF 大纲（目录）：`show_preview` 时算一次存这里；`set_content` 收到 PDF 的
+    /// Bitmap 时用它回填 `toc`（否则会被当成普通图片清空）。`(级别, 标题, 0 基页下标)`。
+    pub(crate) pdf_outline: Vec<(u8, String, usize)>,
     /// "阻止关闭"是否已开启（1.0.10）。开启后空格/Esc 都关不掉，且**不能取消**。
     pub(crate) pinned: bool,
     /// 正在拖哪几条边改窗口大小（1.0.10 把拖边改大小加回来）。
@@ -413,6 +419,7 @@ impl State {
             flow_y: 0.0,
             flow_total: 0.0,
             flow_view: 0.0,
+            pdf_page: 0,
             sheet_scroll: (0, 0),
             sheet_col_w: Vec::new(),
             sheet_row_h: Vec::new(),
@@ -441,6 +448,7 @@ impl State {
             scroll_drag: false,
             toc: Vec::new(),
             toc_active: None,
+            pdf_outline: Vec::new(),
             pinned: false,
             resize_edges: None,
             resize_from: None,
@@ -868,7 +876,7 @@ pub(crate) fn get_lines() -> Vec<String> {
 
 pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
     // 目录要在**换内容时**算一次：Markdown 可能有十几万行，每次重绘都抽一遍太浪费。
-    let toc = match content.as_deref() {
+    let mut toc = match content.as_deref() {
         Some(Canvas::Text(doc)) => match &doc.styles {
             Some(styles) => qlr_render::markdown::outline(&doc.lines, styles)
                 .into_iter()
@@ -878,6 +886,17 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         },
         _ => Vec::new(),
     };
+    // PDF：内容抵达时（Bitmap）保留 `show_preview` 预先算好的大纲，别被当成普通图片清空。
+    let is_pdf = with_state(|s| {
+        s.last_path
+            .as_deref()
+            .map(format::kind_for_path)
+            .is_some_and(|k| k == format::Kind::Pdf)
+    })
+    .unwrap_or(false);
+    if is_pdf {
+        toc = with_state(|s| s.pdf_outline.clone()).unwrap_or_default();
+    }
     // §7 收尾（平台层完善第 7 项）：内容抵达时用**实际 Canvas** 校准表面，
     // 让 `State.surface` 与 `get_content()` 始终一致（`show_preview` 的预算是按 Kind 猜的）。
     let surface = content.as_deref().map(backend::Surface::from_canvas);
@@ -900,6 +919,7 @@ pub(crate) fn set_content(content: Option<Arc<Canvas>>) {
         s.flow_y = 0.0;
         s.flow_total = 0.0;
         s.flow_view = 0.0;
+        s.pdf_page = 0;
         s.styled_logged = false;
         s.toc = toc;
         s.toc_active = None;
@@ -930,12 +950,18 @@ pub(crate) fn get_content() -> Option<Arc<Canvas>> {
     resolve().and_then(|session| session.content.lock().ok().and_then(|guard| guard.clone()))
 }
 
-/// 当前内容是不是 docx/pptx 的**连续纵向滚动**视图（vs 整页翻转）。
+/// 当前内容是不是**连续纵向滚动**视图（vs 整页翻转）。
+///
+/// docx/pptx 恒为 flow；PDF（#1）在多页、未缩放、非缩放预览时也按 flow 处理。
 pub(crate) fn is_flow_view() -> bool {
-    matches!(
-        get_content().as_deref(),
-        Some(Canvas::Document(_) | Canvas::Presentation(_))
-    )
+    match get_content().as_deref() {
+        Some(Canvas::Document(_) | Canvas::Presentation(_)) => true,
+        Some(Canvas::Bitmap(_)) => {
+            with_state(|s| s.pages.is_some() && (s.zoom - 1.0).abs() < 0.01 && !s.zoom_preview)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// 当前预览的文件类型（没有预览或路径未知时 `None`）。

@@ -964,3 +964,85 @@ media 15 / mediashape 13。
 - **改法**：`chrome::scrollbar_drag_at(hwnd,lparam)` 命中滚动条即开始拖动；`boot.rs` 在 `edges_at` 前先调用它；`on_chrome_click` 复用。代价=可滚动格式不再右边缘拖宽。
 - **回归**：`target/shot-scroll.ps1 -XOff 6` 对 pdf/md/toml/docx/xlsx 全部验证通过；`cargo test` 82/87/56 全绿、clippy/fmt 干净、build dev+release 绿。
 - **版本**：1.15.5（`Cargo.toml` / `qlrust.rc` / `README.md` 三处已同步）。打包产物 `dist\qlrust-1.15.5-win64.zip`。
+
+## 接力说明（2026-11-25 · 批 A 快修：用户 11 条反馈 #11/#8/#9/#10）
+- **背景**：用户一次提 11 条预览器反馈，评估文档 `docs/plans/feedback-2026-11-25-triage.md`（含 #1/#4/#7 的问答与对照表、分批计划）。用户批准"按建议顺序做"。
+- **完成（未发版，仍 1.15.5）— 批 A 四项**：
+  - `qlr-render/src/image_view.rs`：`composite_over_black()`（#11 透明区 0 填充）；`render_scaled` 外包一层。
+  - `qlr-platform/src/window/mod.rs` `natural_rect_raw`（#8 最小宽兜底）+ `qlr-app/src/app/show.rs` `window_size_for`（图像抬回 `min_window_w`）。
+  - `qlr-app/src/app/input.rs` `wheel_zoom` 1.25→1.1（#9）；`scripts/smoke.ps1` 断言 `1.00 -> 1.10`。
+  - `qlr-platform/src/window/sheet.rs` `HeaderHit` + `sheet_header_at`；`qlr-app/src/app/input.rs` `sheet_click` 行/列头点选（#10 行列出选）。
+- **回归**：`cargo test --workspace` = app 83 / core 87 / platform 57 / render 170 全绿 0 failed；`scripts/smoke.ps1` 全过（tray SKIP=管理员）；`cargo build` dev 绿；截图 `target/shot-out/{transparent,tall}.png` 核验。CLI 未改。
+- **下一步**：① 批 B（#5 PDF 卡顿 / #2 PSD / #6 EPUB / #3-xls）按序做——PSD、xls 需引入纯 Rust crate（`psd`/`calamine`），EPUB 用已有 `zip` + XML 解析复用 HTML 排版；② 批 C（#1 PDF 连续滚动 / #4 pptx 补齐 / #3 doc 原生）需先定深度（pptx 补到哪层）与"doc 是否保留系统处理器兜底"；③ #10 剩余（列宽命中偏差 / 非折行行高）需真机复现。
+
+## 接力说明（2026-11-25 · 批 B：#2 PSD / #3 xls / #6 EPUB / #5 PDF 预取）
+- **背景**：批 A 后用户批准新增纯 Rust 依赖 `psd`+`calamine`，pptx 补齐深度选"形状几何+旋转"，doc 保留系统处理器。批 B 的 #2/#3/#6 已完成，#5 做了预取窗口首改。
+- **完成（未发版，仍 1.15.5）**：
+  - `psd`：`format.rs`（IMAGE_EXTS psd/psb、magic 8BPS）、`image_view.rs`（`is_psd`/`render_psd`/`psd_dimensions`）。
+  - `calamine` xls：新 `qlr-render/src/xls.rs` + `render/sheet.rs` `is_legacy_xls` 分流；`SHEET_EXTS`+=xls。
+  - EPUB：新 `qlr-render/src/epub.rs` + `lib.rs` `HtmlViewer::render` 分流；`HTML_EXTS`+=epub（归 Html 族）。
+  - #5：`render.rs` `prefetch_neighbor_pages` → `[1,2,-1]`。
+- **回归**：`cargo test --workspace` = app 83 / core 88 / platform 57 / render 175 全绿 0 failed；`cargo check --workspace --all-targets` 0 warning。EPUB 有真实 zip 夹具；PSD/xls 仅编译+单测（无真实样本）。
+- **下一步（批 C，大工程，未动）**：① #4 pptx 形状几何（圆角/椭圆/箭头）+ 旋转（~6–8 人日）；② #1 PDF 连续纵向滚动（复用 docx/pptx 的 flow 机制 `flow_goto_page`/`flow_total`/`flow_view`/`flow_y`，逐页渲染拼竖排）；③ #3 doc 保留 `IPreviewHandler` 兜底、不做原生；④ #5 多页 PDF 实测剖析（prefetch 是否被 `cancel::cancel()` 打断、64MB 页缓存是否够、2× 超采样成本）。
+
+## 接力说明（2026-11-25 · 批 C：#4 pptx 母版/版式装饰 + 背景）
+- **背景**：批 C 选了"形状几何+旋转"深度，但本轮先落"母版/版式装饰图形 + 背景"（goal 目标口径），形状几何/旋转与真渐变渲染留后续。
+- **完成（未发版，仍 1.15.5）**：
+  - `qlr-render/src/pptx.rs` `parse_placeholders(xml, theme)` → `(Placeholders, Option<u32>, Vec<Shape>)`：`slideLayout`/`slideMaster` 里带 `ph` 的 `sp` 记占位符；无 `ph` 的顶层 `sp` 用 `parse_sp` 抽为装饰图形（空占位符表 + identity 变换）。
+  - `resolve_placeholders(pkg, slide_rels, theme)` 收 master→layout 的 decor；`parse_pptx` 里 `let mut shapes = decor;` 再 `extend(parse_sp_tree(...))`，装饰在最底层（z=数组序）。
+  - `parse_bg(root, theme)`：`solidFill`→`resolve_color(el, theme)`（修主题色背景丢失）；`gradFill`→`gsLst` 各色标平均成一种代表色（近似）。
+- **回归**：`cargo test --workspace` app 83 / core 88 / platform 57 / render **177** 全绿 0 failed（新增 `master_decor_shapes_extracted_but_placeholders_kept`、`gradient_background_averages_color_stops`）；`cargo check --workspace --all-targets` 0 warning；`scripts\smoke.ps1` 16 项全 PASS。
+- **下一步**：① #4 形状几何(圆角/椭圆/箭头)+旋转 + 真正的多段渐变；② #1 PDF 连续纵向滚动；③ #3 doc 已定系统兜底、无需原生。
+
+## 接力说明（2026-11-25 · 批 C：#5 深化——预取取消隔离 + 128MB 页缓存 + 前看三页）
+- **背景**：goal 第 2 轮，继续批 C。上轮 #5 仅调窗口，本轮修机制：预取与交互渲染共用全局 `CANCELLED` → 翻页 `cancel()` 会连坐砍掉预取。
+- **完成（未发版，仍 1.15.5）**：
+  - `qlr-render/src/cancel.rs`：`thread_local! SKIP_CANCEL` + `pub fn without_cancel<R>(f)`；`checkpoint()` 免取消区内 `Ok`；单测 `without_cancel_ignores_cancel_and_restores`。
+  - `qlr-app/src/app/render.rs` `warm_page` 用 `without_cancel` 包 `render_file_at_zoom`。
+  - `prefetch_neighbor_pages` 窗口 `[1,2,-1]`→`[1,2,3,-1]`。
+  - `qlr-app/src/pagecache.rs` `CACHE_LIMIT_BYTES` 64→128MB（~56 页）。
+- **回归**：`cargo test --workspace` app 83 / core 88 / platform 57 / render **178** 全绿 0 failed；`cargo check --workspace --all-targets` 0 warning；`smoke.ps1` 16 项全 PASS（tray SKIP）。
+- **下一步**：① #1 PDF 连续纵向滚动（真·多页竖排：需新增 `Canvas` 流式变体或 app 层多页合成 + `pdf_flow`/`pdf_page_offset`/`paint_pdf_flow` + `ensure_pdf_page` 逐页渲染；约 3–5 人日）；② #4 形状几何(圆角/椭圆/箭头)+旋转 + 真多段渐变；③ #3 doc 已定系统兜底无需原生。可考虑先发 1.15.6 收口 A/B/C 已落地部分。
+
+## 接力说明（2026-11-25 · 批 C：#1 铺垫——PDF 连续滚动几何层）
+- **背景**：goal 第 3 轮。#1 真·连续纵向滚动是架构级（PDF 光栅页需逐页渲染），先落纯几何层。
+- **完成（未发版，仍 1.15.5）**：新 `qlr-platform/src/window/pdf.rs`（`mod pdf;`+`pub use pdf::*;`）：`pdf_flow_geom`/`PdfGeom`、`pdf_flow`/`PdfFlow`、`pdf_page_offset`、`pdf_page_dest`；4 个纯几何单测。未接入绘制/输入。
+- **回归**：`cargo test -p qlr-platform` 61 passed/4 ignored；clippy 干净；`cargo fmt --all --check` 通过；`cargo test --workspace` app 83/core 88/platform 61/render 178 全绿。
+- **下一步（#1 接线）**：① 平台加"把 BGRA 位图贴进指定 RECT"的 blit 助手；② chrome `Canvas::Bitmap` 分支对 `Kind::Pdf` 走 `pdf_flow`：按可见页从 `pagecache` 取图（key 用流式渲染尺寸），缺失则投 `WarmTask::Page` 异步渲染并画占位/页码；③ input：PDF 滚轮/PageUp 走 `flow_y` 滚动、滚动条按 `total_h/view_h`；④ 需要 `s.pages` 与页宽高（可由 `s.natural` 或首页位图 aspect 推）。注意光栅页渲染 ~28ms/页，需异步 + 占位，别在 paint 里同步渲染。
+
+## 接力说明（2026-11-25 · 批 C：#1 接线完成——PDF 连续纵向滚动）
+- **背景**：goal 第 4 轮，把上一轮 `pdf_flow` 纯几何接进绘制/输入/异步补页。
+- **完成（未发版，仍 1.15.5）**：`qlr-platform/src/window/pdf.rs` 加 `paint_pdf_flow(...)`（BeginPaint 内 paint_chrome + 浅灰页缝 + IntersectClipRect + 逐页 `pdf_page_dest`/HALFTONE/`StretchDIBits` + overlay）；`qlr-app/render.rs` 加 `request_flow_page`（投 `WarmTask::Page` 异步补页），`request_render`/`on_render_done` 记 `s.pdf_page`；`session.rs` 加 `State.pdf_page`、`is_flow_view()` 扩到多页 Bitmap(zoom≈1 非预览)；`show.rs` 置 `pdf_page=first_page`；`input.rs flow_goto_page` 加 `Canvas::Bitmap`→`pdf_page_offset`；`chrome.rs` 加 `paint_pdf_flow_view` 并对 `Kind::Pdf` 接入。
+- **回归**：`cargo test --workspace` app 83/core 88/platform 61/render 178 全绿；`cargo check --all-targets` 0 warning；`cargo build --workspace` 绿；`smoke.ps1` 16 项 PASS；真机 3 页 PDF 截图 `target/shot-out/pdf_two.png` 见"第 1 页页脚 + 页缝 + 第 2 页"。
+- **下一步（剩余）**：#10 列宽命中偏差/非折行自适应行高（需真机 xlsx 复现）；#4 更深形状几何(圆角/椭圆/箭头)+旋转/真多段渐变；#5 多页 PDF 实测剖析；#3 doc 保留系统处理器（已定）。
+
+## 接力说明（2026-11-25 · #10 复核：列宽命中 + 行高 + 回归锁定）
+- **背景**：用户 #10 报"点 B 列中间会落 A、列宽不准、好像没有自适应行高"。
+- **复核结论**：绘制(`Painter`)与命中(`sheet_cell_at`)共用同一 `SheetSizes`，自动列宽加宽的列点击命中该列（当前不复现"点 B 落 A"）；`sheet_autofit` 已含非折行单行高(pass1)+折行多行高(pass2，表头行跳过)。新增单测 `col_row_hit_honours_autofit_extra` 锁定。
+- **验证**：`cargo test -p qlr-platform` 62 passed/4 ignored；fmt/clippy 干净；`cargo test --workspace` app 83/core 88/platform 62/render 178 全绿（并行偶发 `crash::tests::minidump_of_ourselves_is_written` flaky，环境问题）。
+- **剩余**：#4 更深形状几何(圆角/椭圆/箭头)+旋转/真多段渐变；#5 多页 PDF 实测剖析；#10 若真机仍复现需用户提供 xlsx。#3 doc 保留系统处理器（已定）。
+
+## 接力说明（2026-11-25 · 批 C #4 深化：pptx 形状几何 + 旋转）
+- **完成（未发版，仍 1.15.5）**：`qlr-core/pptx.rs` 加 `RectGeom{Rect,RoundRect,Ellipse}` + `FillRect.geom/rot_deg`；`qlr-render/pptx.rs` 加 `rect_geom`/`xfrm_rot` 并填入 `parse_sp`/`parse_cxn`；`qlr-platform/window/pptx.rs` 重写 `draw_fill_rect`（RoundRect/Ellipse + `SetWorldTransform` 旋转），新增 `begin_rotate` 及 round/ellipse 填充/描边助手。
+- **验证**：单测 `shape_geometry_and_rotation_parsed`；core 88/render 179/platform 62 全绿；check/clippy 干净；smoke 16 PASS；真机 `target/shot-out/pptx_shapes.png` 圆角/椭圆/旋转均对。
+- **局限/下一步**：仅无文字形状；箭头 prst 按矩形兜底未画箭头；文字形状旋转、组合内旋转、真多段渐变未做。剩余大项 #5 多页 PDF 实测剖析。
+
+## 接力说明（2026-11-25 · 批 C #5 剖析：多页 PDF 连续翻页实测）
+- **结果**：60 页 PDF（`test-60page-rich.pdf`）90 次滚轮滚到 13/60；`PAINT pdf-flow` 92 帧无丢帧/白屏；`PAGECACHE 预取` 16 页、页缓存 17 页/35MB；低墨页 0–1ms（重内容 ~28ms/页靠预取覆盖）。脚本 `target/measure-pdf.ps1`（临时，非产品）。
+- **状态**：goal 11 条反馈主体全部落地（批 A/B/C）；剩可选加深 #4 箭头/文字形状旋转/真多段渐变；#10 若真机仍复现需用户提供该 xlsx。版本仍 1.15.5 未 bump、无 git。
+
+## 接力说明（2026-11-25 · 修复：图片预览不再露"正在渲染…"占位页）
+- **完成（未发版，仍 1.15.5）**：`qlr-app/src/app/show.rs` 占位清空条件 `if shell` → `if shell || kind == format::Kind::Image`。图片（png/jpg/gif/webp/tiff/psd…）不再插入"正在渲染…"，开图瞬间空窗，渲染帧一到直接铺满。
+- **验证**：`cargo test --workspace -- --skip minidump_of_ourselves_is_written` app 83/core 88/platform 61(+4 ignored)/render 179(+8 ignored) 全绿；`smoke.ps1` 16 PASS；24MP 大图截图 `target/shot-out/huge2_a.png`（空白无占位）→ `huge2_final.png`（铺满）。
+- **备注**：其它自渲染格式（pdf/sheet/doc/presentation）仍保留"正在渲染…"首帧行（首帧反馈用途）；若也要去掉，把条件扩到 `renderable` 即可，需评估"按了没反应"观感。
+
+## 接力说明（2026-11-25 · PDF 目录/书签大纲）
+- **完成（未发版，仍 1.15.5）**：`qlr-render/pdf.rs` 可选书签 FFI（`Option<fn>` 缺符号降级）+ `pub struct OutlineEntry{level,title,page}` + `pub fn outline(path)->Vec<OutlineEntry>`；`session.rs State.pdf_outline`；`show.rs` 开 PDF 预取大纲进 `pdf_outline`+`toc`；`set_content` 对 `Kind::Pdf` 保留大纲；`chrome.rs` 目录点击对 PDF 走 `super::input::goto_page(page+1)`。
+- **修 bug**：`qlr-platform/window/pdf.rs paint_pdf_flow` 原用 `paint_chrome` 整块区域覆盖传入 `content`（已扣目录栏）→ 页面钻到目录栏下、左侧被裁；改为两 rect 相交（`max/min`）。
+- **验证**：`cargo test`(skip flaky) app 83 / core 88 / platform 61(+4 ignored) / render 179(+8 ignored) 全绿；clippy `-D warnings` 干净；`smoke.ps1` 16 PASS；真机 `target/shot-out/toc_top.png`（目录 4 条含子项缩进、页面右侧不裁）/`toc_jump.png`（点第 2 条跳到 page 2）。无书签的 PDF 不显示目录。
+- **局限**：目录按 level 缩进显示；跳页按页级对齐。
+
+## 接力说明（2026-11-25 · HTML 样式渲染 C 级）
+- **完成（未发版，仍 1.15.5）**：`qlr-render/canvas.rs` 加 `InlineStyle/RichRun/LineBox` + `TextDoc.runs/boxes`；新 `qlr-render/src/html_style.rs`（parse_color/Selector/Stylesheet/compute→InlineStyle+BlockProps，继承+cascade+inline 最高+盒模型/display:none）；`html.rs` `layout_rich` 产 runs/boxes、`extract_styles` 抽 `<style>`；`qlr-platform/window/text.rs` 加 `Vis/RSpan/RRow`+`paint_rich`+`RICHFONTS`；`qlr-app/app/chrome.rs` 加 `paint_rich_html/wrap_rich_line/rgb_to_colorref`，`Canvas::Text` 判 `t.runs` 走富文本。
+- **验证**：check 0 warning；clippy -D warnings 干净；`cargo test --workspace`(skip flaky) app 83/core 88/platform 61(+4)/render 185(+8) 全绿；smoke 16 PASS；真机 `target/shot-out/styled3_final.png`（标题红加粗、蓝加粗/下划线/斜体、浅黄底+灰边 DIV、居中、表头浅蓝底、绿字）。
+- **局限/下一步**：行内逐段背景（`<span style=background>`）未画（仅行/块 bg）；盒模型为近似（无 float/绝对定位/真实内容宽度）；选择器无后代/伪类；不做 `<img>`。

@@ -15,11 +15,32 @@
 //! 中途是打断不了的。检查点只能把"多阶段"的活提前结束，把等待从"整份文件"
 //! 缩短到"一个阶段"。这条限制写进 `docs/dev/ARCH.md` 的稳定性一节。
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use qlr_core::{Error, Result};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// 预取线程的"免取消"开关：预取是投机工作，不该被"用户换文件"打断。
+    static SKIP_CANCEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 在 `f` 执行期间忽略全局取消信号（仅供预取/预热线程使用）。
+///
+/// 全局取消只表达"当前**交互**这一刻的活作废"；预取是后台投机工作，
+/// 若被同样的信号打断，就会出现"用户翻页跑了、预取也被一起砍掉"的竞态。
+/// 用线程局部量隔离，不影响交互渲染线程。
+pub fn without_cancel<R>(f: impl FnOnce() -> R) -> R {
+    SKIP_CANCEL.with(|s| {
+        let prev = s.get();
+        s.set(true);
+        let out = f();
+        s.set(prev);
+        out
+    })
+}
 
 /// 请求取消当前正在跑的活（主线程发新请求时调用）。
 pub fn cancel() {
@@ -38,6 +59,9 @@ pub fn is_cancelled() -> bool {
 
 /// 检查点：已取消就返回 [`Error::Cancelled`]，让调用链一路 `?` 退出。
 pub fn checkpoint() -> Result<()> {
+    if SKIP_CANCEL.with(|s| s.get()) {
+        return Ok(());
+    }
     if is_cancelled() {
         Err(Error::Cancelled)
     } else {
@@ -64,5 +88,17 @@ mod tests {
         // 必须能复位：否则一次取消之后所有渲染都短路。
         reset();
         assert!(checkpoint().is_ok());
+    }
+
+    #[test]
+    fn without_cancel_ignores_cancel_and_restores() {
+        reset();
+        cancel();
+        assert!(checkpoint().is_err());
+        let inside = without_cancel(|| checkpoint().is_ok());
+        assert!(inside, "免取消区内 checkpoint 必须通过");
+        // 离开免取消区后恢复对全局信号的敏感：否则预取修好了，交互渲染却不再可取消。
+        assert!(checkpoint().is_err());
+        reset();
     }
 }

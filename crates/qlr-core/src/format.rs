@@ -127,13 +127,16 @@ impl fmt::Display for Kind {
 /// 内置扩展名表。`extensions()` 把它们暴露出去，文档与矩阵脚本共用一份真值。
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "webp", "tif", "tiff", "ico", "cur",
+    // 批 B（2026-11-25）#2：Photoshop 文档（8BPS 容器，由 `psd` crate 解码）。
+    "psd", "psb",
 ];
 const PDF_EXTS: &[&str] = &["pdf"];
 const MARKDOWN_EXTS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
 /// SVG：`svg` 是标准扩展名；`svgz` 是 gzip 压缩版（渲染层当前不处理压缩，会渲染失败但
 /// 至少走对分支、给出"渲染失败"而不是"不支持"）。
 const SVG_EXTS: &[&str] = &["svg", "svgz"];
-const HTML_EXTS: &[&str] = &["html", "htm", "xhtml", "shtml"];
+/// `epub` 归入 HTML（文档排版）族：批 B #6 内置支持，实际解析在 `qlr-render::epub`。
+const HTML_EXTS: &[&str] = &["html", "htm", "xhtml", "shtml", "epub"];
 /// 音频：MCI 能播的那些容器（`wav` 走 waveaudio，其余走 mpegvideo/自动）。
 const AUDIO_EXTS: &[&str] = &[
     "wav", "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wma", "aif", "aiff", "mid", "midi",
@@ -142,11 +145,11 @@ const AUDIO_EXTS: &[&str] = &[
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "avi", "wmv", "webm", "mkv", "mpg", "mpeg", "ts", "m2ts", "3gp",
 ];
-/// 电子表格（OOXML 的四种后缀，容器完全一样，只是宏/模板标记不同）。
+/// 电子表格：OOXML 四种（容器一样，宏/模板标记不同）+ 老式二进制 `.xls`（BIFF8）。
 ///
-/// 老式二进制 `.xls`/`.et` **不在**这里：它要 BIFF 解析器，本轮不做，
-/// 交回系统处理器/插件兜底（见 `docs/adr/0010-native-sheet-preview.md`）。
-const SHEET_EXTS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm"];
+/// 老式 `.xls` 此前交系统处理器；批 B（2026-11-25）#3 改用纯 Rust `calamine` 解析
+/// （见 `qlr-render::xls`），不再需要装 Office。
+const SHEET_EXTS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm", "xls"];
 /// 文字处理文档（OOXML 的四种后缀，容器完全一样，只是宏/模板标记不同）。
 ///
 /// 老式二进制 `.doc`/`.dot` **不在**这里：它要 BIFF/CFB 解析器，本轮不做，
@@ -404,6 +407,7 @@ fn is_image_magic(h: &[u8]) -> bool {
         b"MM\x00*",          // TIFF 大端
         b"\x00\x00\x01\x00", // ICO
         b"\x00\x00\x02\x00", // CUR
+        b"8BPS",             // PSD/PSB（批 B #2）
     ];
     if SIGS.iter().any(|s| h.starts_with(s)) {
         return true;
@@ -633,5 +637,17 @@ mod tests {
         }
         // zip 仍由插件/系统处理器负责
         assert!(!all.contains(&"zip"), "压缩包仍由插件负责");
+    }
+
+    #[test]
+    fn batch_b_extensions_route_to_native_kinds() {
+        // 批 B（2026-11-25）：PSD/PSB 归 Image；`.xls` 归 Sheet；epub 归 Html（文档排版族）。
+        assert_eq!(kind(r"C:\a\b.psd"), Kind::Image);
+        assert_eq!(kind(r"C:\a\b.PSB"), Kind::Image);
+        assert_eq!(kind(r"C:\a\b.xls"), Kind::Sheet);
+        assert_eq!(kind(r"C:\a\b.epub"), Kind::Html);
+        // 仍不支持的老式二进制（.doc/.ppt）保持 Unsupported（留系统处理器兜底）。
+        assert_eq!(kind(r"C:\a\b.doc"), Kind::Unsupported);
+        assert_eq!(kind(r"C:\a\b.ppt"), Kind::Unsupported);
     }
 }

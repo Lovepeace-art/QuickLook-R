@@ -23,7 +23,9 @@ pub mod canvas;
 pub mod code;
 pub mod docx;
 pub mod downscale;
+pub mod epub;
 pub mod html;
+pub mod html_style;
 pub mod image_view;
 pub mod markdown;
 pub mod media;
@@ -35,11 +37,12 @@ pub mod source_cache;
 pub mod svg;
 pub mod text;
 pub mod wrap;
+pub mod xls;
 
 #[cfg(test)]
 mod testutil;
 
-pub use canvas::{Bitmap, Canvas, LineStyle, Span, TextDoc, Token};
+pub use canvas::{Bitmap, Canvas, InlineStyle, LineBox, LineStyle, RichRun, Span, TextDoc, Token};
 pub use media::MediaInfo;
 
 use std::path::Path;
@@ -199,6 +202,10 @@ impl Viewer for HtmlViewer {
     }
 
     fn render(&self, req: &RenderRequest<'_>) -> Result<Canvas> {
+        // 批 B #6：EPUB 归在 HTML（文档排版）族，按扩展名分发到 zip+OPF 解析器。
+        if epub::is_epub(req.path) {
+            return epub::render(req.path, req.head);
+        }
         html::render(req.path, req.head)
     }
 }
@@ -552,8 +559,9 @@ mod tests {
 
     #[test]
     fn unimplemented_kind_reports_plugin_hint() {
-        // `.epub` 不是内置格式 → Unsupported，走插件/系统路线提示
-        let err = render_file(&PathBuf::from(r"C:\x\a.epub"), 800, 600).unwrap_err();
+        // `.zip` 不是内置格式 → Unsupported，走插件/系统路线提示
+        // （`.epub` 自批 B #6 起归入 Html 族内置，不能再用作"不支持"样本。）
+        let err = render_file(&PathBuf::from(r"C:\x\a.zip"), 800, 600).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unsupported"), "{msg}");
         assert!(msg.contains("插件"), "应提示插件路线：{msg}");

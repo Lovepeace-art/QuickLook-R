@@ -208,7 +208,7 @@ Check "热键处理链可用" ($text -match "HOTKEY vk=0x20")
 & $Exe --wheel 120 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $text = if (Test-Path $logFile) { ((Get-Content $logFile -ErrorAction SilentlyContinue) -join "`n") } else { "" }
-Check "滚轮缩放已生效" ($text -match "ZOOM 1\.00 -> 1\.25") $(if ($text -match "ZOOM 1\.00 -> 1\.25") { "1.00 -> 1.25" } else { "日志里没有 ZOOM 记录" })
+Check "滚轮缩放已生效" ($text -match "ZOOM 1\.00 -> 1\.10") $(if ($text -match "ZOOM 1\.00 -> 1\.10") { "1.00 -> 1.10" } else { "日志里没有 ZOOM 记录" })
 
 # ---- 3.6 选中项通道（A1.6）----
 # 独立进程跑一次就退：验证 COM 初始化 + Shell 爬取不崩（有没有选中项取决于当前桌面状态）。

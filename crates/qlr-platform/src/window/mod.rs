@@ -747,8 +747,13 @@ pub fn natural_rect_raw(work: RECT, width: i32, height: i32, factor: f32) -> REC
         scale = min_scale.min(fit);
     }
 
-    let width = ((cw as f32 * scale).round() as i32).clamp(1, ww);
+    let mut width = ((cw as f32 * scale).round() as i32).clamp(1, ww);
     let height = ((ch as f32 * scale).round() as i32).clamp(1, wh);
+    // #8 极端高图：高度先顶到工作区后，等比算出的宽度会低于最小可读宽 → 顶栏/关闭按钮被挤没。
+    // 抬到 `MIN_WIDTH`（仍不超过工作区）；绘制端 `fill=true` 只把窄出来的这一截横向拉伸，几乎无感。
+    if width < MIN_WIDTH && ww >= MIN_WIDTH {
+        width = MIN_WIDTH;
+    }
     let screen_w = (work.right - work.left).max(1);
     let screen_h = (work.bottom - work.top).max(1);
     let left = work.left + (screen_w - width) / 2;
@@ -1433,6 +1438,7 @@ mod bitmap;
 mod chrome;
 mod docx;
 mod paint;
+mod pdf;
 mod pptx;
 mod scroll;
 mod settings;
@@ -1447,6 +1453,7 @@ pub use bitmap::*;
 pub use chrome::*;
 pub use docx::*;
 pub(crate) use paint::*;
+pub use pdf::*;
 pub use pptx::*;
 pub use scroll::*;
 pub use settings::*;

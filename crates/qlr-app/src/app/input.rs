@@ -416,6 +416,26 @@ pub(crate) fn sheet_click(lparam: LPARAM) -> bool {
     let layout = frame(preview.raw());
     let px = mx - layout.content.left;
     let py = my - layout.content.top;
+    // 行/列号表头点选（#10）：点列号条选整列、点行号条选整行（整条高亮）。
+    if let Some(hit) = window::sheet_header_at(sheet, &sizes, sx, sy, px, py) {
+        let (rows, cols) = (sheet.rows, sheet.cols);
+        with_state(|s| {
+            match hit {
+                window::HeaderHit::Row(r) => {
+                    s.sheet_sel = Some((r as u32, 0));
+                    s.sheet_sel_focus = Some((r as u32, cols.saturating_sub(1)));
+                }
+                window::HeaderHit::Col(c) => {
+                    s.sheet_sel = Some((0, c as u32));
+                    s.sheet_sel_focus = Some((rows.saturating_sub(1), c as u32));
+                }
+            }
+            s.sheet_dragging = false;
+        });
+        log_debug!(SCOPE, "SHEET-SEL 表头点选 {hit:?}");
+        window::invalidate(preview.raw());
+        return true;
+    }
     let hit = window::sheet_cell_at(sheet, &sizes, sx, sy, px, py);
     with_state(|s| {
         s.sheet_sel = hit.map(|(r, c)| (r as u32, c as u32));
@@ -914,7 +934,7 @@ pub(crate) fn bitmap_height() -> Option<i32> {
     }
 }
 
-/// 滚轮缩放：一格（`WHEEL_DELTA`=120）放大 1.25 倍，负向缩小。
+/// 滚轮缩放：一格（`WHEEL_DELTA`=120）放大 1.1 倍，负向缩小。
 ///
 /// 入参是**档数**（已经过 `take_wheel_notches` 的零头累积），不是原始 delta：
 /// 高分辨率滚轮单发只有 30，再在这里除一次 120 就又变回 0 —— 1.8.3 前就是这个问题。
@@ -922,11 +942,8 @@ pub(crate) fn wheel_zoom(notches: isize) {
     if notches == 0 {
         return;
     }
-    let factor = if notches > 0 {
-        1.25_f32
-    } else {
-        1.0 / 1.25_f32
-    };
+    // #9：每档从 1.25× 收细到 1.1×，滚轮缩放更连续、不再一格跳 1/4 那么"割裂"。
+    let factor = if notches > 0 { 1.1_f32 } else { 1.0 / 1.1_f32 };
     for _ in 0..notches.abs() {
         set_zoom(factor);
     }
@@ -1625,6 +1642,14 @@ fn flow_goto_page(hwnd: HWND, page: usize) {
         Canvas::Document(doc) => window::docx_page_offset(doc, content, page.saturating_sub(1)),
         Canvas::Presentation(doc) => {
             window::pptx_slide_offset(doc, content, page.saturating_sub(1))
+        }
+        // PDF（#1）：连续纵向滚动里跳页 = 让目标页顶对齐视口顶。
+        Canvas::Bitmap(b) => {
+            let n = with_state(|s| s.pages).flatten().unwrap_or(1);
+            if n <= 1 {
+                return;
+            }
+            window::pdf_page_offset(b.width, b.height, n, content, page.saturating_sub(1))
         }
         _ => return,
     };

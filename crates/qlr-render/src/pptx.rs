@@ -20,8 +20,8 @@ use image::GenericImageView;
 
 use qlr_core::docx::{DocImage, HAlign, ImageSlot, Line, Para, Rect, Run, dpt_to_px, emu_to_px};
 use qlr_core::pptx::{
-    Chart, ChartKind, ChartSeries, ChartShape, FillRect, Picture, PptxDoc, Shape, Slide, SlideSize,
-    TableCell, TableRow, TableShape, TextBox,
+    Chart, ChartKind, ChartSeries, ChartShape, FillRect, Picture, PptxDoc, RectGeom, Shape, Slide,
+    SlideSize, TableCell, TableRow, TableShape, TextBox,
 };
 use qlr_core::{Error, Result};
 
@@ -692,40 +692,78 @@ impl Placeholders {
     }
 }
 
-/// 从 slideLayout / slideMaster 的 XML 里抽占位符矩形（顶层 sp，无组合变换）。
-fn parse_placeholders(xml: &str) -> (Placeholders, Option<u32>) {
+/// 从 slideLayout / slideMaster 的 XML 里抽占位符矩形（顶层 sp，无组合变换），
+/// 同时抽出**非占位符的装饰图形**（垫在幻灯片内容之下的母版装饰），以及背景色。
+fn parse_placeholders(xml: &str, theme: &Colors) -> (Placeholders, Option<u32>, Vec<Shape>) {
     let mut ph = Placeholders::empty();
     let root = parse_xml(xml);
-    let bg = parse_bg(&root);
+    let bg = parse_bg(&root, theme);
+    let mut decor: Vec<Shape> = Vec::new();
     let Some(tree) = find_desc(&root, "spTree") else {
-        return (ph, bg);
+        return (ph, bg, decor);
     };
     let map = Xf::identity();
+    let empty_rels: HashMap<String, Rel> = HashMap::new();
+    let empty_ph = Placeholders::empty();
+    let ctx = SlideCtx {
+        slide_rels: &empty_rels,
+        theme,
+        ph: &empty_ph,
+    };
     for sp in tree.children("sp") {
-        let Some(rect) = rect_from_xfrm(sp.child("spPr").unwrap_or(sp), &map) else {
-            continue;
-        };
-        let Some(ph_node) = find_desc(sp, "ph") else {
-            continue;
-        };
-        if let Some(idx) = ph_node.attr("idx") {
-            ph.by_idx.insert(idx.to_string(), rect);
-        }
-        if let Some(ty) = ph_node.attr("type") {
-            ph.by_type.insert(ty.to_string(), rect);
+        match find_desc(sp, "ph") {
+            Some(ph_node) => {
+                let Some(rect) = rect_from_xfrm(sp.child("spPr").unwrap_or(sp), &map) else {
+                    continue;
+                };
+                if let Some(idx) = ph_node.attr("idx") {
+                    ph.by_idx.insert(idx.to_string(), rect);
+                }
+                if let Some(ty) = ph_node.attr("type") {
+                    ph.by_type.insert(ty.to_string(), rect);
+                }
+            }
+            None => {
+                // 非占位符：母版/版式上的装饰图形，垫在幻灯片内容之下。
+                if decor.len() < MAX_SHAPES_PER_SLIDE {
+                    if let Some(s) = parse_sp(sp, &ctx, &map) {
+                        decor.push(s);
+                    }
+                }
+            }
         }
     }
-    (ph, bg)
+    (ph, bg, decor)
 }
 
-/// 取 `p:bg` 的纯色（`bgPr` 的 solidFill，或 `bgRef` 的 schemeClr）。
-fn parse_bg(root: &Node) -> Option<u32> {
+/// 取 `p:bg` 的背景色：`bgPr` 的 solidFill，或 gradFill 各色标的平均色（近似为纯色）；`bgRef` 交给外层再试。
+fn parse_bg(root: &Node, theme: &Colors) -> Option<u32> {
     let bg = find_desc(root, "bg")?;
     if let Some(bg_pr) = bg.child("bgPr") {
         if let Some(sf) = bg_pr.child("solidFill") {
             if let Some(el) = sf.kids.first() {
-                // 主题色此时还没解析到；这里只能处理 srgbClr。schemeClr 交给外层再试。
-                return resolve_color(el, &Colors::new());
+                return resolve_color(el, theme);
+            }
+        }
+        // 渐变背景：多色标平均成一种代表色垫底（真正的多段渐变后续再做）。
+        if let Some(gf) = bg_pr.child("gradFill") {
+            if let Some(lst) = find_desc(gf, "gsLst") {
+                let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for gs in lst.children("gs") {
+                    if let Some(el) = gs.kids.first() {
+                        if let Some(c) = resolve_color(el, theme) {
+                            r += u64::from((c >> 16) & 0xFF);
+                            g += u64::from((c >> 8) & 0xFF);
+                            b += u64::from(c & 0xFF);
+                            n += 1;
+                        }
+                    }
+                }
+                if let (Some(rr), Some(gg), Some(bb)) =
+                    (r.checked_div(n), g.checked_div(n), b.checked_div(n))
+                {
+                    return Some(((rr as u32) << 16) | ((gg as u32) << 8) | (bb as u32));
+                }
             }
         }
     }
@@ -1029,6 +1067,27 @@ fn parse_sp_tree(
     shapes
 }
 
+/// 从 `spPr` 的 `a:prstGeom@prst` 判断形状几何；未知一律当矩形。
+fn rect_geom(sp_pr: &Node) -> RectGeom {
+    let prst = find_desc(sp_pr, "prstGeom")
+        .and_then(|n| n.attr("prst"))
+        .unwrap_or("");
+    match prst {
+        "roundRect" => RectGeom::RoundRect,
+        "ellipse" | "oval" => RectGeom::Ellipse,
+        _ => RectGeom::Rect,
+    }
+}
+
+/// 从 `spPr/a:xfrm@rot`（1/60000 度）取整数旋转角。
+fn xfrm_rot(sp_pr: &Node) -> i32 {
+    sp_pr
+        .child("xfrm")
+        .and_then(|x| x.attr_i64("rot"))
+        .map(|r| (r as f64 / 60_000.0).round() as i32)
+        .unwrap_or(0)
+}
+
 fn parse_sp(node: &Node, ctx: &SlideCtx, map: &Xf) -> Option<Shape> {
     let sp_pr = node.child("spPr");
     let ph_node = find_desc(node, "ph");
@@ -1058,7 +1117,15 @@ fn parse_sp(node: &Node, ctx: &SlideCtx, map: &Xf) -> Option<Shape> {
         }
     }
     if fill.is_some() || line.is_some() {
-        return Some(Shape::Rect(FillRect { rect, fill, line }));
+        let geom = sp_pr.map(rect_geom).unwrap_or_default();
+        let rot_deg = sp_pr.map(xfrm_rot).unwrap_or(0);
+        return Some(Shape::Rect(FillRect {
+            rect,
+            fill,
+            line,
+            geom,
+            rot_deg,
+        }));
     }
     None
 }
@@ -1074,6 +1141,8 @@ fn parse_cxn(node: &Node, ctx: &SlideCtx, map: &Xf) -> Option<Shape> {
         rect,
         fill: None,
         line,
+        geom: rect_geom(sp_pr),
+        rot_deg: xfrm_rot(sp_pr),
     }))
 }
 
@@ -1515,9 +1584,10 @@ pub fn parse_pptx(path: &Path) -> Result<PptxDoc> {
         };
         let root = parse_xml(&xml);
         let slide_rels = read_slide_rels(&mut pkg, part)?;
-        let (ph, bg) = resolve_placeholders(&mut pkg, &slide_rels);
+        let (ph, bg, decor) = resolve_placeholders(&mut pkg, &slide_rels, &theme);
 
-        let mut shapes: Vec<Shape> = Vec::new();
+        // 母版/版式装饰先入队（垫底），幻灯片自身图形叠在其上（z 顺序=数组顺序）。
+        let mut shapes: Vec<Shape> = decor;
         if let Some(tree) = find_desc(&root, "spTree") {
             let ctx = SlideCtx {
                 slide_rels: &slide_rels,
@@ -1525,10 +1595,17 @@ pub fn parse_pptx(path: &Path) -> Result<PptxDoc> {
                 ph: &ph,
             };
             let map = Xf::identity();
-            shapes = parse_sp_tree(tree, &ctx, &map, &mut images, &mut img_cache, &mut pkg);
+            shapes.extend(parse_sp_tree(
+                tree,
+                &ctx,
+                &map,
+                &mut images,
+                &mut img_cache,
+                &mut pkg,
+            ));
         }
         // 背景：slide 自身优先，其次 layout/master（resolve_placeholders 已回调 bg）。
-        let slide_bg = parse_bg(&root).or(bg);
+        let slide_bg = parse_bg(&root, &theme).or(bg);
         slides.push(Slide {
             shapes,
             bg: slide_bg,
@@ -1576,13 +1653,15 @@ fn read_slide_rels(pkg: &mut Package, slide_part: &str) -> Result<HashMap<String
         .unwrap_or_default())
 }
 
-/// 沿 slideLayout → slideMaster 收集占位符几何与背景色。
+/// 沿 slideLayout → slideMaster 收集占位符几何、背景色与装饰图形。
 fn resolve_placeholders(
     pkg: &mut Package,
     slide_rels: &HashMap<String, Rel>,
-) -> (Placeholders, Option<u32>) {
+    theme: &Colors,
+) -> (Placeholders, Option<u32>, Vec<Shape>) {
     let mut ph = Placeholders::empty();
     let mut bg = None;
+    let mut decor: Vec<Shape> = Vec::new();
 
     let layout = slide_rels
         .values()
@@ -1591,20 +1670,22 @@ fn resolve_placeholders(
 
     if let Some(layout_part) = layout {
         if let Ok(Some(lxml)) = pkg.read_optional(&layout_part) {
-            let (lph, lbg) = parse_placeholders(&lxml);
+            let (lph, lbg, ldecor) = parse_placeholders(&lxml, theme);
             // master 先吸收（低优先），layout 后吸收（覆盖）
             if let Some(master_part) = master_of(pkg, &layout_part) {
                 if let Ok(Some(mxml)) = pkg.read_optional(&master_part) {
-                    let (mph, mbg) = parse_placeholders(&mxml);
+                    let (mph, mbg, mdecor) = parse_placeholders(&mxml, theme);
                     ph.absorb(mph);
                     bg = bg.or(mbg);
+                    decor.extend(mdecor);
                 }
             }
             ph.absorb(lph);
             bg = bg.or(lbg);
+            decor.extend(ldecor);
         }
     }
-    (ph, bg)
+    (ph, bg, decor)
 }
 
 fn master_of(pkg: &mut Package, layout_part: &str) -> Option<String> {
@@ -1680,6 +1761,58 @@ mod tests {
         let c = resolve_color(el.child("schemeClr").unwrap(), &theme).unwrap();
         // 0x80 * 0.5 = 0x40
         assert_eq!(c, 0x404040);
+    }
+
+    #[test]
+    fn shape_geometry_and_rotation_parsed() {
+        let xml = r#"<p:spPr><a:xfrm rot="5400000"><a:off x="0" y="0"/><a:ext cx="1000000" cy="500000"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom></p:spPr>"#;
+        let root = parse_xml(xml);
+        let sp_pr = root.child("spPr").unwrap();
+        assert_eq!(rect_geom(sp_pr), RectGeom::RoundRect);
+        assert_eq!(xfrm_rot(sp_pr), 90);
+
+        let root2 =
+            parse_xml(r#"<p:spPr><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom></p:spPr>"#);
+        assert_eq!(rect_geom(root2.child("spPr").unwrap()), RectGeom::Ellipse);
+
+        let root3 =
+            parse_xml(r#"<p:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>"#);
+        assert_eq!(rect_geom(root3.child("spPr").unwrap()), RectGeom::Rect);
+    }
+
+    #[test]
+    fn master_decor_shapes_extracted_but_placeholders_kept() {
+        let master = r#"<p:sldMaster><p:cSld><p:spTree>
+            <p:sp><p:nvSpPr><p:cNvPr id="2" name="decor"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+              <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="12192000" cy="1000000"/></a:xfrm>
+                <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></p:spPr></p:sp>
+            <p:sp><p:nvSpPr><p:cNvPr id="3" name="title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+              <p:spPr><a:xfrm><a:off x="914400" y="914400"/><a:ext cx="8000000" cy="1000000"/></a:xfrm></p:spPr></p:sp>
+          </p:spTree></p:cSld></p:sldMaster>"#;
+        let (ph, _bg, decor) = parse_placeholders(master, &Colors::new());
+        // 装饰图形（无 ph）被抽出，占位符不混进装饰。
+        assert_eq!(decor.len(), 1, "应抽出 1 个装饰图形，实际 {}", decor.len());
+        match &decor[0] {
+            Shape::Rect(r) => assert_eq!(r.fill, Some(0x00FF_0000)),
+            other => panic!("装饰应为 Rect，实际 {other:?}"),
+        }
+        // 占位符仍按 type 记录几何。
+        assert!(
+            ph.get(None, Some("title")).is_some(),
+            "title 占位符几何应保留"
+        );
+    }
+
+    #[test]
+    fn gradient_background_averages_color_stops() {
+        let master = r#"<p:sldMaster><p:cSld>
+            <p:bg><p:bgPr><a:gradFill><a:gsLst>
+              <a:gs pos="0"><a:srgbClr val="000000"/></a:gs>
+              <a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs>
+            </a:gsLst></a:gradFill></p:bgPr></p:bg>
+            <p:spTree/></p:cSld></p:sldMaster>"#;
+        let (_ph, bg, _decor) = parse_placeholders(master, &Colors::new());
+        assert_eq!(bg, Some(0x007F_7F7F), "黑白渐变应平均成中灰");
     }
 
     #[test]

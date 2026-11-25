@@ -313,8 +313,9 @@ fn fuzz_mutated_samples_never_panic() {
 #[test]
 fn unsupported_kind_never_reaches_a_parser() {
     // 内置类别之外的扩展名必须直接拒绝，不能落到某个渲染器里。
-    // 注意别拿 docx/xlsx 当"不支持"的样本了——它们现在都有自己的原生查看器（1.9.0 / 1.10.0）。
-    let path = write("unsupported", "story.epub", b"PK\x03\x04");
+    // 注意别拿 docx/xlsx/epub 当"不支持"的样本了——它们现在都有自己的原生查看器
+    // （1.9.0 / 1.10.0 / 批 B #6）。`.zip` 仍由插件/系统处理器负责，是稳定的"不支持"样本。
+    let path = write("unsupported", "story.zip", b"PK\x03\x04");
     let err = render_file(&path, 1024, 768).unwrap_err().to_string();
     assert!(err.contains("插件"), "应当提示走插件：{err}");
 }

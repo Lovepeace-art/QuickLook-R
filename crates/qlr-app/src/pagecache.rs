@@ -8,7 +8,7 @@
 //! 1. **按 (路径, 页号, 宽, 高, 文件戳) 精确匹配**——尺寸不同就是不同的位图，不能拿来凑；
 //!    文件戳（mtime + 字节数）防"同路径文件被覆盖后翻页命中陈旧像素"
 //!    （与 CONVENTIONS #112 的 FrameKey 同一个坑）。
-//! 2. **LRU + 字节上限**：一页 631×893 是 2.25 MB，64 MB 上限约 28 页；
+//! 2. **LRU + 字节上限**：一页 631×893 是 2.25 MB，128 MB 上限约 56 页；
 //!    超了就从最久没用的开始丢（宁可重算一次，也不要悄悄吃满内存）。
 //! 3. 只缓存 **PDF**：图片/文本的渲染本来就便宜，缓存它们只会让内存变脏。
 
@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use qlr_render::{Canvas, budget};
 
-/// 缓存上限：64 MB。一页 631×893 约 2.25 MB，够放 ~28 页。
-pub const CACHE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// 缓存上限：128 MB。一页 631×893 约 2.25 MB，够放 ~56 页。
+pub const CACHE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 /// 一次命中的 key：路径 + 页号 + 目标尺寸 + 文件戳。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +91,7 @@ impl PageCache {
         if bytes >= self.limit {
             return;
         }
-        // 第一道：本缓存自己的 64 MB 上限。
+        // 第一道：本缓存自己的 128 MB 上限。
         while self.bytes + bytes > self.limit {
             let Some(old) = self.entries.pop_front() else {
                 break;

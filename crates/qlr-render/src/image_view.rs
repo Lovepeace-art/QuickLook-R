@@ -44,6 +44,38 @@ pub fn render_scaled(
     max_height: u32,
     upscale: bool,
 ) -> Result<Canvas> {
+    let canvas = render_scaled_raw(path, max_width, max_height, upscale)?;
+    Ok(composite_over_black(canvas))
+}
+
+/// #11：PNG 透明区按"0 填充"呈现——把 RGBA 合成到黑底。
+///
+/// A=0 → 纯黑；0<A<255 → 按 alpha 压暗；A=255 → 不变。上屏走 `StretchDIBits`
+/// `SRCCOPY` 不看 alpha，只有把颜色预先压到黑底，透明区才不会显示成白
+/// （旧行为：`paint_bitmap_at` 先把客户区刷成白色）。JPEG 等全不透明图不受影响。
+fn composite_over_black(canvas: Canvas) -> Canvas {
+    let Canvas::Bitmap(mut b) = canvas else {
+        return canvas;
+    };
+    for px in b.bgra.chunks_exact_mut(4) {
+        let a = px[3];
+        if a != 255 {
+            let f = u32::from(a);
+            px[0] = ((u32::from(px[0]) * f) / 255) as u8;
+            px[1] = ((u32::from(px[1]) * f) / 255) as u8;
+            px[2] = ((u32::from(px[2]) * f) / 255) as u8;
+            px[3] = 255;
+        }
+    }
+    Canvas::Bitmap(b)
+}
+
+fn render_scaled_raw(
+    path: &Path,
+    max_width: u32,
+    max_height: u32,
+    upscale: bool,
+) -> Result<Canvas> {
     crate::cancel::checkpoint()?;
     if is_jpeg(path) {
         match render_jpeg_scaled(path, max_width, max_height, upscale) {
@@ -57,6 +89,10 @@ pub fn render_scaled(
             return Ok(canvas);
         }
     }
+    // #2：PSD/PSB（Photoshop）走 `psd` crate 自己解，`image` 认不了 8BPS 容器。
+    if is_psd(path) {
+        return render_psd(path, max_width, max_height, upscale);
+    }
     render_via_image(path, max_width, max_height, upscale)
 }
 
@@ -68,6 +104,17 @@ fn is_png(path: &Path) -> bool {
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
         Some("png")
+    )
+}
+
+/// PSD/PSB（Photoshop 文档）。`image` 不解 8BPS 容器，单独走 `psd` crate。
+fn is_psd(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("psd" | "psb")
     )
 }
 
@@ -247,6 +294,9 @@ fn finish_rgba(rgba: &[u8], dw: u32, dh: u32, want_w: u32, want_h: u32) -> Resul
 ///
 /// 开窗时用它在"原始尺寸"下决定窗口大小；读失败返回 `None`（调用方退回按比例开窗）。
 pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
+    if is_psd(path) {
+        return psd_dimensions(path);
+    }
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -256,6 +306,53 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
         return None;
     }
     Some((w, h))
+}
+
+/// #2：PSD/PSB（Photoshop 文档）解码。
+///
+/// `image` 不解 8BPS 容器，这里用 `psd` crate 解出扁平化的 RGBA8（库已按图层顺序合成、
+/// 保留透明）。超过像素上限直接拒绝（release 是 `panic = "abort"`，不能对超大 PSD 硬解）。
+fn render_psd(path: &Path, max_width: u32, max_height: u32, upscale: bool) -> Result<Canvas> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Message(format!("打不开 PSD：{e}")))?;
+    crate::cancel::checkpoint()?;
+    let psd =
+        psd::Psd::from_bytes(&bytes).map_err(|e| Error::Message(format!("解码 PSD 失败：{e}")))?;
+    let (sw, sh) = (psd.width().max(1), psd.height().max(1));
+    let px = u64::from(sw) * u64::from(sh);
+    if px > MAX_IMAGE_PIXELS {
+        return Err(Error::Message(format!(
+            "PSD 尺寸过大（{sw}x{sh}，{px} 像素，上限 {MAX_IMAGE_PIXELS}）：{}",
+            crate::display_name(path)
+        )));
+    }
+    let rgba = psd.rgba();
+    if rgba.len() != sw as usize * sh as usize * 4 {
+        return Err(Error::Message(format!(
+            "PSD 解码缓冲与尺寸不匹配（{sw}x{sh}，{} 字节）",
+            rgba.len()
+        )));
+    }
+    crate::cancel::checkpoint()?;
+    let (dw, dh) = thumbnail_dims_for(sw, sh, max_width, max_height, upscale);
+    Ok(Canvas::Bitmap(finish_rgba(&rgba, sw, sh, dw, dh)?))
+}
+
+/// 只读 PSD/PSB 头部（26 字节）拿宽高：`8BPS` + 版本 + 保留 + 通道 + 行 + 列。
+/// 开窗定尺寸用，不解像素，避免一次开窗把整份 PSD 解一遍。
+fn psd_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 26];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"8BPS" {
+        return None;
+    }
+    let height = u32::from_be_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
+    let width = u32::from_be_bytes([hdr[18], hdr[19], hdr[20], hdr[21]]);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 /// 通用路径：整图解码 → 盒式缩放。给所有非 JPEG 格式兜底。
@@ -633,5 +730,25 @@ mod tests {
                 "{sw}x{sh} 放进 {bw}x{bh}（upscale={up}）尺寸不一致"
             );
         }
+    }
+
+    /// #11：透明像素合成到黑底——A=0 变纯黑、半透明按 alpha 压暗、不透明不变。
+    #[test]
+    fn composite_over_black_handles_transparency() {
+        let b = Bitmap {
+            width: 3,
+            height: 1,
+            bgra: vec![
+                10, 20, 30, 0, // 全透明 → 0,0,0,255
+                100, 100, 100, 128, // 半透明 → 100*128/255 = 50
+                1, 2, 3, 255, // 不透明 → 原样
+            ],
+        };
+        let Canvas::Bitmap(out) = composite_over_black(Canvas::Bitmap(b)) else {
+            panic!("应仍是 Bitmap");
+        };
+        assert_eq!(&out.bgra[0..4], &[0, 0, 0, 255], "A=0 应置黑");
+        assert_eq!(&out.bgra[4..8], &[50, 50, 50, 255], "A=128 应按比例压暗");
+        assert_eq!(&out.bgra[8..12], &[1, 2, 3, 255], "A=255 不应改动");
     }
 }

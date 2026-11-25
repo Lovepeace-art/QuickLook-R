@@ -85,6 +85,17 @@ const MAX_CF_RULES: usize = 256;
 const MAX_CF_RANGES: usize = 512;
 const MAX_CF_CELLS: usize = 100_000;
 
+/// 老式二进制 Excel（`.xls`）：走 `calamine`，不按 OOXML zip 解（见 `xls` 模块）。
+fn is_legacy_xls(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("xls")
+    )
+}
+
 /// 解析一个 xlsx/xlsm/xltx/xltm 文件（取工作簿里 `activeTab` 那张表）。
 pub fn parse_sheet(path: &Path) -> qlr_core::Result<SheetDoc> {
     parse_sheet_at(path, 0)
@@ -117,6 +128,9 @@ pub fn parse_sheet_index(path: &Path, index: usize) -> qlr_core::Result<SheetDoc
 ///
 /// 给壳层定翻页范围用（`s.pages` / `s.page`），代价是一次 workbook.xml 读取。
 pub fn sheet_layout(path: &Path) -> Option<(usize, usize)> {
+    if is_legacy_xls(path) {
+        return crate::xls::layout(path);
+    }
     let file = File::open(path).ok()?;
     let zip = zip::ZipArchive::new(file).ok()?;
     let mut pkg = Package { zip, used: 0 };
@@ -130,6 +144,10 @@ pub fn sheet_layout(path: &Path) -> Option<(usize, usize)> {
 }
 
 fn parse_sheet_impl(path: &Path, explicit: Option<usize>) -> qlr_core::Result<SheetDoc> {
+    // 老式二进制 `.xls` 不是 OOXML zip，交 `calamine` 解析（批 B #3）。
+    if is_legacy_xls(path) {
+        return crate::xls::parse(path, explicit);
+    }
     let name = crate::display_name(path);
     let file =
         File::open(path).map_err(|e| Error::msg(format!("打开 xlsx 失败（{name}）：{e}")))?;

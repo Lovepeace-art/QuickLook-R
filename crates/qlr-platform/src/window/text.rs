@@ -3,6 +3,7 @@
 //! 每块只多一行 `use super::*;`，函数体一字未改。
 
 use super::*;
+use windows::Win32::Graphics::Gdi::{CreatePen, LineTo, MoveToEx, PS_SOLID};
 
 /// 文本客户区的底色（不透明）。文本预览不再走亚克力：亚克力会把字和背景混色，
 /// 滚动时新旧字形叠加会更明显（1.0.1 起文本一律刷不透明底）。
@@ -143,6 +144,19 @@ impl TextStyle {
         }
     }
 
+    /// 把一个语义样式换算成"富文本绘制"的默认视觉参数（HTML 样式渲染用）。
+    /// 颜色/字号/字重/字体面都来自这张既有表，富文本只在其上做覆盖。
+    pub fn vis_base(self) -> Vis {
+        Vis {
+            color: self.color(),
+            size_px: self.height(),
+            weight: self.weight(),
+            italic: false,
+            underline: false,
+            mono: matches!(self.face(), "Consolas"),
+        }
+    }
+
     fn create(self) -> HFONT {
         let face = to_wide(self.face());
         unsafe {
@@ -164,6 +178,99 @@ impl TextStyle {
             )
         }
     }
+}
+
+/// 富文本一段的视觉参数（HTML 样式渲染）：颜色/字号/字重/斜体/下划线/等宽。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vis {
+    /// `COLORREF`（0x00BBGGRR）。
+    pub color: u32,
+    /// 字号（物理像素，正数）。
+    pub size_px: i32,
+    pub weight: i32,
+    pub italic: bool,
+    pub underline: bool,
+    pub mono: bool,
+}
+
+/// 富文本一行里的一段（借用文字）。
+pub struct RSpan<'a> {
+    pub text: &'a str,
+    pub vis: Vis,
+}
+
+/// 富文本一行：若干段 + 对齐/缩进/行带底色/边框（HTML 盒模型近似）。
+pub struct RRow<'a> {
+    pub spans: &'a [RSpan<'a>],
+    /// 0 左 / 1 居中 / 2 右。
+    pub align: u8,
+    /// 左缩进（像素，来自 padding-left + 边框宽）。
+    pub indent: i32,
+    pub bg: Option<u32>,
+    /// (颜色, 线宽)；`Some` 表示这一行属于一个带边框的块。
+    pub border: Option<(u32, i32)>,
+    pub border_top: bool,
+    pub border_bottom: bool,
+}
+
+type RichFontKey = (i32, i32, bool, bool, bool);
+type RichFontCache = Vec<(RichFontKey, HFONT)>;
+
+thread_local! {
+    /// 富文本按 (字号,字重,斜体,下划线,等宽) 惰性建字体。
+    static RICHFONTS: std::cell::RefCell<RichFontCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 取（按需创建）一个富文本字体。创建失败退回系统 GUI 字体。
+pub(crate) fn rich_font(v: Vis) -> HFONT {
+    let key = (v.size_px, v.weight, v.italic, v.underline, v.mono);
+    RICHFONTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((_, f)) = cache.iter().find(|(k, _)| *k == key) {
+            return *f;
+        }
+        let face = to_wide(if v.mono {
+            "Consolas"
+        } else {
+            "Microsoft YaHei"
+        });
+        let font = unsafe {
+            CreateFontW(
+                -v.size_px,
+                0,
+                0,
+                0,
+                v.weight,
+                if v.italic { 1 } else { 0 },
+                if v.underline { 1 } else { 0 },
+                0,
+                DEFAULT_CHARSET,
+                OUT_TT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH.0 as u32,
+                PCWSTR(face.as_ptr()),
+            )
+        };
+        if font.0.is_null() {
+            let stock = HFONT(unsafe { GetStockObject(DEFAULT_GUI_FONT) }.0);
+            return stock;
+        }
+        cache.push((key, font));
+        font
+    })
+}
+
+/// 丢掉富文本字体缓存（DPI 变化时用）。
+pub(crate) fn clear_rich_fonts() {
+    RICHFONTS.with(|cell| {
+        for (_, font) in cell.borrow_mut().drain(..) {
+            unsafe {
+                let _ = DeleteObject(font.into());
+            }
+        }
+    });
 }
 
 /// 一行待绘制文本。
@@ -263,6 +370,7 @@ pub fn fonts_invalidate() {
     // 不是正常路径（每跳一次就要重建 14 个 HFONT，绘制会明显变慢）。
     qlr_core::log_debug!("window", "字体缓存失效（DPI 变化）");
     FONTS.with(|cell| cell.borrow_mut().clear());
+    clear_rich_fonts();
     // docx 有自己的"按文件字号"字体缓存（见 `window::docx`），DPI 变了同样要丢，
     // 否则跨屏后还在用旧像素高度的字体、且每次新建都漏一个 HFONT。
     super::docx::clear_font_cache();
@@ -723,6 +831,155 @@ pub fn paint_doc_with(
     }
 }
 
+/// 富文本绘制（HTML 样式渲染）：逐行画行带底/边框，逐段用各自字体与颜色。
+///
+/// 与 `paint_doc_with` 同一套双缓冲/顶栏/叠加层流程，只是"段"换成带像素级视觉参数的
+/// `RSpan`。折行由壳层按各段字体算好再交进来（本函数不折行，只在右边界裁掉）。
+pub fn paint_rich(
+    hwnd: HWND,
+    chrome: Option<&Chrome<'_>>,
+    content: Option<RECT>,
+    rows: &[RRow<'_>],
+    overlay: Option<&dyn Fn(HDC, RECT)>,
+) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let window_dc: HDC = BeginPaint(hwnd, &mut ps);
+        if window_dc.0.is_null() {
+            let _ = EndPaint(hwnd, &ps);
+            return;
+        }
+        let rc = client_rect(hwnd);
+        let pt0 = std::time::Instant::now();
+        let mut buffer = acquire_paint_buffer(window_dc, rc);
+        let hdc: HDC = buffer.as_ref().map_or(window_dc, |b| b.dc);
+        SetBkMode(hdc, TRANSPARENT);
+        let brush = CreateSolidBrush(COLORREF(TEXT_BACKGROUND_RGB));
+        FillRect(hdc, &rc, brush);
+        let _ = DeleteObject(brush.into());
+        let after_chrome = match chrome {
+            Some(spec) => paint_chrome(hdc, rc, spec),
+            None => rc,
+        };
+        let content = content.unwrap_or(after_chrome);
+        let base_left = content.left + 12;
+        let text_right = content.right - 24;
+        let mut y = content.top + text_padding_top();
+        for row in rows {
+            let left = base_left + row.indent.max(0);
+            if let Some(rgb) = row.bg {
+                let band = RECT {
+                    left: left - 4,
+                    top: y,
+                    right: text_right + 8,
+                    bottom: y + line_height(),
+                };
+                let b = CreateSolidBrush(COLORREF(rgb));
+                FillRect(hdc, &band, b);
+                let _ = DeleteObject(b.into());
+            }
+            let mut total = 0i32;
+            for s in row.spans {
+                total += measure_vis(hdc, s.vis, s.text);
+            }
+            let avail = (text_right - left).max(0);
+            let mut x = left
+                + match row.align {
+                    1 => ((avail - total) / 2).max(0),
+                    2 => (avail - total).max(0),
+                    _ => 0,
+                };
+            if let Some((color, w)) = row.border {
+                let pen = CreatePen(PS_SOLID, w.max(1), COLORREF(color));
+                let oldp = SelectObject(hdc, pen.into());
+                let l = base_left - 6;
+                let r = text_right + 4;
+                for xx in [l, r] {
+                    let _ = MoveToEx(hdc, xx, y, None);
+                    let _ = LineTo(hdc, xx, y + line_height());
+                }
+                if row.border_top {
+                    let _ = MoveToEx(hdc, l, y, None);
+                    let _ = LineTo(hdc, r, y);
+                }
+                if row.border_bottom {
+                    let _ = MoveToEx(hdc, l, y + line_height() - 1, None);
+                    let _ = LineTo(hdc, r, y + line_height() - 1);
+                }
+                SelectObject(hdc, oldp);
+                let _ = DeleteObject(pen.into());
+            }
+            for s in row.spans {
+                if s.text.is_empty() {
+                    continue;
+                }
+                if x >= text_right {
+                    break;
+                }
+                let font = rich_font(s.vis);
+                let old = SelectObject(hdc, font.into());
+                SetTextColor(hdc, COLORREF(s.vis.color));
+                let mut buf: Vec<u16> = s.text.encode_utf16().collect();
+                let mut rect = RECT {
+                    left: x,
+                    top: y,
+                    right: text_right,
+                    bottom: y + line_height(),
+                };
+                DrawTextW(
+                    hdc,
+                    &mut buf,
+                    &raw mut rect,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                );
+                SelectObject(hdc, old);
+                x += measure_vis(hdc, s.vis, s.text);
+            }
+            y += line_height();
+        }
+        if let Some(draw) = overlay {
+            draw(hdc, content);
+        }
+        if let Some(buffer) = &buffer {
+            let _ = BitBlt(
+                window_dc,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                Some(buffer.dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+        }
+        log_paint_gdi("rich", pt0.elapsed().as_secs_f64() * 1000.0);
+        release_paint_buffer(buffer.take());
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// 用某段的字体量它的像素宽度（选中字体后 GetTextExtentPoint32W）。
+fn measure_vis(hdc: HDC, vis: Vis, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let font = rich_font(vis);
+        let old = SelectObject(hdc, font.into());
+        let wide = crate::wide::to_wide(text);
+        let body = &wide[..wide.len() - 1];
+        let mut size = SIZE::default();
+        let w = if GetTextExtentPoint32W(hdc, body, &mut size).as_bool() {
+            size.cx.max(0)
+        } else {
+            0
+        };
+        SelectObject(hdc, old);
+        w
+    }
+}
+
 /// 画一组单段样式的文本行（Markdown/文本预览走这里）。
 ///
 /// 只是 `paint_doc` 的薄包装：**全程序只有一条文本绘制路径**，
@@ -858,6 +1115,28 @@ impl Measurer {
                 0
             }
         }
+    }
+
+    /// 富文本一段在指定视觉参数下的像素宽度（HTML 折行用）。
+    pub fn width_vis(&self, vis: Vis, text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        let wide = crate::wide::to_wide(text);
+        let body = &wide[..wide.len() - 1];
+        let mut size = SIZE::default();
+        let w = unsafe {
+            let font = rich_font(vis);
+            SelectObject(self.hdc, font.into());
+            if GetTextExtentPoint32W(self.hdc, body, &mut size).as_bool() {
+                size.cx.max(0) as u32
+            } else {
+                0
+            }
+        };
+        // 换了非保留字体：把 current 置为无效，下一次 select_style 必重选。
+        self.current.set(usize::MAX);
+        w
     }
 
     /// 一次问 GDI："这段文字在 `width` 内能放下多少字节"（返回**最长可放前缀的 UTF-8 字节长度**）。

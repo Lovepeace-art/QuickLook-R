@@ -11,12 +11,14 @@
 use super::*;
 use qlr_core::docx::{DocImage, HAlign, Line, Para, Run};
 use qlr_core::pptx::{
-    Chart, ChartKind, ChartShape, FillRect, Picture, PptxDoc, Shape, TableShape, TextBox,
+    Chart, ChartKind, ChartShape, FillRect, Picture, PptxDoc, RectGeom, Shape, TableShape, TextBox,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, IntersectClipRect, PS_SOLID, Pie, Polyline, RestoreDC, SaveDC,
+    CreatePen, Ellipse, GM_ADVANCED, GetStockObject, IntersectClipRect, NULL_BRUSH, NULL_PEN,
+    PS_SOLID, Pie, Polyline, RestoreDC, RoundRect, SaveDC, SelectObject, SetGraphicsMode,
+    SetWorldTransform, XFORM,
 };
 
 const SCOPE: &str = "pptx";
@@ -930,11 +932,140 @@ fn draw_text_box(hdc: HDC, set: &mut FontMap, tb: &TextBox, ox: i32, oy: i32, s:
 
 fn draw_fill_rect(hdc: HDC, fr: &FillRect, ox: i32, oy: i32, s: f32) {
     let rect = scaled_rect(&fr.rect, ox, oy, s);
-    if let Some(fill) = fr.fill {
-        fill_color_rect(hdc, &rect, fill);
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
     }
-    if let Some(line) = fr.line {
-        frame_rect(hdc, &rect, line);
+    // 旋转：围绕矩形中心做世界变换，几何/填充/描边一起转。
+    let saved = begin_rotate(hdc, &rect, fr.rot_deg);
+    let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 8).clamp(2, 24);
+    match fr.geom {
+        RectGeom::Rect => {
+            if let Some(fill) = fr.fill {
+                fill_color_rect(hdc, &rect, fill);
+            }
+            if let Some(line) = fr.line {
+                frame_rect(hdc, &rect, line);
+            }
+        }
+        RectGeom::RoundRect => {
+            if let Some(fill) = fr.fill {
+                fill_round_rect(hdc, &rect, fill, radius);
+            }
+            if let Some(line) = fr.line {
+                frame_round_rect(hdc, &rect, line, radius);
+            }
+        }
+        RectGeom::Ellipse => {
+            if let Some(fill) = fr.fill {
+                fill_ellipse(hdc, &rect, fill);
+            }
+            if let Some(line) = fr.line {
+                frame_ellipse(hdc, &rect, line);
+            }
+        }
+    }
+    if let Some(saved) = saved {
+        unsafe {
+            let _ = RestoreDC(hdc, saved);
+        }
+    }
+}
+
+/// 开始绕矩形中心旋转 `deg` 度（`SetWorldTransform`）。返回 `Some(saved)` 时调用方须 `RestoreDC`。
+fn begin_rotate(hdc: HDC, rect: &RECT, deg: i32) -> Option<i32> {
+    if deg.rem_euclid(360) == 0 {
+        return None;
+    }
+    unsafe {
+        let saved = SaveDC(hdc);
+        if saved == 0 {
+            return None;
+        }
+        if SetGraphicsMode(hdc, GM_ADVANCED) == 0 {
+            let _ = RestoreDC(hdc, saved);
+            return None;
+        }
+        let rad = (deg as f32).to_radians();
+        let (sin, cos) = rad.sin_cos();
+        let cx = (rect.left + rect.right) as f32 / 2.0;
+        let cy = (rect.top + rect.bottom) as f32 / 2.0;
+        let xf = XFORM {
+            eM11: cos,
+            eM12: sin,
+            eM21: -sin,
+            eM22: cos,
+            eDx: cx - (cos * cx - sin * cy),
+            eDy: cy - (sin * cx + cos * cy),
+        };
+        if !SetWorldTransform(hdc, &xf).as_bool() {
+            let _ = RestoreDC(hdc, saved);
+            return None;
+        }
+        Some(saved)
+    }
+}
+
+fn fill_round_rect(hdc: HDC, rect: &RECT, rgb: u32, radius: i32) {
+    unsafe {
+        let brush = CreateSolidBrush(rgb_to_colorref(rgb));
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let old_brush = SelectObject(hdc, brush.into());
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+fn frame_round_rect(hdc: HDC, rect: &RECT, rgb: u32, radius: i32) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 1, rgb_to_colorref(rgb));
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let old_pen = SelectObject(hdc, pen.into());
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+fn fill_ellipse(hdc: HDC, rect: &RECT, rgb: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(rgb_to_colorref(rgb));
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let old_brush = SelectObject(hdc, brush.into());
+        let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+fn frame_ellipse(hdc: HDC, rect: &RECT, rgb: u32) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 1, rgb_to_colorref(rgb));
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let old_pen = SelectObject(hdc, pen.into());
+        let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen.into());
     }
 }
 

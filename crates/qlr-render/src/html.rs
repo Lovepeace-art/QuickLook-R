@@ -24,7 +24,8 @@ use std::path::Path;
 
 use qlr_core::{Error, Result};
 
-use crate::canvas::{Canvas, LineStyle, TextDoc};
+use crate::canvas::{Canvas, InlineStyle, LineBox, LineStyle, RichRun, TextDoc};
+use crate::html_style::{BlockProps, Stylesheet};
 use crate::text::{self, MAX_LINES, READ_LIMIT};
 
 /// 分隔线画成多长（字符数，与 `markdown::RULE_CHARS` 一致）。
@@ -56,7 +57,12 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
     }
     let (src, encoding) = text::decode(&bytes);
 
-    let (mut lines, mut styles) = layout(&src);
+    // 先从**原始**源码里抽出 `<style>` 规则（strip_hidden_all 会把 style/head 整段删掉，
+    // 那样就再也看不到 CSS 了）。随后正常排版，样式表只影响上色/盒模型，不改文字。
+    let css = extract_styles(&src);
+    let sheet = Stylesheet::parse(&css);
+
+    let (mut lines, mut styles, mut runs, mut boxes) = layout_rich(&src, Some(&sheet));
     // 这里**不能**学 Markdown 那样"排到预算就停"：状态行要显示"全文共 N 行"，
     // 而 HTML 的 N 是排版后的显示行数，早停就再也算不出准确值（Markdown 报的是
     // 源文件行数，不受影响）。省下的那几十毫秒不值得在界面上撒谎。
@@ -68,34 +74,92 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
         if head {
             lines.truncate(max_lines);
             styles.truncate(max_lines);
+            runs.truncate(max_lines);
+            boxes.truncate(max_lines);
         } else {
             let start = lines.len() - max_lines;
             lines.drain(..start);
             styles.drain(..start);
+            runs.drain(..start);
+            boxes.drain(..start);
         }
     }
+
+    // 只有真的带内联样式/盒信息时才填 `runs`/`boxes`，纯文本路径保持零开销。
+    let runs = if runs.iter().any(|r| r.iter().any(|x| !x.style.is_default())) {
+        Some(runs)
+    } else {
+        None
+    };
+    let boxes = if boxes.iter().any(|b| !b.is_default()) {
+        Some(boxes)
+    } else {
+        None
+    };
 
     Ok(Canvas::Text(TextDoc {
         lines,
         styles: Some(styles),
         spans: None,
+        runs,
+        boxes,
         total_lines,
         truncated: truncated_file || truncated_lines,
         encoding,
     }))
 }
 
-/// HTML 源码 → 「(显示文本, 样式)」。纯函数，测试直接打这个。
+/// HTML 源码 → 「(显示文本, 样式)」。纯函数，测试直接打这个（不含 CSS）。
 pub fn layout(src: &str) -> (Vec<String>, Vec<LineStyle>) {
+    let (lines, styles, _, _) = layout_rich(src, None);
+    (lines, styles)
+}
+
+/// 带样式表的完整排版：额外产出逐行内联样式段与行盒信息。
+fn layout_rich(
+    src: &str,
+    sheet: Option<&Stylesheet>,
+) -> (Vec<String>, Vec<LineStyle>, Vec<Vec<RichRun>>, Vec<LineBox>) {
     let stripped = strip_comments(&strip_hidden_all(src));
-    let mut builder = Builder::default();
+    let mut builder = Builder::new(sheet);
     for_each_token(&stripped, |token| match token {
         Tok::Text(t) => builder.push_text(t),
         Tok::Start(name, attrs) => builder.on_start(name, attrs),
         Tok::End(name) => builder.on_end(name),
     });
     builder.flush();
-    (builder.lines, builder.styles)
+    (builder.lines, builder.styles, builder.runs, builder.boxes)
+}
+
+/// 从原始 HTML 中抽取所有 `<style>…</style>` 的正文，拼成一张 CSS 文本。
+fn extract_styles(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(off) = find_ci(&src[i..], "<style").map(|k| i + k) else {
+            break;
+        };
+        // 确认是 `<style>` 而非 `<stylex>`
+        let after = off + "<style".len();
+        let bounded = bytes
+            .get(after)
+            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
+        if !bounded {
+            i = off + 1;
+            continue;
+        }
+        let Some(open_end) = find_ci(&src[after..], ">").map(|k| after + k + 1) else {
+            break;
+        };
+        let Some(close) = find_ci(&src[open_end..], "</style").map(|k| open_end + k) else {
+            break;
+        };
+        out.push_str(&src[open_end..close]);
+        out.push('\n');
+        i = close + "</style".len();
+    }
+    out
 }
 
 /// 纯文本化（不排版、不带样式）：给"复制全文"或搜索用。
@@ -371,7 +435,6 @@ struct List {
     next: usize,
 }
 
-#[derive(Default)]
 struct Builder {
     lines: Vec<String>,
     styles: Vec<LineStyle>,
@@ -390,13 +453,106 @@ struct Builder {
     skip: Option<String>,
     /// 总字符预算（防止压缩成一行的 8 MB HTML 把排版拖死）
     chars: usize,
+    // —— HTML 样式（2.0）：内联段与行盒 ——
+    css: Option<Stylesheet>,
+    inline_stack: Vec<InlineStyle>,
+    tag_stack: Vec<String>,
+    runs: Vec<Vec<RichRun>>,
+    boxes: Vec<LineBox>,
+    run_buf: Vec<RichRun>,
+    cur_block: BlockProps,
+    block_first_line: Option<usize>,
 }
 
 impl Builder {
+    fn new(sheet: Option<&Stylesheet>) -> Self {
+        Builder {
+            lines: Vec::new(),
+            styles: Vec::new(),
+            block: None,
+            buf: String::new(),
+            space: false,
+            in_pre: false,
+            lists: Vec::new(),
+            in_table: false,
+            row: Vec::new(),
+            header_row: false,
+            skip: None,
+            chars: 0,
+            css: sheet.cloned(),
+            inline_stack: vec![InlineStyle::default()],
+            tag_stack: Vec::new(),
+            runs: Vec::new(),
+            boxes: Vec::new(),
+            run_buf: Vec::new(),
+            cur_block: BlockProps::default(),
+            block_first_line: None,
+        }
+    }
+
+    fn cur_inline(&self) -> InlineStyle {
+        *self.inline_stack.last().unwrap_or(&InlineStyle::default())
+    }
+
+    /// 把一行同时推入 lines/styles/runs/boxes（保证四个数组等长）。
+    fn push_row(&mut self, line: String, style: LineStyle, runs: Vec<RichRun>, block: BlockProps) {
+        let b = LineBox {
+            align: block.align,
+            indent: block.padding_left + block.border.map(|(_, w)| w).unwrap_or(0),
+            bg: block.bg,
+            border: block.border,
+            ..LineBox::default()
+        };
+        self.lines.push(line);
+        self.styles.push(style);
+        self.runs.push(runs);
+        self.boxes.push(b);
+    }
+
+    /// 由 run_buf 生成某行的样式段（含前缀）。与正文字符不一致时退回单一纯文本段。
+    fn build_line_runs(&self, prefix: &str, text: &str, raw: bool) -> Vec<RichRun> {
+        let mut runs = self.run_buf.clone();
+        if !raw {
+            runs = trim_runs(runs);
+        }
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        if joined != text {
+            runs.clear();
+        }
+        if runs.is_empty() {
+            if text.is_empty() && prefix.is_empty() {
+                return Vec::new();
+            }
+            let style = self.cur_inline();
+            let mut v = Vec::new();
+            if !prefix.is_empty() {
+                v.push(RichRun {
+                    text: prefix.to_string(),
+                    style,
+                });
+            }
+            if !text.is_empty() {
+                v.push(RichRun {
+                    text: text.to_string(),
+                    style,
+                });
+            }
+            return v;
+        }
+        if !prefix.is_empty() {
+            let mut v = Vec::with_capacity(runs.len() + 1);
+            v.push(RichRun {
+                text: prefix.to_string(),
+                style: self.cur_inline(),
+            });
+            v.extend(runs);
+            return v;
+        }
+        runs
+    }
+
     fn on_start(&mut self, name: &str, attrs: &str) {
-        if let Some(skip) = &self.skip {
-            // 只关心它的结束标签；嵌套同名标签不该出现在这里，出现也只当一次
-            let _ = skip;
+        if self.skip.is_some() {
             return;
         }
         if name == "title" || name == "head" {
@@ -421,6 +577,42 @@ impl Builder {
             }
             return;
         }
+        // 计算本元素的内联样式与块属性；非 void 且不在表格结构里则压栈。
+        let no_push = self.in_table
+            || matches!(
+                name,
+                "table"
+                    | "tr"
+                    | "td"
+                    | "th"
+                    | "thead"
+                    | "tbody"
+                    | "tfoot"
+                    | "col"
+                    | "colgroup"
+                    | "caption"
+            )
+            || is_void(name);
+        let (inline, block) = {
+            let id = attr_value(attrs, "id");
+            let cls = attr_value(attrs, "class");
+            let classes: Vec<&str> = cls
+                .map(|c| c.split_whitespace().collect())
+                .unwrap_or_default();
+            let sty = attr_value(attrs, "style");
+            crate::html_style::compute(
+                self.cur_inline(),
+                self.css.as_ref(),
+                name,
+                id,
+                &classes,
+                sty,
+            )
+        };
+        if !no_push {
+            self.inline_stack.push(inline);
+            self.tag_stack.push(name.to_string());
+        }
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = match name {
@@ -428,15 +620,15 @@ impl Builder {
                     "h2" => LineStyle::Heading2,
                     _ => LineStyle::Heading3,
                 };
-                self.begin(level, String::new());
+                self.begin(level, String::new(), block);
             }
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
             | "aside" | "figure" | "figcaption" | "form" | "body" | "html" | "dl" | "dt" | "dd" => {
-                self.begin(LineStyle::Normal, String::new());
+                self.begin(LineStyle::Normal, String::new(), block);
             }
-            "blockquote" => self.begin(LineStyle::Quote, format!("▎ {}", String::new())),
+            "blockquote" => self.begin(LineStyle::Quote, format!("▎ {}", String::new()), block),
             "pre" => {
-                self.begin(LineStyle::Code, String::new());
+                self.begin(LineStyle::Code, String::new(), block);
                 self.in_pre = true;
             }
             "ul" | "ol" => {
@@ -462,7 +654,7 @@ impl Builder {
                 } else {
                     format!("{}• ", LIST_INDENT.repeat(depth))
                 };
-                self.begin(LineStyle::List, prefix);
+                self.begin(LineStyle::List, prefix, block);
             }
             "table" => {
                 self.flush();
@@ -483,11 +675,19 @@ impl Builder {
             "hr" => {
                 self.flush();
                 if !self.lines.last().is_some_and(|l| l.is_empty()) {
-                    self.lines.push(String::new());
-                    self.styles.push(LineStyle::Normal);
+                    self.push_row(
+                        String::new(),
+                        LineStyle::Normal,
+                        Vec::new(),
+                        BlockProps::default(),
+                    );
                 }
-                self.lines.push("─".repeat(RULE_CHARS));
-                self.styles.push(LineStyle::Rule);
+                self.push_row(
+                    "─".repeat(RULE_CHARS),
+                    LineStyle::Rule,
+                    Vec::new(),
+                    BlockProps::default(),
+                );
             }
             "br" => self.hard_break(),
             "img" => {
@@ -545,6 +745,11 @@ impl Builder {
                 self.lists.pop();
             }
             _ => {}
+        }
+        // 弹出本元素的内联上下文（仅对压过栈的标签）。
+        if self.tag_stack.last().map(|t| t.eq(name)).unwrap_or(false) {
+            self.tag_stack.pop();
+            self.inline_stack.pop();
         }
     }
 
@@ -612,15 +817,37 @@ impl Builder {
     fn push_run(&mut self, text: &str) {
         if self.space && !self.buf.is_empty() {
             self.buf.push(' ');
+            self.append_run(" ");
         }
         self.space = false;
         self.buf.push_str(text);
+        self.append_run(text);
+    }
+
+    /// 追加一段带当前内联样式的文字到 run_buf（相邻同样式合并）。
+    fn append_run(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let style = self.cur_inline();
+        if let Some(last) = self.run_buf.last_mut() {
+            if last.style == style {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        self.run_buf.push(RichRun {
+            text: text.to_string(),
+            style,
+        });
     }
 
     /// 起一个新块：先把上一块吐出去，再按需插一个空行（段落之间要留白）。
-    fn begin(&mut self, style: LineStyle, prefix: String) {
+    fn begin(&mut self, style: LineStyle, prefix: String, block: BlockProps) {
         self.flush();
         self.separate(style);
+        self.cur_block = block;
+        self.block_first_line = None;
         self.block = Some((style, prefix));
         self.space = false;
     }
@@ -635,8 +862,6 @@ impl Builder {
 
     /// 落一行（`raw` = true 表示代码块：保留前后空格）。
     fn emit_line(&mut self, style: LineStyle, prefix: String, raw: bool) {
-        // 原来这一行要分配三次：`to_string()` 拷一份 body、`format!` 拼前缀、`clip` 再拷一份。
-        // 现在只拼一次（`clip_line` 内部按预算边拼边数），`buf` 用 `clear` 复用容量。
         let text: &str = if raw { &self.buf } else { self.buf.trim() };
         let line = if text.is_empty() {
             String::new()
@@ -645,12 +870,19 @@ impl Builder {
         };
         if line.is_empty() && style != LineStyle::Code {
             self.buf.clear();
+            self.run_buf.clear();
             return;
         }
-        self.lines.push(line);
-        self.styles.push(style);
+        let runs = self.build_line_runs(&prefix, text, raw);
+        let block = self.cur_block;
+        let had_text = !text.is_empty();
+        self.push_row(line, style, runs, block);
+        if had_text && self.block_first_line.is_none() {
+            self.block_first_line = Some(self.boxes.len() - 1);
+        }
         self.space = false;
         self.buf.clear();
+        self.run_buf.clear();
     }
 
     fn flush(&mut self) {
@@ -665,11 +897,32 @@ impl Builder {
             self.buf.trim()
         };
         if !text.is_empty() {
-            self.lines.push(clip_line(&prefix, text));
-            self.styles.push(style);
+            let line = clip_line(&prefix, text);
+            let runs = self.build_line_runs(&prefix, text, style == LineStyle::Code);
+            let block = self.cur_block;
+            self.push_row(line, style, runs, block);
+            if self.block_first_line.is_none() {
+                self.block_first_line = Some(self.boxes.len() - 1);
+            }
         }
+        // 有边框的块：把首行标 top、末行标 bottom，左右两侧每行都画。
+        if self.cur_block.border.is_some() {
+            if let Some(fi) = self.block_first_line {
+                let last = self.boxes.len().saturating_sub(1);
+                if last >= fi {
+                    for b in &mut self.boxes[fi..=last] {
+                        b.border_left = true;
+                        b.border_right = true;
+                    }
+                    self.boxes[fi].border_top = true;
+                    self.boxes[last].border_bottom = true;
+                }
+            }
+        }
+        self.block_first_line = None;
         self.space = false;
         self.buf.clear();
+        self.run_buf.clear();
     }
 
     /// 需要时补一个空行，让"块"之间有呼吸感（列表项之间不补，否则一份 50 项清单会翻倍）。
@@ -685,13 +938,18 @@ impl Builder {
         if adjacent_compact {
             return;
         }
-        self.lines.push(String::new());
-        self.styles.push(LineStyle::Normal);
+        self.push_row(
+            String::new(),
+            LineStyle::Normal,
+            Vec::new(),
+            BlockProps::default(),
+        );
     }
 
     /// 表格一行：单元格用 `│` 连起来（与 Markdown 表格同一套画法）。
     fn emit_row(&mut self) {
         self.buf.clear();
+        self.run_buf.clear();
         if self.row.is_empty() {
             return;
         }
@@ -711,13 +969,77 @@ impl Builder {
         }
         self.separate(LineStyle::Table);
         let line = clip_line("", &joined);
-        self.lines.push(line);
-        self.styles.push(LineStyle::Table);
+        // 表格行底色：表头用 th 规则、正文用 td 规则（近似）。
+        let row_bg = if let Some(sheet) = &self.css {
+            let (_, bp) = crate::html_style::compute(
+                InlineStyle::default(),
+                Some(sheet),
+                if header { "th" } else { "td" },
+                None,
+                &[],
+                None,
+            );
+            bp.bg
+        } else {
+            None
+        };
+        let block = BlockProps {
+            bg: row_bg,
+            ..BlockProps::default()
+        };
+        self.push_row(line, LineStyle::Table, Vec::new(), block);
         if header {
-            self.lines.push("─".repeat(RULE_CHARS));
-            self.styles.push(LineStyle::Rule);
+            self.push_row(
+                "─".repeat(RULE_CHARS),
+                LineStyle::Rule,
+                Vec::new(),
+                BlockProps::default(),
+            );
         }
     }
+}
+
+/// 空元素（无闭合标签），不参与内联样式压栈。
+fn is_void(name: &str) -> bool {
+    matches!(
+        name,
+        "br" | "img"
+            | "hr"
+            | "meta"
+            | "link"
+            | "input"
+            | "source"
+            | "col"
+            | "area"
+            | "base"
+            | "param"
+            | "track"
+            | "wbr"
+            | "embed"
+    )
+}
+
+/// 去掉 run 序列首尾的空白（与 `buf.trim()` 对齐）。
+fn trim_runs(mut runs: Vec<RichRun>) -> Vec<RichRun> {
+    while let Some(first) = runs.first_mut() {
+        let t = first.text.trim_start();
+        if t.is_empty() {
+            runs.remove(0);
+        } else {
+            first.text = t.to_string();
+            break;
+        }
+    }
+    while let Some(last) = runs.last_mut() {
+        let t = last.text.trim_end();
+        if t.is_empty() {
+            runs.pop();
+        } else {
+            last.text = t.to_string();
+            break;
+        }
+    }
+    runs
 }
 
 /// 拼一行：`prefix` + `text`，按 `MAX_LINE_CHARS` 截断（超了补省略号）。

@@ -71,6 +71,213 @@ pub(crate) fn line_bg(style: qlr_render::LineStyle) -> Option<u32> {
     }
 }
 
+/// HTML 富文本一行（拥有所有权的中间表示，最后再借出成 `window::RRow`）。
+struct OwnedRow {
+    spans: Vec<(String, window::Vis)>,
+    align: u8,
+    indent: i32,
+    bg: Option<u32>,
+    border: Option<(u32, i32)>,
+    border_top: bool,
+    border_bottom: bool,
+    is_first: bool,
+    is_last: bool,
+}
+
+fn rgb_to_colorref(rgb: u32) -> u32 {
+    ((rgb & 0x0000_00FF) << 16) | (rgb & 0x0000_FF00) | ((rgb >> 16) & 0x0000_00FF)
+}
+
+/// 把一段内联样式叠到基础视觉参数上（HTML 行内样式 → 像素）。
+fn apply_inline(mut v: window::Vis, s: &qlr_render::InlineStyle) -> window::Vis {
+    if let Some(fg) = s.fg {
+        v.color = rgb_to_colorref(fg);
+    }
+    let pct = if s.font_pct == 0 {
+        100u32
+    } else {
+        s.font_pct as u32
+    };
+    if pct != 100 {
+        v.size_px = (((v.size_px as u32) * pct) / 100).max(6) as i32;
+    }
+    if s.bold {
+        v.weight = 700;
+    }
+    if s.italic {
+        v.italic = true;
+    }
+    if s.underline {
+        v.underline = true;
+    }
+    v
+}
+
+/// 把一"逻辑行"的 run 按可用宽度贪心折成若干可视行（逐字符量宽，简单可靠）。
+fn wrap_rich_line(
+    runs: &[qlr_render::RichRun],
+    line: &str,
+    base: qlr_render::LineStyle,
+    boxi: &qlr_render::LineBox,
+    width: u32,
+    m: Option<&window::Measurer>,
+    cap: usize,
+) -> Vec<OwnedRow> {
+    let base_vis = to_text_style(base).vis_base();
+    let mk = |spans: Vec<(String, window::Vis)>, first: bool, last: bool| OwnedRow {
+        spans,
+        align: boxi.align,
+        indent: boxi.indent,
+        bg: boxi.bg,
+        border: boxi.border,
+        border_top: false,
+        border_bottom: false,
+        is_first: first,
+        is_last: last,
+    };
+    // 展开成 (字符, 视觉参数) 流：有 runs 用 runs（带内联样式）；无 runs（表格行等）用
+    // 纯文本 + 基础样式，保证这些行不会在富文本通道里"凭空消失"。
+    let mut stream: Vec<(char, window::Vis)> = Vec::new();
+    if runs.is_empty() {
+        for ch in line.chars() {
+            stream.push((ch, base_vis));
+        }
+    } else {
+        for run in runs {
+            let vis = apply_inline(base_vis, &run.style);
+            for ch in run.text.chars() {
+                stream.push((ch, vis));
+            }
+        }
+    }
+    if stream.is_empty() || cap == 0 {
+        return vec![mk(Vec::new(), true, true)];
+    }
+    let avail = width.saturating_sub(boxi.indent.max(0) as u32).max(1);
+    let mut out: Vec<OwnedRow> = Vec::new();
+    let mut cur: Vec<(String, window::Vis)> = Vec::new();
+    let mut cur_w = 0u32;
+    'outer: for (ch, vis) in stream {
+        let cw = m.map(|mm| mm.width_vis(vis, &ch.to_string())).unwrap_or(8);
+        if cur_w + cw > avail && !cur.is_empty() {
+            out.push(mk(std::mem::take(&mut cur), false, false));
+            cur_w = 0;
+            if ch == ' ' {
+                continue;
+            }
+            if out.len() >= cap {
+                break 'outer;
+            }
+        }
+        match cur.last_mut() {
+            Some(last) if last.1 == vis => last.0.push(ch),
+            _ => cur.push((ch.to_string(), vis)),
+        }
+        cur_w += cw;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(mk(cur, false, false));
+    }
+    let n = out.len();
+    for (k, r) in out.iter_mut().enumerate() {
+        r.is_first = k == 0;
+        r.is_last = k + 1 == n;
+    }
+    out
+}
+
+/// HTML 富文本绘制：识别 `t.runs`/`t.boxes`，做逐段样式 + 盒模型近似渲染。
+fn paint_rich_html(
+    hwnd: HWND,
+    chrome: &window::Chrome<'_>,
+    layout: &Frame,
+    t: &qlr_render::TextDoc,
+) {
+    let Some(runs_all) = &t.runs else {
+        return;
+    };
+    let rows_cap = visible_rows(hwnd).max(1);
+    let scroll = with_state(|s| s.scroll).unwrap_or(0).min(t.lines.len());
+    let rc = layout.content;
+    let width = ((rc.right - rc.left) - 48).max(1) as u32;
+    let measurer = window::Measurer::new(hwnd);
+    let mut owned: Vec<OwnedRow> = Vec::new();
+    let mut consumed = 0usize;
+    for i in scroll..t.lines.len() {
+        if owned.len() >= rows_cap {
+            break;
+        }
+        let base = t
+            .styles
+            .as_ref()
+            .and_then(|a| a.get(i).copied())
+            .unwrap_or_default();
+        let boxi = t
+            .boxes
+            .as_ref()
+            .and_then(|b| b.get(i).cloned())
+            .unwrap_or_default();
+        let runs_i: &[qlr_render::RichRun] = runs_all.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let rows = wrap_rich_line(
+            runs_i,
+            &t.lines[i],
+            base,
+            &boxi,
+            width,
+            measurer.as_ref(),
+            rows_cap - owned.len(),
+        );
+        consumed += 1;
+        for mut r in rows {
+            r.border_top = boxi.border_top && r.is_first;
+            r.border_bottom = boxi.border_bottom && r.is_last;
+            // block 的颜色是 0x00RRGGBB，绘制层要 COLORREF(0x00BBGGRR)，这里换一次。
+            r.bg = boxi.bg.map(rgb_to_colorref);
+            r.border = boxi.border.map(|(c, w)| (rgb_to_colorref(c), w));
+            owned.push(r);
+            if owned.len() >= rows_cap {
+                break;
+            }
+        }
+    }
+    with_state(|s| s.wrapped_consumed = consumed);
+    let span_rows: Vec<Vec<window::RSpan>> = owned
+        .iter()
+        .map(|r| {
+            r.spans
+                .iter()
+                .map(|(txt, vis)| window::RSpan {
+                    text: txt.as_str(),
+                    vis: *vis,
+                })
+                .collect()
+        })
+        .collect();
+    let rrows: Vec<window::RRow> = owned
+        .iter()
+        .zip(span_rows.iter())
+        .map(|(r, sp)| window::RRow {
+            spans: sp.as_slice(),
+            align: r.align,
+            indent: r.indent,
+            bg: r.bg,
+            border: r.border,
+            border_top: r.border_top,
+            border_bottom: r.border_bottom,
+        })
+        .collect();
+    let overlay = |hdc: HDC, content: RECT| paint_overlays_dc(hdc, layout, content);
+    window::paint_rich(
+        hwnd,
+        Some(chrome),
+        Some(layout.content),
+        &rrows,
+        Some(&overlay),
+    );
+    window::paint_window_frame(hwnd);
+    paint_lens_if_any(hwnd);
+}
+
 // ---------------------------------------------------------------------------
 // 顶栏 / 内容区布局（1.0.9：四种格式统一）
 // ---------------------------------------------------------------------------
@@ -201,6 +408,79 @@ pub(crate) fn scroll_info() -> Option<window::ScrollInfo> {
 /// 1.8.3 起它就是 `layout::Layout`：几何只在 `layout.rs` 里算一次，这里只负责
 /// **把状态翻译成输入**（有没有目录、这一帧画不画滚动条），不再自己切矩形。
 pub(crate) type Frame = layout::Layout;
+
+/// #1：PDF 连续纵向滚动的绘制。算出可见页范围、把当前帧与页缓存里可见页的位图收集起来
+/// 交给 `window::paint_pdf_flow` 逐页贴；缓存里没有的可见页投给预渲染线程异步补。
+fn paint_pdf_flow_view(
+    hwnd: HWND,
+    chrome: &window::Chrome<'_>,
+    layout: &Frame,
+    b: &qlr_render::Bitmap,
+    path: &std::path::Path,
+    n: usize,
+) {
+    let content = layout.content;
+    let page_w = b.width.max(1);
+    let page_h = b.height.max(1);
+    let vy0 = with_state(|s| s.flow_y).unwrap_or(0.0) as i32;
+    let f = window::pdf_flow(page_w, page_h, n, content, vy0);
+    let vy = vy0.clamp(0, (f.total_h - f.view_h).max(0));
+    let rendered_page = with_state(|s| s.pdf_page).unwrap_or(0);
+    with_state(|s| {
+        s.flow_total = f.total_h as f64;
+        s.flow_view = f.view_h as f64;
+        s.flow_y = vy as f64;
+        s.page = f.top_page;
+    });
+    // 可见页里已渲染好的位图：当前屏幕这张 b 直接用，其余从页缓存取，缺的异步补。
+    let mut cached: Vec<(usize, Arc<Canvas>)> = Vec::new();
+    for p in f.first_page..=f.last_page {
+        if p == rendered_page {
+            continue;
+        }
+        let key = crate::pagecache::PageKey::new(
+            path,
+            p,
+            page_w,
+            page_h,
+            super::render::file_stamp(path),
+        );
+        match crate::pagecache::get(&key) {
+            Some(c) if matches!(c.as_ref(), Canvas::Bitmap(_)) => cached.push((p, c)),
+            _ => super::render::request_flow_page(path, p, page_w, page_h),
+        }
+    }
+    let mut refs: Vec<(usize, u32, u32, &[u8])> = Vec::new();
+    if (f.first_page..=f.last_page).contains(&rendered_page) {
+        refs.push((rendered_page, b.width, b.height, &b.bgra));
+    }
+    for (p, c) in &cached {
+        if let Canvas::Bitmap(bm) = c.as_ref() {
+            refs.push((*p, bm.width, bm.height, &bm.bgra));
+        }
+    }
+    let overlay = |hdc: HDC, c: RECT| paint_overlays_dc(hdc, layout, c);
+    window::paint_pdf_flow(
+        hwnd,
+        Some(chrome),
+        content,
+        page_w,
+        page_h,
+        n,
+        &refs,
+        vy,
+        Some(&overlay),
+    );
+    window::paint_window_frame(hwnd);
+    log_debug!(
+        SCOPE,
+        "PAINT pdf-flow view_y={vy} pages={}..={} cur={rendered_page} content={}x{}",
+        f.first_page + 1,
+        f.last_page + 1,
+        content.right - content.left,
+        content.bottom - content.top
+    );
+}
 
 pub(crate) fn frame(hwnd: HWND) -> Frame {
     let client = window::client_rect(hwnd);
@@ -356,12 +636,27 @@ pub(crate) fn on_chrome_click(hwnd: HWND, lparam: LPARAM) -> bool {
         if let Some(index) = index {
             let target = with_state(|s| s.toc.get(index).map(|item| item.2)).flatten();
             if let Some(line) = target {
-                with_state(|s| {
-                    s.scroll = line;
-                    s.toc_active = Some(index);
-                });
-                window::invalidate(hwnd);
-                log_debug!(SCOPE, "目录跳转：第 {} 行", line + 1);
+                // PDF 的目录第三字段是 **0 基页下标** → 跳页；文本/Markdown 是显示行下标 → 滚正文。
+                let is_pdf = with_state(|s| {
+                    s.last_path
+                        .as_deref()
+                        .map(format::kind_for_path)
+                        .is_some_and(|k| k == format::Kind::Pdf)
+                })
+                .unwrap_or(false);
+                if is_pdf {
+                    with_state(|s| s.toc_active = Some(index));
+                    window::invalidate(hwnd);
+                    log_debug!(SCOPE, "目录跳转：第 {} 页", line + 1);
+                    super::input::goto_page(line + 1);
+                } else {
+                    with_state(|s| {
+                        s.scroll = line;
+                        s.toc_active = Some(index);
+                    });
+                    window::invalidate(hwnd);
+                    log_debug!(SCOPE, "目录跳转：第 {} 行", line + 1);
+                }
             }
         }
         return true;
@@ -672,6 +967,23 @@ pub(crate) fn repaint(hwnd: HWND) {
                     matches!(kind, Some(format::Kind::Svg) | Some(format::Kind::Video));
                 // 图片：小于内容区的维度也拉伸铺满，绝不居中留白（方案B 的核心）。
                 let fill = matches!(kind, Some(format::Kind::Image));
+                // #1（2026-11-25）：PDF 连续纵向滚动。多页、未缩放、非预览态时，把可见页
+                // 竖向堆叠逐页贴图（缺页异步渲染、先露灰底），滚动只改 `s.flow_y`。
+                if matches!(kind, Some(format::Kind::Pdf))
+                    && !preview
+                    && with_state(|s| (s.zoom - 1.0).abs() < 0.01).unwrap_or(false)
+                {
+                    let info = with_state(|s| (s.pages, s.last_path.clone()))
+                        .and_then(|(n, p)| Some((n?, p?)));
+                    if let Some((n, path)) = info {
+                        if n > 1 {
+                            paint_pdf_flow_view(hwnd, &chrome, &layout, b, &path, n);
+                            paint_overlays(hwnd, &layout);
+                            paint_lens_if_any(hwnd);
+                            return;
+                        }
+                    }
+                }
                 if fit_bitmap {
                     // 视频（1.7.9）：播放时 `s.video` 里有"当前这一帧"，它比渲染出来的首帧新。
                     // 用帧画（而不是首帧位图），窗口改大小/被别的窗口盖住后重画才不会"倒带"。
@@ -902,6 +1214,11 @@ pub(crate) fn repaint(hwnd: HWND) {
                 return;
             }
             Canvas::Text(t) => {
+                // HTML 富文本（含行内样式/盒模型）：走专用富文本绘制通道。
+                if t.runs.as_ref().is_some_and(|r| !r.is_empty()) {
+                    paint_rich_html(hwnd, &chrome, &layout, t);
+                    return;
+                }
                 // 代码预览（1.0.8）：不折行、一行一源行，走 paint_doc 的"一行多色"通道。
                 if let Some(spans) = &t.spans {
                     paint_code(hwnd, &chrome, &layout, t, spans);

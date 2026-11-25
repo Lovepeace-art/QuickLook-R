@@ -251,6 +251,8 @@ pub fn render_with(path: &Path, head: bool, read_limit: usize, max_lines: usize)
         lines,
         styles: None,
         spans: Some(spans),
+        runs: None,
+        boxes: None,
         total_lines,
         truncated: truncated_bytes || truncated_lines,
         encoding,

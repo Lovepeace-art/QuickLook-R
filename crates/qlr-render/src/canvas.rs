@@ -160,6 +160,72 @@ pub struct Span {
     pub token: Token,
 }
 
+/// 行内样式（HTML 样式渲染用）；`None`/默认表示继承或未指定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct InlineStyle {
+    /// 文字颜色 0x00RRGGBB。
+    pub fg: Option<u32>,
+    /// 行内高亮背景 0x00RRGGBB。
+    pub bg: Option<u32>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// 字号相对正文的百分比（100=正文；0 视作 100）。
+    pub font_pct: u16,
+}
+
+impl InlineStyle {
+    /// 是否等于"未指定"（全默认）。画的时候可据此回退到行级样式。
+    pub fn is_default(&self) -> bool {
+        self.fg.is_none()
+            && self.bg.is_none()
+            && !self.bold
+            && !self.italic
+            && !self.underline
+            && (self.font_pct == 0 || self.font_pct == 100)
+    }
+
+    /// 取有效字号百分比（0 → 100）。
+    pub fn pct(&self) -> u16 {
+        if self.font_pct == 0 {
+            100
+        } else {
+            self.font_pct
+        }
+    }
+}
+
+/// 一行里的一段带样式的文字（HTML 内联样式）。拼起来近似等于该行 `lines[i]`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RichRun {
+    pub text: String,
+    pub style: InlineStyle,
+}
+
+/// 一行的盒模型近似信息（HTML 块样式：对齐/缩进/背景/边框）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LineBox {
+    /// 0=左 1=居中 2=右。
+    pub align: u8,
+    /// 左缩进（DIP 像素）。
+    pub indent: i32,
+    /// 整行背景 0x00RRGGBB。
+    pub bg: Option<u32>,
+    /// 边框颜色与线宽（DIP）；None=无边框。
+    pub border: Option<(u32, i32)>,
+    pub border_top: bool,
+    pub border_bottom: bool,
+    pub border_left: bool,
+    pub border_right: bool,
+}
+
+impl LineBox {
+    /// 完全没有可画的盒信息（画的时候可据此跳过）。
+    pub fn is_default(&self) -> bool {
+        self.align == 0 && self.indent == 0 && self.bg.is_none() && self.border.is_none()
+    }
+}
+
 /// 文本类内容的排版结果。只保留**要显示的行**，不是整个文件。
 #[derive(Clone, Debug, Default)]
 pub struct TextDoc {
@@ -170,6 +236,10 @@ pub struct TextDoc {
     /// 代码着色结果（1.0.8）：外层与 `lines` 等长，内层是这一行的 token 段。
     /// `None` 表示不是代码，整行同一套样式。与 `styles` 互斥（代码不折行、无行级样式）。
     pub spans: Option<Vec<Vec<Span>>>,
+    /// HTML 内联样式：外层与 `lines` 等长，内层是该行的样式段。`None`=无内联样式。
+    pub runs: Option<Vec<Vec<RichRun>>>,
+    /// HTML 块样式：与 `lines` 等长的行盒信息（对齐/缩进/背景/边框）。`None`=无。
+    pub boxes: Option<Vec<LineBox>>,
     /// 文件里一共有多少行（可能远大于 `lines.len()`）。
     pub total_lines: usize,
     /// 是否因为超出显示预算而只截取了开头一段。
@@ -280,6 +350,8 @@ mod tests {
             lines: vec!["abc".into(), "de".into()],
             styles: None,
             spans: None,
+            runs: None,
+            boxes: None,
             total_lines: 2,
             truncated: false,
             encoding: "utf-8",

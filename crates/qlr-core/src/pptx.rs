@@ -39,12 +39,28 @@ pub struct Picture {
     pub alt: String,
 }
 
+/// 无文字形状的几何类别（`a:prstGeom` 的 `prst`，仅取常见几种）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RectGeom {
+    /// 普通矩形（默认；也作为未知 `prst` 的兜底）。
+    #[default]
+    Rect,
+    /// 圆角矩形（`roundRect`）。
+    RoundRect,
+    /// 椭圆 / 圆（`ellipse` / `oval`）。
+    Ellipse,
+}
+
 /// 一个纯色块 / 无文字的形状（`p:sp` 无文字但有填充，或 `p:cxnSp` 直线）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FillRect {
     pub rect: Rect,
     pub fill: Option<u32>,
     pub line: Option<u32>,
+    /// 形状几何（默认矩形）。
+    pub geom: RectGeom,
+    /// 整形状旋转角（度，整数；0 = 不旋转）。
+    pub rot_deg: i32,
 }
 
 /// 表格单元格（文字已折行，`rect` 是绝对坐标）。
@@ -288,7 +304,8 @@ mod tests {
             Shape::Rect(FillRect {
                 rect: r,
                 fill: None,
-                line: None
+                line: None,
+                ..Default::default()
             })
             .rect(),
             r

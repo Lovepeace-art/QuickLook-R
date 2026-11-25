@@ -3957,3 +3957,139 @@ otches>0 是滚轮往上，应"看上面的内容"，改成 low_y -= notches*12
 `target/shot-scroll.ps1`（点击点=cw-6 滑条中点）：pdf 点轨道底→8/8、拖→6/8；big.md→第 196514 行/20 万；big.toml→567-594/600；big.docx→连续流 1166-1196；big.xlsx→拖到 200-228、点轨道中段正常。`cargo test -p qlr-app -p qlr-core -p qlr-platform`=82/87/56 全绿；clippy `-D warnings` 0、fmt 干净、build dev/release 绿。
 ### 局限
 无 GUI 自动化只能模拟点击+截图核验；真机仍需人工确认拖动手感。点击滚动条最底部（表格标签栏区）会落到标签栏而非滚动条，属正常（滚动条只覆盖到标签栏之上）。
+
+## 2026-11-25 批 A 快修（#11/#8/#9/#10 行列出选）
+### 做了什么
+用户一次提 11 条反馈（评估见 `docs/plans/feedback-2026-11-25-triage.md`），按建议顺序先做批 A 四项快修：
+- **#11 PNG 透明区 0 填充**：`qlr-render/src/image_view.rs` 新增 `fn composite_over_black(Canvas)->Canvas`，`render_scaled` 改为 `render_scaled_raw` 出图后外包一层合成。规则：A=0→RGB 全 0；0<A<255→`c*f/255` 预乘黑底；A=255→原样。上屏 `StretchDIBits SRCCOPY` 本就不看 alpha，预乘到黑底即可让透明像素呈黑。只改 a≠255 像素，尺寸/不透明像素不变（老 `...color...` 测试仍过）。
+- **#8 极端高图最小宽度**：`qlr-platform/src/window/mod.rs` `natural_rect_raw` 计算宽后 `if width<MIN_WIDTH && ww>=MIN_WIDTH { width=MIN_WIDTH }`（只影响"因超高被 fit 压到 <240"的图，正常图不动）；`qlr-app/src/app/show.rs` `window_size_for` 在 `media_window_size` 之后、`Kind::Image && remembered.is_none()` 时 `width=min_window_w().min(work宽)` 兜底。有尺寸记忆时不动（尊重用户缩放）。
+- **#9 缩放步长**：`qlr-app/src/app/input.rs` `wheel_zoom` 每档 1.25×→1.1×；`scripts/smoke.ps1` 的 `ZOOM 1.00 -> 1.25` 断言改 `1.00 -> 1.10`。右拖缩放 `zoom_drag_target(anchor,dy)=anchor*1.25^(dy/60)` 保持不变。
+- **#10 行/列号点选**：`qlr-platform/src/window/sheet.rs` 新增 `pub enum HeaderHit{Row(usize),Col(usize)}` + `pub fn sheet_header_at(sheet,sizes,scroll_x,scroll_y,px,py)->Option<HeaderHit>`（与 `sheet_cell_at` 同坐标口径；落在列号条→`Col`、行号条→`Row`）；`qlr-app/src/app/input.rs` `sheet_click` 在算 `sheet_cell_at` 之前先判表头，点列号选整列（`sheet_sel=(0,c)`、焦点 `(rows-1,c)`）、点行号选整行，然后 return。
+### 为什么
+这四项都是低风险、用户能立刻感知的体验/正确性问题；原 `paint_bitmap_at` 刷白 + SRCCOPY 不看 alpha 导致透明 PNG 显示成白底；`natural_rect_raw` 的 `min_scale.min(fit)` 把最小宽度保护抵消；滚轮 1.25× 步进过大造成"割裂"；行/列头点击此前直接返回 None、根本选不中整行/整列。
+### 怎么验证
+- `cargo build` dev 绿；`cargo test --workspace` = **app 83 / core 87 / platform 57 / render 170 全绿 0 failed**（新增 3 个单测：`image_extreme_tall_keeps_min_width`、`header_hit_selects_row_or_col`、`composite_over_black_handles_transparency`）。
+- `pwsh -File scripts\smoke.ps1`：16 项全 PASS（托盘 1 项 SKIP=管理员运行 UIPI），含"滚轮缩放已生效 1.00 -> 1.10"。
+- 真机截图 `target/shot-out/transparent.png`（400×330，透明区纯黑+红圆）、`tall.png`（240×1040，宽度保住 240、关闭按钮可见）。
+### 局限
+#10 本轮只补"行/列头点选"；用户还提的"列宽命中偏一列（点 B 中→A）"和"非折行单元格自适应行高"需真机复现后再定口径，未在批 A 改。批 B/C（PDF 卡顿/PSD/EPUB/xls、PDF 连续滚动/pptx 补齐/doc）尚未动。
+
+## 2026-11-25 批 B（#2 PSD / #3 xls / #6 EPUB / #5 PDF 预取）
+### 做了什么
+- **依赖**：`quicklook-rs/Cargo.toml` [workspace.dependencies] 加 `psd="0.3"`、`calamine="0.38"`；`crates/qlr-render/Cargo.toml` 引用。
+- **#2 PSD**：`format.rs` `IMAGE_EXTS`+=`psd/psb`、`is_image_magic`+=`b"8BPS"`；`image_view.rs` `is_psd`/`render_psd`（`psd::Psd::from_bytes`→`.rgba()`）/`psd_dimensions`（头 26B），`render_scaled_raw` 在 `render_via_image` 前分流；透明区仍走 `composite_over_black`。
+- **#3 xls**：新 `xls.rs`（`calamine::open_workbook_auto`→`build_sheet`；`parse`/`layout`；`fmt_float`/`excel_serial_to_string`/`civil_from_days`）；`render/sheet.rs` `is_legacy_xls` 分流 `sheet_layout`/`parse_sheet_impl`；`SHEET_EXTS`+=`xls`。
+- **#6 EPUB**：新 `epub.rs`（`is_epub`/`render`：container→OPF→spine→`html::layout` 拼 `TextDoc`；`find_tags`/`attr`/`decode_entities`/`join_path`）；`lib.rs` `HtmlViewer::render` 分流；`HTML_EXTS`+=`epub`。
+- **#5 PDF 预取**：`render.rs` `prefetch_neighbor_pages` 循环 `[1,-1]`→`[1,2,-1]`。
+- **测试适配**：`tests/malformed.rs` `unsupported_kind_never_reaches_a_parser` 与 `lib.rs` `unimplemented_kind_reports_plugin_hint` 的"不支持"样本 `epub`→`zip`（epub 已内置）；`format.rs` 新增 `batch_b_extensions_route_to_native_kinds`。
+### 为什么
+用户要 PSD/xls/EPUB 三种格式内置；纯 Rust `psd`/`calamine` 避免引入 Office/外部运行时；EPUB 复用现有 HTML 排版，不新增 Kind 以免动 11 类不变量；多页 PDF 连翻时预取只做 ±1 会跑在用户按键前面，故前看两页。
+### 怎么验证
+`cargo test --workspace` = **app 83 / core 88 / platform 57 / plugin 4·7·11 / render 175（+8 ignored）全绿 0 failed**；`cargo check --workspace --all-targets` 0 warning。EPUB 用现场 ZipWriter 真实夹具验证解析顺序；PSD 无真实样本、xls 未造真实 BIFF，仅编译+单测。批 B 未改窗口/绘制，未跑 smoke（符合 AGENTS）。
+### 局限
+批 C 未动：#4 pptx 形状几何(圆角/椭圆/箭头)+旋转、#1 PDF 连续纵向滚动（#3 doc 保留系统处理器）；#5 只是预取窗口首改，多页实测剖析/更深优化未做。
+
+## 2026-11-25 批 C（#4 pptx 母版/版式装饰图形 + 背景）
+### 做了什么
+- `qlr-render/src/pptx.rs` `parse_placeholders(xml, theme)` 现返回 `(Placeholders, Option<u32>, Vec<Shape>)`：`slideLayout`/`slideMaster` 的 `spTree` 里，带 `<p:ph>` 的 `sp` 记占位符几何；无 `ph` 的顶层 `sp` 当作**母版装饰图形**用 `parse_sp` 解析（空占位符表 + identity 变换）。
+- `resolve_placeholders(pkg, slide_rels, theme)` 收集 master 再 layout 的 decor，一并返回；`parse_pptx` 里 `let mut shapes = decor;` 后 `shapes.extend(parse_sp_tree(...))`，装饰在最底层（z=数组序）。
+- `parse_bg(root, theme)`：`solidFill`→`resolve_color(el, theme)`（修主题色背景此前 `Colors::new()` 丢失）；`gradFill`→取 `gsLst` 各色标平均成一种代表色（近似纯色，非真渐变）。
+- 新增单测 `master_decor_shapes_extracted_but_placeholders_kept`（装饰抽出 1 个 Rect 且 title 占位符几何仍在）、`gradient_background_averages_color_stops`（黑白渐变→`0x7F7F7F`）。
+### 为什么
+用户要 pptx 补母版/版式（当前只继承占位符矩形、不画装饰图形，背景只有纯色且主题色还会丢）。装饰垫底 + 背景主题色/渐变近似是"最值钱、最低风险"的一层；形状几何/旋转属更深一层，留后续。
+### 怎么验证
+`cargo test --workspace` = **app 83 / core 88 / platform 57 / render 177（+8 ignored）全绿 0 failed**（render +2 新单测）；`cargo check --workspace --all-targets` 0 warning；`scripts\smoke.ps1` 16 项全 PASS（tray SKIP=管理员）。pptx 改的是解析/模型层，未动窗口绘制主路径，smoke 仍全过。
+### 局限
+装饰只取顶层 `sp`（`grpSp` 组合里的装饰、图片装饰未纳入）；渐变只平均成纯色（未做真正的多段线性/径向渐变）；#4 的"形状几何(圆角/椭圆/箭头)+旋转"与 #1 PDF 连续滚动仍未做。
+
+## 2026-11-25 批 C（#5 深化：预取取消隔离 + 128MB 页缓存 + 前看三页）
+### 做了什么
+- `qlr-render/src/cancel.rs`：新增 `thread_local! SKIP_CANCEL: Cell<bool>` 与 `pub fn without_cancel<R>(f: impl FnOnce()->R)->R`；`checkpoint()` 若在免取消区内返回 `Ok(())`（不再读全局 `CANCELLED`）。新增单测 `without_cancel_ignores_cancel_and_restores`。
+- `qlr-app/src/app/render.rs` `warm_page`：把 `qlr_render::render_file_at_zoom(...)` 用 `qlr_render::cancel::without_cancel(|| ...)` 包住。
+- `qlr-app/src/app/render.rs` `prefetch_neighbor_pages`：预取窗口 `[1,2,-1]`→`[1,2,3,-1]`。
+- `qlr-app/src/pagecache.rs`：`CACHE_LIMIT_BYTES` 64MB→128MB（~56 页），同步注释。
+### 为什么
+全局 `CANCELLED` 一处服务两种活：交互渲染（应可取消）与后台预取（不该被"用户换文件"连坐）。二者共用导致翻页一次 `cancel()` 顺手把预取砍掉，热页永远攒不起来——这才是多页 PDF 连翻卡顿的机制性原因（不只是窗口大小）。用线程局部量精确隔离；配合更大页缓存与前看三页，连续向前翻页基本命中热页。
+### 怎么验证
+`cargo test --workspace` = app 83 / core 88 / platform 57 / render **178（+8 ignored）** 全绿 0 failed（render +1 新单测）；`cargo check --workspace --all-targets` 0 warning；`scripts\smoke.ps1` 16 项全 PASS（tray SKIP）。只改渲染/预取内部，未动窗口绘制主路径，smoke 全过。
+### 局限
+仍是"页缓存 + 预取"式优化，未改变 PDF 的翻页式显示；#1 真·连续纵向滚动未做。
+
+## 2026-11-25 批 C（#1 铺垫：PDF 连续纵向滚动几何层）
+### 做了什么
+- 新 `qlr-platform/src/window/pdf.rs`（`mod pdf;` + `pub use pdf::*;`）：`pdf_flow_geom`/`PdfGeom`、`pdf_flow`/`PdfFlow`（总高/视口高/可见页范围/顶部页）、`pdf_page_offset`（跳页偏移）、`pdf_page_dest`（某页在 view_y 下的绘制矩形，越界 None）。与 `pptx_flow_geom`/`pptx_flow`/`pptx_slide_offset` 同构，坐标口径 `content.top+pad+i*(ph+gap)-view_y`。
+- 4 个纯几何单测：fit 宽 + 竖向堆叠超屏、可见页范围随滚动、偏移单调 + clamp、越界返回 None。
+### 为什么
+#1 真·连续纵向滚动是架构级改动（PDF 是光栅页，需逐页渲染 + 占位）。先把**与绘制解耦的纯几何**落地并测好，后续接线（chrome 逐页贴图/异步渲染、input 滚动、滚动条）风险更低。
+### 怎么验证
+`cargo test -p qlr-platform` = 61 passed / 4 ignored；`cargo clippy -p qlr-platform --all-targets -- -D warnings` 干净；`cargo fmt --all` 后全仓 `--check` 通过（顺带修批 B `xls` 遗留格式）；`cargo test --workspace` = app 83 / core 88 / platform 61 / render 178 全绿 0 failed。
+### 局限
+仅几何层，尚未接入任何绘制/输入；窗口里 PDF 仍是"页码框 + 翻页"。
+
+## 2026-11-25 批 C #1 接线：PDF 真·连续纵向滚动
+### 做什么
+把 `pdf_flow` 几何接到真实绘制/输入：①`qlr-platform/src/window/pdf.rs` 加 `paint_pdf_flow(...)`（BeginPaint 内 `paint_chrome` + 内容区浅灰页缝 + `IntersectClipRect` + 逐页 `pdf_page_dest`/`SetStretchBltMode(HALFTONE)`/`StretchDIBits` + overlay，一次画完）；②`qlr-app/render.rs` 加 `request_flow_page(path,page,w,h)`（命中页缓存跳过，否则投 `WarmTask::Page` 异步渲染写缓存），`request_render`/`on_render_done` 记 `s.pdf_page`；③`session.rs` 加 `State.pdf_page`、`is_flow_view()` 把"多页 Bitmap 且 zoom≈1 且非 zoom_preview"也判为 flow，`show.rs` 打开置 `pdf_page=first_page`；④`input.rs flow_goto_page` 加 `Canvas::Bitmap` 臂走 `pdf_page_offset`；⑤`chrome.rs Canvas::Bitmap` 对 `Kind::Pdf` 改走新 `paint_pdf_flow_view`（收集当前页 + 页缓存可见页位图，缺页异步补，交 `paint_pdf_flow` 画）。
+### 为什么
+用户要"PDF 像 docx 那样上下翻动"。PDF 是光栅页，逐页渲染 ~28ms，必须异步补页 + 占位，不能同步渲染卡 UI。几何层已就绪，本轮补绘制/输入/缓存三条线。
+### 怎么验证
+`cargo test --workspace` = app 83 / core 88 / platform 61 / render 178（+8 ignored）全绿 0 failed；`cargo check --workspace --all-targets` 0 warning；`cargo build --workspace` 绿；`scripts\smoke.ps1` 16 项全 PASS（tray SKIP=管理员）；真机 3 页 PDF（`target/shot-out/pdf_top.png`、`pdf_two.png`）：下滚 2 格后同屏"第 1 页页脚 + 浅灰页缝 + 第 2 页标题"，连续滚动成立。
+### 局限
+跳页/滚动条按页级 offset；快速拖动未命中页短暂露浅灰等异步补齐；未做像素级滚轮惯性/虚拟化。
+
+## 2026-11-25 #10 复核：列宽命中 + 行高 + 回归锁定
+### 做什么
+复核表格"点 B 列中间落 A / 列宽不准 / 行高未自适应"。读代码确认：`qlr-platform/src/window/sheet.rs` 的 `Painter` 绘制用 `sizes.col_x/row_y/col_width/row_height`，`sheet_cell_at` 命中用同一 `SheetSizes`（`col_at/row_at`），绘制与命中同源。`sheet_autofit`：pass1 非折行单行高、pass2 仅 wrap 且跳过表头行按最终列宽折行高。新增单测 `col_row_hit_honours_autofit_extra` 锁定"加宽/加高后命中跟视觉走"。
+### 为什么
+用户反馈列宽命中不准、怀疑无自适应行高。代码复核显示二者口径已一致、行高两态都有；补回归测试防回退，并给用户"如需真机复现请提供 xlsx"的明确下一步。
+### 怎么验证
+`cargo test -p qlr-platform` = 62 passed/4 ignored；`cargo fmt --all` / `cargo clippy -p qlr-platform --all-targets -- -D warnings` 干净；`cargo test --workspace` app 83/core 88/platform 62/render 178(+8 ignored) 全绿（并行时 `crash::tests::minidump_of_ourselves_is_written` 偶发 flaky，单跑过，环境问题）。
+
+## 2026-11-25 批 C #4 深化：pptx 形状几何（圆角/椭圆）+ 旋转
+### 做什么
+模型 `qlr-core/pptx.rs` 加 `enum RectGeom{Rect,RoundRect,Ellipse}` 与 `FillRect.geom/rot_deg`（默认 Rect/0，仍 Eq）。解析 `qlr-render/pptx.rs` 加 `rect_geom(spPr)`（读 `a:prstGeom@prst`）与 `xfrm_rot(spPr)`（读 `a:xfrm@rot`/60000 取整度），`parse_sp`/`parse_cxn` 填入。绘制 `qlr-platform/window/pptx.rs` 重写 `draw_fill_rect`：按 geom 用 `RoundRect`/`Ellipse`/`Rectangle` + `begin_rotate`（`SaveDC`+`SetGraphicsMode(GM_ADVANCED)`+`SetWorldTransform` 绕中心旋转，画完 `RestoreDC`）。
+### 为什么
+用户要求 pptx 补齐"形状几何（圆角/椭圆/箭头）+ 旋转"。先落圆角矩形/椭圆/旋转（最高频、可验证），箭头与文字形状旋转留后续。
+### 怎么验证
+新增单测 `shape_geometry_and_rotation_parsed`（roundRect+rot=5400000→RoundRect/90°、ellipse→Ellipse、rect→Rect）；`cargo test -p qlr-core -p qlr-render -p qlr-platform` = 88/62/179 全绿；`check`/`clippy -D warnings` 干净；`scripts\smoke.ps1` 16 项 PASS；真机截图 `target/shot-out/pptx_shapes.png`（`target/real-samples/shapes.pptx`：圆角矩形/椭圆/旋转30°）——均正确。
+
+## 2026-11-25 批 C #5 剖析：多页 PDF 连续翻页实测
+### 做什么
+用 60 页内容型 PDF（`target/real-samples/test-60page-rich.pdf`）+ 临时脚本 `target/measure-pdf.ps1`：`--hide` 宿主发文件、`PostMessage` 发 WM_MOUSEWHEEL(−120) 90 次（70ms 间隔）、PrintWindow 抓帧、按本运行时间戳过滤 `app.log`（`QLRUST_LOG=debug`）。
+### 结果
+滚动到第 13/60 页；期间 `PAINT pdf-flow` 92 帧（每次滚动都重绘，无丢帧/白屏）、`PAGECACHE 预取` 16 页、页缓存 17 页/35MB；低墨样本逐页渲染 0–1ms（重内容 A4 631×893 2× 约 28ms/页，由预取窗口覆盖）。截图 `target/shot-out/pdf60_after.png`：页缝 + 第 2 页标题 + 页码 13/60。
+### 为什么
+#5「多页 PDF 卡顿」需实测证据。机制修复（预取"前看三页+后一页"、`without_cancel` 隔离预取与交互取消、128MB 页缓存、#1 连续流式按需补页）经验证无卡顿。低墨样本渲染本就极快，故为机制级证据；真重图 PDF 靠预取覆盖逐页成本。
+
+## 2026-11-25 修复：图片预览不再露"正在渲染…"占位页
+### 做什么
+`qlr-app/src/app/show.rs` 打开预览时，占位行清空条件由"仅 shell 后端"扩为 `if shell || kind == format::Kind::Image { lines.clear(); }`。图片（png/jpg/gif/webp/tiff/psd…，均 `Kind::Image`）不再 `lines.insert(2, "正在渲染…")`，窗口先空着等渲染帧铺满。
+### 为什么
+用户反馈"预览 png 还是有占位页，之前不是全部删掉了么"。根因是此前只对系统预览处理器（Office）删占位页，自渲染图片仍保留整页文件信息+正在渲染文字；大图解码几百毫秒期间很脏。
+### 怎么验证
+`cargo build` 绿；`cargo test --workspace -- --skip minidump_of_ourselves_is_written` = app 83 / core 88 / platform 61(+4 ignored) / render 179(+8 ignored) 全绿 0 failed；`scripts\smoke.ps1` 16 项 PASS；真机 24MP 大图（`target/real-samples/huge-24mp.png`）`target/shot-out/huge2_a.png`（开图瞬间纯空白、无文字占位）→ `huge2_final.png`（渐变铺满）。
+
+## 2026-11-25 PDF 目录（书签大纲）支持
+### 做什么
+- 抽取：`qlr-render/pdf.rs` 加**可选** pdfium 书签 FFI（`FPDFBookmark_GetFirstChild/GetNextSibling/GetTitle/GetDest/GetAction`、`FPDFAction_GetType/GetDest`、`FPDFDest_GetDestPageIndex`，以 `Option<fn>` 加载，缺符号降级为"无目录"）+ `pub struct OutlineEntry{level,title,page}`（page 0 基）+ `pub fn outline(path)->Vec<OutlineEntry>`（DFS 遍历书签树，GOTO 动作或直接 dest 取页号，标题 UTF-16LE 读取，`seen>=4000` 保护）。
+- 状态：`session.rs State.pdf_outline`；`show.rs` 打开 PDF 时 `qlr_render::pdf::outline(path)`→`pdf_outline`+`toc`；`set_content` 对 `Kind::Pdf` 保留大纲（不被 Bitmap 当图片清空）。
+- 点击：`chrome.rs` 目录点击对 PDF 改走 `super::input::goto_page(page+1)`（复用 PDF 连续滚动跳页，1 基）。
+### 修 bug
+`qlr-platform/window/pdf.rs paint_pdf_flow` 原把传入的 `content`（已扣目录栏）用 `paint_chrome` 返回的整块区域**覆盖**，导致页面按整窗宽画、钻到目录栏底下、左侧被裁（"PDF"的 P 看不见）。改为两 rect 取交：`RECT{ left:area.left.max(content.left), top:area.top.max(content.top), right:area.right.min(content.right), bottom:area.bottom.min(content.bottom) }`。
+### 为什么
+用户：预览 pdf 有目录就显示、没有不加；目录要能点击跳页。
+### 怎么验证
+`cargo test -p qlr-core -p qlr-render -p qlr-platform -p qlr-app -- --skip minidump_of_ourselves_is_written` = app 83 / core 88 / platform 61(+4 ignored) / render 179(+8 ignored) 全绿；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`scripts\smoke.ps1` 16 项 PASS；真机 `target/real-samples/toc-3page.pdf`（pypdf 加 4 书签）→ `target/shot-out/toc_top.png`（左侧「目录」4 条含子项缩进、页面右侧完整不裁）、`toc_jump.png`（点「第二页 数据」→ 正文跳到 `QLRust PDF test page 2`）。无书签的 PDF 不显示目录栏。
+
+## 2026-11-25 HTML 样式渲染（C 级：行内样式 + 盒模型近似 + 表格底色）
+### 做什么
+- 模型：`qlr-render/canvas.rs` 加 `InlineStyle{fg,bg,bold,italic,underline,font_pct}`、`RichRun{text,style}`、`LineBox{align,indent,bg,border,border_top/bottom/left/right}`；`TextDoc` 加 `runs`/`boxes`（spans 之后，10 处字面量补齐）。
+- CSS：新 `qlr-render/src/html_style.rs`——`parse_color`/`parse_len`/`Selector`(specificity)/`Stylesheet`/`compute(...)->(InlineStyle,BlockProps)`（继承+cascade，inline 最高；background/text-align/display:none/margin/padding/border）。
+- Builder：`html.rs` `layout_rich` 同时出 lines/styles/runs/boxes；inline/tag 栈；逐行 RichRun+LineBox（align/indent/bg/边框）；`extract_styles` 抽 `<style>`；表格 th/td 取底色。
+- 绘制：`qlr-platform/window/text.rs` 新增 `Vis/RSpan/RRow`+`paint_rich`（动态字体、逐段 fg、行 bg 带、align、border、逐字符折行）+`RICHFONTS` 缓存；`qlr-app/app/chrome.rs` 新增 `paint_rich_html`/`wrap_rich_line`/`rgb_to_colorref`，`Canvas::Text` 若 `t.runs` 非空走富文本。
+### 为什么
+用户要求不用 WebView2、自渲染 CSS 样式到 C 级（行内样式 + 盒模型近似 + 表格底色），保持零外部依赖。
+### 修 bug
+- 空 runs 行（表格行）在富文本通道消失 → `wrap_rich_line` 增 `line` 参数，runs 空时用 base 样式画纯文本。
+- block bg/border 颜色 R/B 反（0xRRGGBB 当 COLORREF 用）→ 送绘制前 `rgb_to_colorref` 转换。
+### 怎么验证
+`cargo check --workspace --all-targets` 0 warning；`clippy --workspace --all-targets -- -D warnings` 干净；`cargo test --workspace -- --skip minidump_of_ourselves_is_written` = app 83 / core 88 / platform 61(+4 ignored) / render **185(+8 ignored)** 全绿（html_style 6 单测）；`scripts\smoke.ps1` 16 PASS；真机 `target/real-samples/styled.html` → `target/shot-out/styled3_final.png`（红色加粗标题、蓝加粗/下划线/斜体行内、浅黄底+灰边 DIV、居中、表头浅蓝底、绿色小字）。**局限**：行内逐段背景未画；盒模型近似；不做 `<img>`。

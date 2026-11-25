@@ -15,7 +15,7 @@
 //!   我们只有一个渲染线程，但别给以后留坑。
 //! - dll 只在第一次真正渲染 PDF 时才加载（启动路径不碰它）。
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -43,6 +43,9 @@ const FPDF_BITMAP_BGRA: c_int = 4;
 // FPDF_ANNOT：把注释/表单外观也画出来，否则签名、批注会消失。
 const RENDER_FLAGS: c_int = 0x01;
 
+// PDF 动作类型（见 fpdf_doc.h）：PDFACTION_GOTO = 1，表示"跳到某一页"。
+const PDFACTION_GOTO: c_ulong = 1;
+
 // ---------------------------------------------------------------------------
 // 动态符号表
 // ---------------------------------------------------------------------------
@@ -63,6 +66,16 @@ type FnBitmapDestroy = unsafe extern "C" fn(*mut c_void);
 type FnRenderPageBitmap =
     unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, c_int, c_int, c_int, c_int);
 
+// 书签/大纲（目录）相关：按**可选**符号加载，老版 pdfium 缺符号时只是没有目录，不影响渲染。
+type FnBookmarkGetFirstChild = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type FnBookmarkGetNextSibling = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type FnBookmarkGetTitle = unsafe extern "C" fn(*mut c_void, *mut c_void, c_ulong) -> c_ulong;
+type FnBookmarkGetDest = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type FnBookmarkGetAction = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+type FnActionGetType = unsafe extern "C" fn(*mut c_void) -> c_ulong;
+type FnActionGetDest = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type FnDestGetPageIndex = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+
 struct Api {
     // Library 必须活到最后：符号是从它里面取的。
     _lib: Library,
@@ -79,6 +92,15 @@ struct Api {
     bitmap_fill_rect: FnBitmapFillRect,
     bitmap_destroy: FnBitmapDestroy,
     render_page: FnRenderPageBitmap,
+    // 书签（目录）：可选，缺符号则为 None（PDF 照常渲染，只是不显示目录）。
+    bookmark_first_child: Option<FnBookmarkGetFirstChild>,
+    bookmark_next_sibling: Option<FnBookmarkGetNextSibling>,
+    bookmark_get_title: Option<FnBookmarkGetTitle>,
+    bookmark_get_dest: Option<FnBookmarkGetDest>,
+    bookmark_get_action: Option<FnBookmarkGetAction>,
+    action_get_type: Option<FnActionGetType>,
+    action_get_dest: Option<FnActionGetDest>,
+    dest_get_page_index: Option<FnDestGetPageIndex>,
 }
 
 // 全部调用都经 `api()` 里那把锁串行化；pdfium 的指针只在这个模块内出现。
@@ -127,6 +149,11 @@ fn load_api() -> std::result::Result<Api, String> {
                     }
                 };
             }
+            macro_rules! sym_opt {
+                ($name:literal, $ty:ty) => {
+                    lib.get::<$ty>($name.as_bytes()).ok().map(|s| *s)
+                };
+            }
             let api = Api {
                 init: sym!("FPDF_InitLibrary", FnInitLibrary),
                 last_error: sym!("FPDF_GetLastError", FnGetLastError),
@@ -141,6 +168,20 @@ fn load_api() -> std::result::Result<Api, String> {
                 bitmap_fill_rect: sym!("FPDFBitmap_FillRect", FnBitmapFillRect),
                 bitmap_destroy: sym!("FPDFBitmap_Destroy", FnBitmapDestroy),
                 render_page: sym!("FPDF_RenderPageBitmap", FnRenderPageBitmap),
+                bookmark_first_child: sym_opt!(
+                    "FPDFBookmark_GetFirstChild",
+                    FnBookmarkGetFirstChild
+                ),
+                bookmark_next_sibling: sym_opt!(
+                    "FPDFBookmark_GetNextSibling",
+                    FnBookmarkGetNextSibling
+                ),
+                bookmark_get_title: sym_opt!("FPDFBookmark_GetTitle", FnBookmarkGetTitle),
+                bookmark_get_dest: sym_opt!("FPDFBookmark_GetDest", FnBookmarkGetDest),
+                bookmark_get_action: sym_opt!("FPDFBookmark_GetAction", FnBookmarkGetAction),
+                action_get_type: sym_opt!("FPDFAction_GetType", FnActionGetType),
+                action_get_dest: sym_opt!("FPDFAction_GetDest", FnActionGetDest),
+                dest_get_page_index: sym_opt!("FPDFDest_GetDestPageIndex", FnDestGetPageIndex),
                 _lib: lib,
             };
             (api.init)();
@@ -584,6 +625,131 @@ fn fit_scaled_can_upscale() {
     let (w4, h4) = fit_scaled(1.0, 1.0, 1.0, 1.0);
     assert!(w4 >= 1 && h4 >= 1);
 }
+
+// ---------------------------------------------------------------------------
+// 大纲 / 目录（书签）
+// ---------------------------------------------------------------------------
+
+/// PDF 大纲（书签）条目：`level` 从 0 开始（缩进层级），`page` 是 **0 基**页下标。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub level: u8,
+    pub title: String,
+    pub page: usize,
+}
+
+/// 读取 PDF 的书签大纲（目录）。
+///
+/// - 没有书签、或当前 pdfium 缺少书签相关符号时返回空 `Vec`（**不报错**，PDF 照常渲染）；
+/// - `page` 是 0 基页下标，交给 UI 时按需 +1。
+pub fn outline(path: &Path) -> Vec<OutlineEntry> {
+    let Ok(api) = api() else {
+        return Vec::new();
+    };
+    let Ok(guard) = api.lock() else {
+        return Vec::new();
+    };
+    with_document(&guard, path, |api, doc, pages| {
+        let mut out = Vec::new();
+        if let Some(first_child) = api.bookmark_first_child {
+            // 传 NULL 文档/书签句柄 → 拿到顶层第一个书签。
+            let first = unsafe { first_child(doc, std::ptr::null_mut()) };
+            let mut seen = 0usize;
+            walk_bookmarks(api, doc, pages, first, 0, &mut out, &mut seen);
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}
+
+fn walk_bookmarks(
+    api: &Api,
+    doc: *mut c_void,
+    pages: usize,
+    mut cur: *mut c_void,
+    level: usize,
+    out: &mut Vec<OutlineEntry>,
+    seen: &mut usize,
+) {
+    while !cur.is_null() {
+        if *seen >= 4000 {
+            return;
+        }
+        *seen += 1;
+        if let Some(page) = bookmark_page(api, doc, cur) {
+            if page < pages {
+                let title = bookmark_title(api, cur);
+                if !title.is_empty() {
+                    out.push(OutlineEntry {
+                        level: level.min(9) as u8,
+                        title,
+                        page,
+                    });
+                }
+            }
+        }
+        if let Some(first_child) = api.bookmark_first_child {
+            let child = unsafe { first_child(doc, cur) };
+            if !child.is_null() {
+                walk_bookmarks(api, doc, pages, child, level + 1, out, seen);
+            }
+        }
+        match api.bookmark_next_sibling {
+            Some(next) => cur = unsafe { next(doc, cur) },
+            None => break,
+        }
+    }
+}
+
+/// 书签指向的 0 基页下标：优先直接 Dest，否则走 GOTO 动作的 Dest。
+fn bookmark_page(api: &Api, doc: *mut c_void, bm: *mut c_void) -> Option<usize> {
+    let get_dest = api.bookmark_get_dest?;
+    let get_dest_page = api.dest_get_page_index?;
+    let mut dest = unsafe { get_dest(doc, bm) };
+    if dest.is_null() {
+        let get_action = api.bookmark_get_action?;
+        let action = unsafe { get_action(bm) };
+        if action.is_null() {
+            return None;
+        }
+        let get_type = api.action_get_type?;
+        if unsafe { get_type(action) } != PDFACTION_GOTO {
+            return None;
+        }
+        let action_dest = api.action_get_dest?;
+        dest = unsafe { action_dest(doc, action) };
+        if dest.is_null() {
+            return None;
+        }
+    }
+    let idx = unsafe { get_dest_page(doc, dest) };
+    if idx < 0 { None } else { Some(idx as usize) }
+}
+
+/// 书签标题：UTF-16LE（含结尾 NUL）。先问长度再取。
+fn bookmark_title(api: &Api, bm: *mut c_void) -> String {
+    let Some(get_title) = api.bookmark_get_title else {
+        return String::new();
+    };
+    let needed = unsafe { get_title(bm, std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return String::new();
+    }
+    let units = (needed as usize) / 2;
+    if units == 0 || units > 8192 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; units];
+    let got = unsafe { get_title(bm, buf.as_mut_ptr() as *mut c_void, needed) };
+    if got == 0 {
+        return String::new();
+    }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf16_lossy(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1967,3 +1967,8 @@ min/max，于是分母（区间）被隔壁列的数字带偏。
 - 规矩：命中滚动条要**先于**拖边判断。用 `chrome::scrollbar_drag_at(hwnd,lparam)`（命中区与绘制区同口径：表格用 `sheet_area` 扣掉标签栏），`WM_LBUTTONDOWN` 在 `edges_at` 之前调用它，命中即开始 `scroll_drag` 并 `return`。
 - 代价与取舍：可滚动格式不再支持"从右边缘拖宽"，改从左/上/下/角拖；这是有意的（滚动条优先）。
 - 验证：`target/shot-scroll.ps1 -File <f> -XOff 6`（点击点落在原来拖不动的滑条中点），看 hash 变化 + 目视页码/行号；pdf/md/toml/docx/xlsx 均通过。
+
+## #186 HTML 富文本：样式在 qlr-render 解析成 runs/boxes，qlr-platform 只负责像素
+- **分层**：解析（`html_style.rs` + `html.rs`）只在 `qlr-render`，产出 `TextDoc.runs/boxes`（`InlineStyle`/`LineBox`），可无 windows 单测；绘制（`window::text::paint_rich` + `app/chrome.rs::paint_rich_html`）只在 `qlr-platform`/`qlr-app`。`Canvas::Text` 开头若 `t.runs` 非空即走富文本，否则回退旧的按 `LineStyle` 整行画，二者共存不破坏老路径。
+- **颜色**：CSS/`InlineStyle` 的颜色是 `0x00RRGGBB`，Win32 的 `COLORREF` 是 `0x00BBGGRR`。所有送 `CreateSolidBrush`/`CreatePen`/`SetTextColor` 的值必须过 `rgb_to_colorref()`（`(r&FF)<<16 | g | b<<8`），否则红蓝互换（曾把浅黄底画成浅蓝）。
+- **坑**：①富文本通道只认 `runs`，表格行等 `runs` 为空的逻辑行会"消失"——`wrap_rich_line` 必须收 `line` 原文、runs 空时用 base 样式画纯文本。②行高仍固定 `cpx(24)`（与旧滚动行数口径一致），不要因字号变化改行高，否则 `wrapped_consumed`/滚动定位全乱。③clippy：`thread_local` 初始化用 `const { RefCell::new(Vec::new()) }`（否则 `thread_local_initializer_can_be_made_const`）；hex 字面量分组要等宽（`0x0000_FF00` 不能写 `0x00FF_00`）；`BlockProps`/`LineBox` 等尽量用结构体初始化而非 `let mut x=Default::default(); x.f=..`（`field_reassign_with_default`）。

@@ -507,6 +507,8 @@ pub(crate) fn render_with_plugin(
                 lines,
                 styles: None,
                 spans: None,
+                runs: None,
+                boxes: None,
                 total_lines: total,
                 truncated: false,
                 encoding: "utf-8",
@@ -588,6 +590,7 @@ pub(crate) fn request_render(path: &Path, max_w: u32, max_h: u32, page: usize) {
                 s.render_since = None;
                 s.render_warned = false;
                 s.pending_key = None;
+                s.pdf_page = page;
             });
             present_canvas(canvas);
             return;
@@ -747,6 +750,7 @@ pub(crate) fn on_render_done() {
             if let Some(key) = with_state(|s| s.pending_key.take()).flatten()
                 && matches!(canvas.as_ref(), Canvas::Bitmap(_))
             {
+                with_state(|s| s.pdf_page = key.page);
                 pagecache::put(key.clone(), canvas.clone());
                 prefetch_neighbor_pages(&key);
             }
@@ -1305,8 +1309,12 @@ pub(crate) fn warm_page(job: &RenderJob) {
         return;
     }
     let started = Instant::now();
-    match qlr_render::render_file_at_zoom(&job.path, job.max_width, job.max_height, job.page, false)
-    {
+    // #5（2026-11-25）：预取是投机工作，必须不受"用户换文件"的全局取消信号影响，
+    // 否则交互翻页一次 cancel() 就会把正在跑的预取一起砍掉（竞态）。用 without_cancel 隔离。
+    let rendered = qlr_render::cancel::without_cancel(|| {
+        qlr_render::render_file_at_zoom(&job.path, job.max_width, job.max_height, job.page, false)
+    });
+    match rendered {
         Ok(canvas) => {
             let elapsed = started.elapsed().as_millis();
             let canvas = Arc::new(canvas);
@@ -1341,7 +1349,10 @@ pub(crate) fn prefetch_neighbor_pages(key: &pagecache::PageKey) {
     };
     let Ok(guard) = slot.lock() else { return };
     let Some(tx) = guard.as_ref() else { return };
-    for delta in [1_i64, -1] {
+    // #5（2026-11-25）：多页 PDF 翻页卡顿——只预取 ±1 页，用户按 PageDown 稍快一点
+    // 就会跑在预取前面，下一帧还得冷渲染。改成"前看三页 + 后一页"的有向窗口（共 4 页，
+    // 128 MB 页缓存约 56 页余量足够），让连续向前翻页始终有热页可用。
+    for delta in [1_i64, 2, 3, -1] {
         let target = key.page as i64 + delta;
         if target < 0 || target as usize >= total {
             continue;
@@ -1368,6 +1379,33 @@ pub(crate) fn prefetch_neighbor_pages(key: &pagecache::PageKey) {
             target: 0,
         }));
     }
+}
+
+/// #1：为 PDF 连续纵向滚动请求某一页的位图（异步、只写页缓存，不覆盖当前上屏帧）。
+///
+/// 和 `prefetch_neighbor_pages` 不同：这里可指定任意页（滚动到哪就补哪几页），
+/// 尺寸用**同一份** `(page_w, page_h)` 保证页缓存 key 与 chrome 查询时一致。
+pub(crate) fn request_flow_page(path: &Path, page: usize, w: u32, h: u32) {
+    let (w, h) = (w.max(1), h.max(1));
+    let key = pagecache::PageKey::new(path, page, w, h, file_stamp(path));
+    if pagecache::has(&key) {
+        return;
+    }
+    let Some(slot) = PREWARM_TX.get() else {
+        return;
+    };
+    let Ok(guard) = slot.lock() else { return };
+    let Some(tx) = guard.as_ref() else { return };
+    let job = RenderJob {
+        generation: 0,
+        path: path.to_path_buf(),
+        max_width: w,
+        max_height: h,
+        page,
+        upscale: false,
+        target: 0,
+    };
+    let _ = tx.send(WarmTask::Page(job));
 }
 
 /// 这个路径还是当前"准备预热"的候选吗？（用户已经换选中项就作废）
